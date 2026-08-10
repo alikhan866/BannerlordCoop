@@ -160,7 +160,7 @@ internal class BattleFinalizeHandler : IHandler
         // in live p2p hostile battles when player-party collection races teardown.
         if (playerPartyIds.Length > 0)
         {
-            PvpEncounterCloseSender.Send(network, messageBroker, this, playerPartyIds, mapEventId: payload.What.MapEventId);
+            PvpEncounterCloseSender.Send(network, playerPartyIds, mapEventId: payload.What.MapEventId);
             return;
         }
 
@@ -181,7 +181,7 @@ internal class BattleFinalizeHandler : IHandler
         if (!objectManager.TryGetObjectWithLogging(payload.What.MapEventId, out MapEvent mapEvent))
         {
             if (!closeAlreadySent && knownPlayerPartyIds.Length > 0)
-                PvpEncounterCloseSender.Send(network, messageBroker, this, knownPlayerPartyIds, payload.What.SurrenderedPartyId, payload.What.MapEventId);
+                PvpEncounterCloseSender.Send(network, knownPlayerPartyIds, payload.What.SurrenderedPartyId, payload.What.MapEventId);
 
             return;
         }
@@ -196,7 +196,7 @@ internal class BattleFinalizeHandler : IHandler
             var playerPartyIds = FinalizeAndCollectPlayers(mapEvent, knownPlayerPartyIds);
 
             if (!closeAlreadySent && playerPartyIds.Length > 0)
-                PvpEncounterCloseSender.Send(network, messageBroker, this, playerPartyIds, payload.What.SurrenderedPartyId, payload.What.MapEventId);
+                PvpEncounterCloseSender.Send(network, playerPartyIds, payload.What.SurrenderedPartyId, payload.What.MapEventId);
         }
         catch (Exception e)
         {

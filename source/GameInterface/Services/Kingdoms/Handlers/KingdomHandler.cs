@@ -8,6 +8,7 @@ using GameInterface.Services.Kingdoms;
 using GameInterface.Services.Kingdoms.Messages;
 using GameInterface.Services.ObjectManager;
 using GameInterface.Services.Players;
+using GameInterface.Registry.Auto;
 using Helpers;
 using Serilog;
 using System;
@@ -553,6 +554,7 @@ public class KingdomHandler : IHandler
             if (!objectManager.TryGetObjectWithLogging<Kingdom>(payload.What.KingdomId, out var kingdom)) return;
             if (!objectManager.TryGetObjectWithLogging<Clan>(payload.What.ClanId, out var clan)) return;
 
+            kingdom.Banner = new Banner(kingdom.Banner);
             ChangeRulingClanAction.Apply(kingdom, clan);
         });
     }

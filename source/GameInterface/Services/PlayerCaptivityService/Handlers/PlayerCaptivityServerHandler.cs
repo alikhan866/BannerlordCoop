@@ -417,7 +417,7 @@ internal class PlayerCaptivityServerHandler : IHandler
                 string.Join(",", playerPartyIds),
                 surrenderedPartyId ?? "<none>",
                 payload.What.MapEventId ?? "<none>");
-            PvpEncounterCloseSender.Send(network, messageBroker, this, playerPartyIds, surrenderedPartyId, payload.What.MapEventId);
+            PvpEncounterCloseSender.Send(network, playerPartyIds, surrenderedPartyId, payload.What.MapEventId);
             mapEvent.DoSurrender(playerParty.Party.Side);
             messageBroker.Publish(this, new MapEventConcluded(payload.What.MapEventId, playerPartyIds, surrenderedPartyId));
         }, blocking: true, context: nameof(Handle_NetworkPlayerSurrendered));

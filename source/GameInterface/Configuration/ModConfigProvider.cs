@@ -50,17 +50,24 @@ public readonly struct ModOptions
     public readonly float MaximumLootersMultiplier { get; } = 1f;
     [ProtoMember(15)]
     public readonly LordDefectionRetryMode LordDefectionRetries { get; } = LordDefectionRetryMode.Vanilla;
+    // 16 and 17 belong to development's hero-execution options. This branch had claimed the same two
+    // numbers for its siege options, so they are renumbered to 18-20: a ProtoMember number is the wire
+    // identifier, and two fields sharing one silently corrupts config sync between server and clients.
     [ProtoMember(16)]
-    public readonly bool MilitiaJoinsSallyOut { get; } = true;
+    public readonly bool EnableHeroExecutions { get; } = true;
     [ProtoMember(17)]
-    public readonly bool ResumeSiegeWhenEnemyRetreats { get; } = true;
+    public readonly bool EnablePlayerClanMemberExecutions { get; } = false;
     [ProtoMember(18)]
+    public readonly bool MilitiaJoinsSallyOut { get; } = true;
+    [ProtoMember(19)]
+    public readonly bool ResumeSiegeWhenEnemyRetreats { get; } = true;
+    [ProtoMember(20)]
     public readonly bool GarrisonJoinsSiegeRelief { get; } = true;
 
     /// <summary>
     /// Takes the configured value, or keeps the option's declared default when the config leaves it out.
     /// Spelled as a call rather than <c>??</c> so the constructor reads as one straight line per option:
-    /// seventeen null-coalesces in a row look like seventeen branches, both to an analyzer and to anyone
+    /// twenty null-coalesces in a row look like twenty branches, both to an analyzer and to anyone
     /// skimming for the single option they care about.
     /// </summary>
     private static T Or<T>(T? configured, T declaredDefault) where T : struct => configured ?? declaredDefault;
@@ -82,6 +89,8 @@ public readonly struct ModOptions
         SmithingStaminaRecoveryMultiplier = Or(modOptionsData.SmithingStaminaRecoveryMultiplier, SmithingStaminaRecoveryMultiplier);
         MaximumLootersMultiplier = Or(modOptionsData.MaximumLootersMultiplier, MaximumLootersMultiplier);
         LordDefectionRetries = Or(modOptionsData.LordDefectionRetries, LordDefectionRetries);
+        EnableHeroExecutions = Or(modOptionsData.EnableHeroExecutions, EnableHeroExecutions);
+        EnablePlayerClanMemberExecutions = Or(modOptionsData.EnablePlayerClanMemberExecutions, EnablePlayerClanMemberExecutions);
         MilitiaJoinsSallyOut = Or(modOptionsData.MilitiaJoinsSallyOut, MilitiaJoinsSallyOut);
         ResumeSiegeWhenEnemyRetreats = Or(modOptionsData.ResumeSiegeWhenEnemyRetreats, ResumeSiegeWhenEnemyRetreats);
         GarrisonJoinsSiegeRelief = Or(modOptionsData.GarrisonJoinsSiegeRelief, GarrisonJoinsSiegeRelief);

@@ -34,6 +34,11 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
     private static readonly ILogger Logger = LogManager.GetLogger<MobilePartyBehaviorSnapshot>();
 
     private readonly IObjectManager objectManager;
+    private readonly HashSet<string> loggedJoinBaselineFailures = new HashSet<string>();
+    private string lastJoinBaselineFailure;
+
+    internal string LastJoinBaselineFailure => lastJoinBaselineFailure;
+    internal int LoggedJoinBaselineFailureCount => loggedJoinBaselineFailures.Count;
 
     public MobilePartyBehaviorSnapshot(IObjectManager objectManager) => this.objectManager = objectManager;
 
@@ -55,35 +60,26 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
             return FailCreation("party AI is unavailable", out failure);
         if (!TryGetCompactId(party, out string partyId))
             return FailCreation("party is not registered", out failure);
-        // An unresolvable REFERENCE must not abandon the whole update. These three used to return false, which
-        // meant no behaviour was ever produced for that party - and because the sync only ever sends behaviour
-        // this way, the client never learned the party's ShortTermBehavior and left it at None. Such a party
-        // shows the DefaultBehavior it was given ("patrolling", or nothing the UI can name) and never acts on
-        // it, permanently, because the missing reference never comes back.
-        //
-        // Seen live after a battle wedged and took its parties down with it: ~850 parties still pointed at
-        // destroyed ones, so 850 updates were dropped in silence - FailCreation discards its reason - leaving
-        // the map frozen on every client while the server ran on happily. Dropping the reference and keeping
-        // the behaviour is strictly better: the client gets a party that moves, and the AI re-targets on its
-        // next decision. This is what the MoveTargetParty branch below has always done.
         if (!TryGetInteractableReference(
             party.Ai.AiBehaviorInteractable,
             out string interactablePointId,
             out bool isInteractableAnchor))
         {
-            WarnDroppedReference(party, "AI interactable", party.Ai.AiBehaviorInteractable?.GetType().Name);
-            interactablePointId = null;
-            isInteractableAnchor = false;
+            return FailCreation(
+                $"AI interactable '{party.Ai.AiBehaviorInteractable?.GetType().Name}' is not registered",
+                out failure);
         }
         if (!TryGetCompactId(party.TargetParty, out string targetPartyId))
         {
-            WarnDroppedReference(party, "target party", party.TargetParty?.StringId);
-            targetPartyId = null;
+            return FailCreation(
+                $"target party '{party.TargetParty?.StringId}' is not registered",
+                out failure);
         }
         if (!TryGetCompactId(party.TargetSettlement, out string targetSettlementId))
         {
-            WarnDroppedReference(party, "target settlement", party.TargetSettlement?.StringId);
-            targetSettlementId = null;
+            return FailCreation(
+                $"target settlement '{party.TargetSettlement?.StringId}' is not registered",
+                out failure);
         }
 
         MoveModeType partyMoveMode = party.PartyMoveMode;
@@ -207,24 +203,6 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
         return true;
     }
 
-    // Once per party per reference kind: a stuck party would otherwise repeat this every tick, and the point
-    // is to make a previously SILENT drop visible, not to trade one log flood for another.
-    private static readonly HashSet<string> warnedDrops = new HashSet<string>();
-
-    private static void WarnDroppedReference(MobileParty party, string what, string referenced)
-    {
-        var key = party.StringId + "|" + what;
-        lock (warnedDrops)
-        {
-            if (!warnedDrops.Add(key)) return;
-        }
-
-        Logger.Warning(
-            "[PartySync] {Party} references an unregistered {What} ('{Referenced}'); dropping that reference and " +
-            "syncing the behaviour without it, rather than sending nothing for this party",
-            party.StringId, what, referenced ?? "<null>");
-    }
-
     private bool TryGetInvalidJoinReferences(
         MobileParty party,
         ISet<MobileParty> liveParties,
@@ -282,7 +260,14 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
     public bool TryApply(MobileParty party, PartyBehaviorUpdateData data, out IInteractablePoint interactable)
     {
         interactable = null;
-        if (!TryPrepare(party, data, null, null, out ResolvedBehaviorUpdate resolved))
+        if (!TryPrepare(
+            party,
+            data,
+            null,
+            null,
+            logLookupFailures: true,
+            out ResolvedBehaviorUpdate resolved,
+            out _))
             return false;
 
         interactable = resolved.Interactable;
@@ -290,65 +275,68 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
         return true;
     }
 
-    /// <summary>
-    /// Applies as much of a joining client's authoritative party baseline as will resolve.
-    /// </summary>
-    /// <remarks>
-    /// Deliberately best-effort, and it was not always so. This used to be all-or-nothing: a single party that
-    /// failed to resolve, or a client whose party count differed from the server's by even one, threw the
-    /// ENTIRE baseline away and returned false without logging a word.
-    ///
-    /// That is a far worse outcome than it looks, because the baseline is the only way a client ever learns the
-    /// behaviour of a party whose orders do not subsequently change. Ordinary updates are published on CHANGE,
-    /// so a lord already patrolling when the client joined generates nothing to send. Lose the baseline and
-    /// that party sits on the client with ShortTermBehavior = None forever: it displays the DefaultBehavior it
-    /// was given and never acts on it. Live, that stranded roughly 650 parties while the ~250 whose orders
-    /// happened to change afterwards moved normally - which reads, correctly, as "everything on the map is
-    /// frozen, but the ones that came out of settlements are fine".
-    ///
-    /// So: apply every party that resolves, count the ones that do not, and say so. A partial baseline leaves a
-    /// few parties waiting for their next change; no baseline leaves all of them stuck for good.
-    /// </remarks>
     public bool TryApplyJoinBaseline(MobilePartyJoinState[] states, Action beforeApply)
     {
-        if (states == null || beforeApply == null) return false;
+        if (states == null)
+            return RejectJoinBaseline("the baseline party-state array is null");
+        if (beforeApply == null)
+            return RejectJoinBaseline("the before-apply callback is null");
 
-        var campaignObjectManager = Campaign.Current?.CampaignObjectManager;
-        var parties = campaignObjectManager?.MobileParties;
-        var settlements = campaignObjectManager?.Settlements;
-        if (parties == null || settlements == null) return false;
+        var objectManager = Campaign.Current?.CampaignObjectManager;
+        var parties = objectManager?.MobileParties;
+        var settlements = objectManager?.Settlements;
+        if (parties == null)
+            return RejectJoinBaseline("the client campaign mobile-party collection is unavailable");
+        if (settlements == null)
+            return RejectJoinBaseline("the client campaign settlement collection is unavailable");
+        if (states.Length != parties.Count)
+        {
+            return RejectJoinBaseline(
+                $"party count mismatch (baseline={states.Length}, client={parties.Count})");
+        }
 
         var liveParties = new HashSet<MobileParty>(parties);
         var liveSettlements = new HashSet<Settlement>(settlements);
         var seenParties = new HashSet<MobileParty>();
-        var resolvedUpdates = new List<ResolvedBehaviorUpdate>(states.Length);
-        var resolvedStates = new List<MobilePartyJoinState>(states.Length);
-        int skipped = 0;
+        var resolved = new ResolvedBehaviorUpdate[states.Length];
 
         for (int i = 0; i < states.Length; i++)
         {
             PartyBehaviorUpdateData behavior = states[i].Behavior;
-            if (string.IsNullOrEmpty(behavior.MobilePartyId) ||
-                !this.objectManager.TryGetObject(behavior.MobilePartyId, out MobileParty party) ||
-                !liveParties.Contains(party) ||
-                !seenParties.Add(party) ||
-                !TryPrepare(party, behavior, liveParties, liveSettlements, out ResolvedBehaviorUpdate prepared))
+            if (string.IsNullOrEmpty(behavior.MobilePartyId))
+                return RejectJoinBaseline($"state {i} has no mobile-party id");
+            if (!this.objectManager.TryGetObject(
+                behavior.MobilePartyId,
+                out MobileParty party))
             {
-                skipped++;
-                continue;
+                return RejectJoinBaseline(
+                    $"state {i} references missing mobile party '{behavior.MobilePartyId}'");
             }
-
-            resolvedUpdates.Add(prepared);
-            resolvedStates.Add(states[i]);
+            if (!liveParties.Contains(party))
+            {
+                return RejectJoinBaseline(
+                    $"state {i} party '{behavior.MobilePartyId}' is not in the client campaign collection");
+            }
+            if (!seenParties.Add(party))
+                return RejectJoinBaseline($"state {i} duplicates party '{behavior.MobilePartyId}'");
+            if (!TryPrepare(
+                party,
+                behavior,
+                liveParties,
+                liveSettlements,
+                logLookupFailures: false,
+                out resolved[i],
+                out string failure))
+            {
+                return RejectJoinBaseline(
+                    $"state {i} party '{behavior.MobilePartyId}' failed validation: {failure}");
+            }
         }
 
-        if (resolvedUpdates.Count == 0)
+        if (seenParties.Count != liveParties.Count)
         {
-            Logger.Error(
-                "[PartySync] Join baseline resolved none of its {Total} party state(s); this client can then only " +
-                "learn a party's behaviour if it later changes, so parties with standing orders will never move",
-                states.Length);
-            return false;
+            return RejectJoinBaseline(
+                $"party coverage mismatch (baseline={seenParties.Count}, client={liveParties.Count})");
         }
 
         try
@@ -356,33 +344,45 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
             beforeApply();
             using (new AllowedThread())
             {
-                for (int i = 0; i < resolvedUpdates.Count; i++)
+                for (int i = 0; i < resolved.Length; i++)
                 {
-                    ApplyJoinState(resolvedUpdates[i].Party, resolvedStates[i]);
-                    ApplyBehavior(resolvedUpdates[i], resetPath: true);
+                    ApplyJoinState(resolved[i].Party, states[i]);
+                    ApplyBehavior(resolved[i], resetPath: true);
                 }
             }
 
-            if (skipped > 0)
-            {
-                Logger.Warning(
-                    "[PartySync] Join baseline applied to {Applied} of {Total} party state(s); {Skipped} did not " +
-                    "resolve and will stay still until their orders next change",
-                    resolvedUpdates.Count, states.Length, skipped);
-            }
-            else
-            {
-                Logger.Information(
-                    "[PartySync] Join baseline applied to all {Applied} party state(s)", resolvedUpdates.Count);
-            }
-
+            lastJoinBaselineFailure = null;
+            loggedJoinBaselineFailures.Clear();
             return true;
         }
         catch (Exception ex)
         {
-            Logger.Error(ex, "Failed to apply a mobile-party join baseline");
-            return false;
+            return RejectJoinBaseline(
+                $"application threw {ex.GetType().Name}: {ex.Message}",
+                ex);
         }
+    }
+
+    private bool RejectJoinBaseline(string failure, Exception exception = null)
+    {
+        lastJoinBaselineFailure = failure;
+        if (!loggedJoinBaselineFailures.Add(failure))
+            return false;
+
+        if (exception == null)
+        {
+            Logger.Warning(
+                "Could not apply mobile-party join baseline: {Failure}. Identical retries will not be logged",
+                failure);
+        }
+        else
+        {
+            Logger.Error(
+                exception,
+                "Could not apply mobile-party join baseline: {Failure}. Identical retries will not be logged",
+                failure);
+        }
+        return false;
     }
 
     private bool TryPrepare(
@@ -390,34 +390,40 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
         PartyBehaviorUpdateData data,
         HashSet<MobileParty> liveParties,
         HashSet<Settlement> liveSettlements,
-        out ResolvedBehaviorUpdate resolved)
+        bool logLookupFailures,
+        out ResolvedBehaviorUpdate resolved,
+        out string failure)
     {
         resolved = default;
-        if (party?.Ai == null ||
-            !TryResolveInteractable(data, out IInteractablePoint interactable) ||
-            !TryResolve(data.TargetPartyId, out MobileParty targetParty) ||
-            !TryResolve(data.TargetSettlementId, out Settlement targetSettlement) ||
-            !TryResolve(data.MoveTargetPartyId, out MobileParty moveTargetParty))
-        {
-            return false;
-        }
+        failure = null;
+        if (party == null)
+            return FailPreparation("party is unavailable", out failure);
+        if (party.Ai == null)
+            return FailPreparation("party AI is unavailable", out failure);
+        if (!TryResolveInteractable(data, out IInteractablePoint interactable, logLookupFailures))
+            return FailPreparation($"interactable '{data.InteractablePointId}' could not be resolved", out failure);
+        if (!TryResolve(data.TargetPartyId, out MobileParty targetParty, logLookupFailures))
+            return FailPreparation($"target party '{data.TargetPartyId}' could not be resolved", out failure);
+        if (!TryResolve(data.TargetSettlementId, out Settlement targetSettlement, logLookupFailures))
+            return FailPreparation($"target settlement '{data.TargetSettlementId}' could not be resolved", out failure);
+        if (!TryResolve(data.MoveTargetPartyId, out MobileParty moveTargetParty, logLookupFailures))
+            return FailPreparation($"move target party '{data.MoveTargetPartyId}' could not be resolved", out failure);
 
         if (data.PartyMoveMode == MoveModeType.Party && moveTargetParty == null)
-            return false;
+            return FailPreparation("party movement mode requires a move target", out failure);
 
-        if (liveParties != null &&
-            ((targetParty != null && !liveParties.Contains(targetParty)) ||
-             (moveTargetParty != null && !liveParties.Contains(moveTargetParty)) ||
-             !IsLiveInteractable(interactable, liveParties, liveSettlements)))
-        {
-            return false;
-        }
+        if (liveParties != null && targetParty != null && !liveParties.Contains(targetParty))
+            return FailPreparation($"target party '{data.TargetPartyId}' is not live", out failure);
+        if (liveParties != null && moveTargetParty != null && !liveParties.Contains(moveTargetParty))
+            return FailPreparation($"move target party '{data.MoveTargetPartyId}' is not live", out failure);
+        if (liveParties != null && !IsLiveInteractable(interactable, liveParties, liveSettlements))
+            return FailPreparation($"interactable '{data.InteractablePointId}' is not live", out failure);
 
         if (liveSettlements != null &&
             targetSettlement != null &&
             !liveSettlements.Contains(targetSettlement))
         {
-            return false;
+            return FailPreparation($"target settlement '{data.TargetSettlementId}' is not live", out failure);
         }
 
         resolved = new ResolvedBehaviorUpdate(
@@ -428,6 +434,12 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
             targetSettlement,
             moveTargetParty);
         return true;
+    }
+
+    private static bool FailPreparation(string reason, out string failure)
+    {
+        failure = reason;
+        return false;
     }
 
     private static bool IsLiveInteractable(
@@ -502,22 +514,27 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
         }
     }
 
-    private bool TryResolveInteractable(PartyBehaviorUpdateData data, out IInteractablePoint interactable)
+    private bool TryResolveInteractable(
+        PartyBehaviorUpdateData data,
+        out IInteractablePoint interactable,
+        bool logLookupFailures = true)
     {
         interactable = null;
         if (data.InteractablePointId == null)
             return true;
         if (data.IsInteractableAnchor)
-            return TryResolve(data.InteractablePointId, out MobileParty owner) &&
+            return TryResolve(data.InteractablePointId, out MobileParty owner, logLookupFailures) &&
                 (interactable = owner.Anchor) != null;
-        return TryResolve(data.InteractablePointId, out PartyBase partyBase) &&
+        return TryResolve(data.InteractablePointId, out PartyBase partyBase, logLookupFailures) &&
             (interactable = partyBase) != null;
     }
 
-    private bool TryResolve<T>(string id, out T value) where T : class
+    private bool TryResolve<T>(string id, out T value, bool logLookupFailures = true) where T : class
     {
         value = null;
-        return id == null || objectManager.TryGetObjectWithLogging(id, out value);
+        return id == null || (logLookupFailures
+            ? objectManager.TryGetObjectWithLogging(id, out value)
+            : objectManager.TryGetObject(id, out value));
     }
 
     private bool TryGetInteractableReference(IInteractablePoint interactable, out string id, out bool isAnchor)
