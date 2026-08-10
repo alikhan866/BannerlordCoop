@@ -2,6 +2,7 @@
 using Common.Messaging;
 using Common.Network;
 using GameInterface.Services.ObjectManager;
+using GameInterface.Services.Players;
 using GameInterface.Services.Settlements.Handlers;
 using GameInterface.Services.Settlements.Messages;
 using Moq;
@@ -53,10 +54,14 @@ public class SettlementOwnershipHandlerThreadingTests
             .Setup(b => b.Subscribe(It.IsAny<SettlementOwnershipMessageHandler>()))
             .Callback<SettlementOwnershipMessageHandler>(s => subscriber = s);
 
+        // The fourth argument arrived with the client-gift flow: the handler re-derives who may give a
+        // fief away, which needs the player registry. This test only exercises the ownership-change
+        // replication path, so an unconfigured mock is enough.
         using var handler = new SettlementOwnershipHandler(
             messageBroker.Object,
             objectManager.Object,
-            new Mock<INetwork>().Object);
+            new Mock<INetwork>().Object,
+            new Mock<IPlayerManager>().Object);
         Assert.NotNull(subscriber);
 
         var releasePump = new ManualResetEventSlim(false);
