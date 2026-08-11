@@ -1,10 +1,13 @@
 ﻿using Common;
 using Common.Logging;
 using Common.Util;
+using GameInterface.Services.MobileParties.Extensions;
 using GameInterface.Services.ObjectManager;
+using HarmonyLib;
 using Serilog;
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using TaleWorlds.CampaignSystem;
 using TaleWorlds.CampaignSystem.Map;
 using TaleWorlds.CampaignSystem.Naval;
@@ -198,6 +201,7 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
             NavigationTransitionStartTimeTicks = party.NavigationTransitionStartTime.NumTicks,
             StartTransitionNextFrameToExitFromPort = party.StartTransitionNextFrameToExitFromPort,
             ForceAiNoPathMode = party.ForceAiNoPathMode,
+            IsActive = party.IsActive,
         };
         failure = null;
         return true;
@@ -289,10 +293,17 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
             return RejectJoinBaseline("the client campaign mobile-party collection is unavailable");
         if (settlements == null)
             return RejectJoinBaseline("the client campaign settlement collection is unavailable");
+        // Activation is authoritative world state and must be applied BEFORE anything is validated
+        // against it: CampaignObjectManager.MobileParties holds only ACTIVE parties, so a party the
+        // joiner has but has deactivated is missing from every count and every walk of that
+        // collection. Reconciling here is what makes the comparison below meaningful.
+        ApplyServerActivation(states, parties);
+
         if (states.Length != parties.Count)
         {
             return RejectJoinBaseline(
-                $"party count mismatch (baseline={states.Length}, client={parties.Count})");
+                $"party count mismatch (baseline={states.Length}, client={parties.Count}); " +
+                DescribeDivergence(states, parties));
         }
 
         var liveParties = new HashSet<MobileParty>(parties);
@@ -342,12 +353,19 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
         try
         {
             beforeApply();
+            // TEMPORARY LOCAL PATCH - DO NOT COMMIT. Apply per party so one bad party cannot abandon the
+            // whole baseline. Seen live: a party whose target reference was dropped by TryCreate arrives with
+            // a targetless GoToSettlement/EscortParty, and MobilePartyAi.UpdateBehavior dereferences it. The
+            // throw aborted the entire baseline, the server resent ~6 MB, and the client looped on the loading
+            // screen forever. Revert this before continuing PR work; the real fix belongs in the PR.
+            int applyFailures = 0;
             using (new AllowedThread())
             {
                 for (int i = 0; i < resolved.Length; i++)
                 {
                     ApplyJoinState(resolved[i].Party, states[i]);
                     ApplyBehavior(resolved[i], resetPath: true);
+
                 }
             }
 
@@ -361,6 +379,180 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
                 $"application threw {ex.GetType().Name}: {ex.Message}",
                 ex);
         }
+    }
+
+    /// <summary>
+    /// Brings the joiner's party activation in line with the server's before the baseline is validated.
+    /// </summary>
+    /// <remarks>
+    /// The joiner does not lose parties - it deactivates them. Vanilla campaign code running during world
+    /// load (settlement menu-init being the observed case) flips <c>IsActive</c> on a party the server still
+    /// has active, and the coop guards cannot stop it: they key off whether the object is REGISTERED, which
+    /// during load is indistinguishable from "not registered yet". The party then vanishes from
+    /// <c>CampaignObjectManager.MobileParties</c> and the join is refused for a party that was there the
+    /// whole time. Measured live: baseline=1538 / client=1537, the difference being one castle garrison at
+    /// <c>IsActive=false</c>, on the one client whose own party was sitting in that castle.
+    ///
+    /// Applied under <see cref="AllowedThread"/> so the sync layer treats it as the server speaking rather
+    /// than a local client mutation - which is exactly the distinction the load-time guards could not make.
+    /// </remarks>
+    // MobileParty.IsActive is a plain auto-property - its setter only writes the backing field and does
+    // NOT move the party in or out of CampaignObjectManager.MobileParties. Membership of that collection
+    // is controlled solely by the internal Add/RemoveMobileParty pair, so setting the flag alone leaves a
+    // party that reports IsActive=true and is still invisible to every count and every walk of it.
+    //
+    // Only the ADD half is used here, and the same fact is why. Because the setter is a bare field write,
+    // the SERVER keeps an inactive party in its own collection too - and the baseline is built by walking
+    // exactly that collection, so an IsActive=false party is present in the states array and counted in
+    // states.Length. Mirroring the flag by REMOVING it on the client therefore does not converge the two
+    // sides, it separates them: the client ends one party short of a baseline that still lists it, and the
+    // count check below rejects a join that was correct until this method touched it. Measured live on
+    // 2026-08-11 - baseline=1546 / client=1545, the one difference being the other player's party at
+    // IsActive=false because that player was not connected, which livelocked both joins until the retry
+    // cap disconnected them.
+    private static readonly MethodInfo AddMobilePartyMethod =
+        AccessTools.Method(typeof(CampaignObjectManager), "AddMobileParty", new[] { typeof(MobileParty) });
+
+    /// <summary>
+    /// Identifies a party for a log line without ever throwing.
+    /// </summary>
+    /// <remarks>
+    /// <c>MobileParty.Name</c> dereferences state a half-initialised party may not have, so reading it can
+    /// throw - and a diagnostic that crashes the join it is describing is worse than no diagnostic at all.
+    /// Caught in a unit test where an NRE from get_Name aborted TryApplyJoinBaseline outright.
+    /// </remarks>
+    private static string Describe(MobileParty party)
+    {
+        if (party == null) return "<null>";
+
+        try
+        {
+            var name = party.Name?.ToString();
+            return string.IsNullOrEmpty(name) ? party.StringId : $"{party.StringId} ({name})";
+        }
+        catch
+        {
+            return party.StringId;
+        }
+    }
+
+    private void ApplyServerActivation(MobilePartyJoinState[] states, IEnumerable<MobileParty> parties)
+    {
+        var campaignObjectManager = Campaign.Current?.CampaignObjectManager;
+        if (campaignObjectManager == null) return;
+
+        var inCollection = new HashSet<MobileParty>(parties);
+        int changed = 0;
+        string firstChange = null;
+
+        using (new AllowedThread())
+        {
+            foreach (var state in states)
+            {
+                var id = state.Behavior.MobilePartyId;
+                if (string.IsNullOrEmpty(id)) continue;
+                if (!objectManager.TryGetObject(id, out MobileParty party) || party == null) continue;
+
+                bool present = inCollection.Contains(party);
+                if (party.IsActive == state.IsActive && present) continue;
+
+                party.IsActive = state.IsActive;
+
+                // Membership is RESTORED, never withdrawn - see the remarks above. Guarded on current
+                // membership so a re-add cannot duplicate the party in the list.
+                if (!present)
+                    AddMobilePartyMethod?.Invoke(campaignObjectManager, new object[] { party });
+
+                changed++;
+                firstChange ??= $"{Describe(party)} -> IsActive={state.IsActive}";
+            }
+        }
+
+        if (changed > 0)
+        {
+            Logger.Warning(
+                "[PartySync] Join baseline corrected activation on {Count} party(ies); first {First}",
+                changed,
+                firstChange);
+        }
+    }
+
+    /// <summary>
+    /// Names the parties the two sides disagree about, rather than only how many there are.
+    /// </summary>
+    /// <remarks>
+    /// A bare "baseline=1538, client=1537" says a join is impossible but not why, and identifying the
+    /// single offending party took a night of dumping both clients' party lists and diffing them by
+    /// hand. It turned out to be one garrison. Naming it here turns that into one line.
+    ///
+    /// Capped because a genuinely broken world could differ by hundreds, and a log line that long is
+    /// its own denial of service.
+    /// </remarks>
+    private string DescribeDivergence(MobilePartyJoinState[] states, IEnumerable<MobileParty> parties)
+    {
+        const int MaxNamed = 8;
+
+        // Resolved through the SAME path the apply loop uses. Comparing id STRINGS from the two sides
+        // instead compares two different namespaces - the baseline carries bare ids while the object
+        // manager hands back prefixed ones ("MobileParty_...") - which reports every single party as
+        // diverging and buries the one that actually is.
+        var matched = new Dictionary<MobileParty, string>();
+        var missing = new List<string>();
+        var aliased = new List<string>();
+
+        foreach (var state in states)
+        {
+            var id = state.Behavior.MobilePartyId;
+            if (string.IsNullOrEmpty(id)) continue;
+
+            if (objectManager.TryGetObject(id, out MobileParty resolved) && resolved != null)
+            {
+                // Two DISTINCT server parties resolving to one client object is the failure that hides
+                // behind a count mismatch with nothing missing and nothing extra: N baseline states
+                // collapse onto N-1 client parties. The apply loop's own duplicate check sits after the
+                // count check and so never runs, leaving only the arithmetic to notice.
+                if (matched.TryGetValue(resolved, out string firstId))
+                {
+                    if (aliased.Count < MaxNamed)
+                        aliased.Add($"{id} and {firstId} both resolve to {Describe(resolved)}");
+                    continue;
+                }
+
+                matched[resolved] = id;
+                continue;
+            }
+
+            if (missing.Count < MaxNamed) missing.Add(id);
+        }
+
+        var live = new HashSet<MobileParty>(parties);
+
+        var extra = new List<string>();
+        foreach (var party in parties)
+        {
+            if (party == null || matched.ContainsKey(party)) continue;
+            if (extra.Count >= MaxNamed) break;
+
+            extra.Add(Describe(party));
+        }
+
+        // The case none of the sets above can see: a party the client HAS and can resolve by id, but
+        // which is absent from CampaignObjectManager.MobileParties because that collection only holds
+        // ACTIVE parties. It is counted by the server and not by the client, so the totals differ by
+        // one while nothing is missing, extra, or aliased.
+        var inactive = new List<string>();
+        foreach (var pair in matched)
+        {
+            if (live.Contains(pair.Key)) continue;
+            if (inactive.Count >= MaxNamed) break;
+
+            inactive.Add($"{Describe(pair.Key)} IsActive={pair.Key.IsActive}");
+        }
+
+        return $"onServerNotOnClient=[{string.Join(", ", missing)}] " +
+               $"onClientNotOnServer=[{string.Join(", ", extra)}] " +
+               $"aliased=[{string.Join(", ", aliased)}] " +
+               $"resolvedButNotInClientCollection=[{string.Join(", ", inactive)}]";
     }
 
     private bool RejectJoinBaseline(string failure, Exception exception = null)
@@ -475,6 +667,7 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
     {
         MobileParty party = resolved.Party;
         PartyBehaviorUpdateData data = resolved.Data;
+
 
         // Install targets first because DefaultBehavior can immediately recalculate short-term state.
         party.SetTargetSettlement(resolved.TargetSettlement, data.IsTargetingPort);

@@ -41,6 +41,7 @@ namespace GameInterface.Services.Kingdoms
         bool HandleVoteRequest(string controllerId, KingdomDecisionVoteData voteData);
         void ApplyRemoteVote(string clanId, KingdomDecisionVoteData voteData);
         bool TryResolveDecision(KingdomDecision decision, bool force);
+        void ResolveDecisionsNoLongerWaitingOnAnyone();
         bool HasEligiblePlayerClan(KingdomDecision decision);
         bool TryPublishFinalVoteForElection(KingdomElection election);
         IReadOnlyList<KingdomDecisionVoteManager.KingdomDecisionDebugInfo> GetDecisionDebugInfo(Kingdom kingdom);
@@ -271,7 +272,9 @@ namespace GameInterface.Services.Kingdoms
             if (!TryGetClanId(voterClan, out string voterClanId)) return false;
 
             KingdomDecisionVoteState state = GetOrCreateState(decision);
-            state.RefreshEligibleClanIds(GetEligibleClanIds(decision));
+            // Connected clans only: this is the resolution barrier, and a vote is only ever owed by someone
+            // who can still send one.
+            state.RefreshEligibleClanIds(GetVotingClanIds(decision));
             if (state.IsResolved || !state.EligibleClanIds.Contains(voterClanId)) return false;
             if (!ApplyVote(state, voterClanId, voterClan, voteData)) return false;
 
@@ -305,12 +308,40 @@ namespace GameInterface.Services.Kingdoms
             if (decision == null) return false;
 
             KingdomDecisionVoteState state = GetOrCreateState(decision);
-            state.RefreshEligibleClanIds(GetEligibleClanIds(decision));
+            // Connected clans only — see HandleVoteRequest. A decision left waiting on someone who has gone
+            // can never reach HasAllVotes, which is what pinned players on the Done screen.
+            state.RefreshEligibleClanIds(GetVotingClanIds(decision));
             if (state.EligibleClanIds.Count == 0) return false;
             if (!force && !state.HasAllVotes) return false;
 
             ResolveDecision(state);
             return true;
+        }
+
+        /// <summary>
+        /// [Server] Re-check every tracked decision after the set of connected players changed, resolving any
+        /// that the remaining players have already all voted on.
+        /// </summary>
+        /// <remarks>
+        /// Eligibility is recomputed when a vote arrives or a resolve is attempted, so a decision whose last
+        /// outstanding voter DISCONNECTS has nothing left to trigger it: everyone still present has already
+        /// voted, no further vote is coming, and the decision sits unresolved with those players stuck on the
+        /// Done screen. This is the trigger for that case.
+        ///
+        /// A decision with no connected player clans left is deliberately NOT resolved here — with nobody to
+        /// have chosen it, applying an outcome would decide the kingdom's business on their behalf. It stays
+        /// pending until someone eligible returns.
+        /// </remarks>
+        public void ResolveDecisionsNoLongerWaitingOnAnyone()
+        {
+            // Snapshot: resolving mutates the dictionary.
+            foreach (var decision in DecisionStates.Keys.ToList())
+            {
+                if (decision == null) continue;
+                if (DecisionStates.TryGetValue(decision, out var state) && state.IsResolved) continue;
+
+                TryResolveDecision(decision, force: false);
+            }
         }
 
         public bool HasEligiblePlayerClan(KingdomDecision decision)
@@ -1025,6 +1056,19 @@ namespace GameInterface.Services.Kingdoms
             return new KingdomDecisionVoteState(kingdomId, decisionIndex, decision, GetEligibleClanIds(decision));
         }
 
+        /// <summary>
+        /// Every player clan in this kingdom, whether or not that player is currently connected.
+        /// </summary>
+        /// <remarks>
+        /// Deliberately connection-AGNOSTIC. This answers "is this a decision players vote on, or one the AI
+        /// election settles", and <c>KingdomInterface.AddDecision</c> asks it on the server AND on every client
+        /// to pick that branch. Clients hold no peers for anyone, so a connection-aware answer here would have
+        /// them branch one way while the server branched the other — the decision would exist as a player vote
+        /// on the server and as a resolved AI election on the client.
+        ///
+        /// Connection matters only when deciding whether a vote is still OWED; that is
+        /// <see cref="GetVotingClanIds"/>, applied on the server where the resolution barrier lives.
+        /// </remarks>
         private HashSet<string> GetEligibleClanIds(KingdomDecision decision)
         {
             HashSet<string> eligibleClanIds = new HashSet<string>();
@@ -1042,6 +1086,39 @@ namespace GameInterface.Services.Kingdoms
                 }
             }
             return eligibleClanIds;
+        }
+
+        /// <summary>
+        /// The player clans a decision is still WAITING ON: the eligible ones whose player is connected.
+        /// </summary>
+        /// <remarks>
+        /// A player who is registered but not connected — a friend from an earlier session, or someone who
+        /// dropped mid-vote — can never send a vote, so waiting on their clan leaves the decision permanently
+        /// one vote short. Everyone else sits on the Done screen unable to continue, and only reloading clears
+        /// it (which is what rebuilds the player registry). Every other place that waits on players filters the
+        /// same way, e.g. <c>BattleHandler.CountConnectedPlayersInMapEvents</c>.
+        ///
+        /// Used only by the server's resolution paths. The eligibility question itself stays connection-agnostic
+        /// so server and clients agree on it — see <see cref="GetEligibleClanIds"/>.
+        /// </remarks>
+        internal HashSet<string> GetVotingClanIds(KingdomDecision decision)
+        {
+            HashSet<string> voting = new HashSet<string>();
+            if (playerManager == null || objectManager == null) return voting;
+
+            foreach (var player in playerManager.Players)
+            {
+                if (string.IsNullOrEmpty(player.ClanId)) continue;
+                if (!playerManager.IsConnected(player)) continue;
+                if (!TryGetClan(player.ClanId, decision.Kingdom, out Clan clan)) continue;
+                if (clan.Kingdom != decision.Kingdom) continue;
+
+                if (TryGetClanId(clan, out string clanId))
+                {
+                    voting.Add(clanId);
+                }
+            }
+            return voting;
         }
 
         private bool TryGetVoterClan(string controllerId, KingdomDecision decision, out Clan clan)

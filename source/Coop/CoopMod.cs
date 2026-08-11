@@ -139,9 +139,34 @@ namespace Coop
                 EnsureSafeExitConfig();
             }
 
+            // Decided here rather than in NoHarmonyLoad because the UI patching just below has to know:
+            // without a renderer those patches throw, and a throw would take the whole server with it.
+            headlessRequested = HeadlessServerBootstrap.IsRequested();
+            var headless = headlessRequested;
+
+            // Published so GameInterface can take the render-free path - most importantly for the map
+            // scene, which vanilla cannot build without a renderer.
+            ModInformation.IsHeadless = headless;
+            GameInterface.Services.Headless.HeadlessServices.HostedSaveName = ManagedServerConfig.SaveName;
+            GameInterface.Services.Headless.HeadlessServices.Install();
+
+            // Opt-in, because it writes a line per campaign object: the only way to identify which object a
+            // native crash died inside, since there is no stack to read.
+            GameInterface.Services.Headless.Patches.HeadlessObjectLoadTracePatches.TraceObjects =
+                args.Any(a => a.Equals("/cooptraceload", StringComparison.OrdinalIgnoreCase));
+
             // Boot-apply the loading-window patches so the keepalive guard exists before a host or join waits on PatchAll
-            new Harmony("Coop.UILoading").PatchCategory(
-                typeof(IGameInterface).Assembly, GameInterface.GameInterface.HARMONY_UI_LOADING_CATEGORY);
+            try
+            {
+                new Harmony("Coop.UILoading").PatchCategory(
+                    typeof(IGameInterface).Assembly, GameInterface.GameInterface.HARMONY_UI_LOADING_CATEGORY);
+            }
+            catch (Exception uiPatchFailure) when (headless)
+            {
+                // The loading window these guard does not exist without a renderer, and the assemblies they
+                // patch may not even be loaded. Fatal for a client, irrelevant for a dedicated server.
+                Logger.Warning(uiPatchFailure, "[Headless] skipping the loading-window patches");
+            }
 
             GameThread.Instance.MarkGameThread();
         }
@@ -545,11 +570,14 @@ namespace Coop
             base.OnSubModuleUnloaded();
         }
 
+        private static bool headlessRequested;
         private bool m_IsFirstTick = true;
         private bool _autoStarted = false;
         private bool steamBootAttempted = false;
         protected override void OnApplicationTick(float dt)
         {
+            HeadlessServerBootstrap.NoteEngineTick();
+
             if(m_IsFirstTick)
             {
                 GameThread.Instance.MarkGameThread();
@@ -567,7 +595,10 @@ namespace Coop
             TryShowCrashReportingConsent(isAtMainMenu);
 
             // Boot Steam services once the main menu is up, so a +connect_lobby launch resolves while joining is possible.
-            if (!steamBootAttempted && isAtMainMenu)
+            // A headless server has no main menu and never will, so it boots as soon as it is ticking:
+            // without this it listens on 4200 but advertises nothing, and the only way in is a direct
+            // connection to its address - which is exactly what Steam lobbies exist to avoid.
+            if (!steamBootAttempted && (isAtMainMenu || headlessRequested))
             {
                 steamBootAttempted = true;
                 var steamPump = SteamIntegrationBoot.TryStartWithCallbackPump(
@@ -580,6 +611,13 @@ namespace Coop
             Updateables.UpdateAll(frameTime);
 
             TryManagedServerAutoStart();
+
+            // The command console starts only once the campaign is up. Started during module init the read
+            // blocks on a console handle the engine has not finished with, and typed lines never arrive.
+            if (headlessRequested && GameStateManager.Current?.ActiveState is TaleWorlds.CampaignSystem.GameState.MapState)
+            {
+                HeadlessServerBootstrap.StartConsole();
+            }
 
 #if DEBUG
             TryAutoConnect();
@@ -618,10 +656,17 @@ namespace Coop
             // Keyed on the auto-load save, not the UI-spawned marker: a manually launched
             // /coopsave server also auto-loads without an owner-process id.
             if (!isServer || !ManagedServerConfig.HasAutoLoadSave || _managedAutoStarted) return;
-            if (!(GameStateManager.Current?.ActiveState is InitialState)) return;
+
+            // InitialState is the main menu. A windowless server never reaches it - there is no UI to show
+            // one - so waiting for it there means waiting forever. What the start actually needs is a state
+            // manager to push the loading state onto, so headless waits for that instead.
+            var atMenu = GameStateManager.Current?.ActiveState is InitialState;
+            var headlessReady = headlessRequested && GameStateManager.Current != null;
+            if (!atMenu && !headlessReady) return;
 
             _managedAutoStarted = true;
-            Logger.Information("[ManagedServer] InitialState active — hosting save '{SaveName}'", ManagedServerConfig.SaveName);
+            Logger.Information("[ManagedServer] {Trigger} — hosting save '{SaveName}'",
+                atMenu ? "InitialState active" : "headless engine ready", ManagedServerConfig.SaveName);
 
             try
             {

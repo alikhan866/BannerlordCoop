@@ -9,10 +9,13 @@ using GameInterface.CoopSessionData;
 using GameInterface.Services.CampaignService.Interfaces;
 using GameInterface.Services.Heroes.Interfaces;
 using GameInterface.Services.ObjectManager;
+using GameInterface.Services.Players;
 using ProtoBuf;
 using Serilog;
 using System;
 using System.Threading;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.Party;
 
 namespace Coop.Core.Server.Connections.States;
 
@@ -34,7 +37,9 @@ public class TransferSaveState : ConnectionStateBase
         IConnectionMessageQueue connectionMessageQueue,
         ISendCoalescer coalescer,
         IAttachmentIdMapper attachmentIdMapper,
-        IServerOptionsProvider serverOptionsProvider)
+        IServerOptionsProvider serverOptionsProvider,
+        IPlayerManager playerManager,
+        IObjectManager objectManager)
         : base(connectionLogic)
     {
         GameSaveDataPacket snapshot = default;
@@ -65,6 +70,54 @@ public class TransferSaveState : ConnectionStateBase
                 catch (Exception ex)
                 {
                     Logger.Error(ex, "Failed to broadcast the join save start");
+                }
+
+                // Un-park THIS peer's own party before the snapshot is taken, so the joiner loads a world
+                // in which the party it is about to control is already active.
+                //
+                // Otherwise the party is captured IsActive=false (parked while the player was offline) and
+                // is only restored later, at campaign entry. A party with IsActive=false is not in
+                // CampaignObjectManager.MobileParties and cannot move - but the client shows an interactive
+                // map before the activation replicates, so the player spends the first several seconds
+                // issuing orders to a party the server will not move. Measured live: IsActive flipped
+                // false->true about seven seconds after the map appeared, and movement worked immediately
+                // after. Nothing else changed in that window - the behaviour was Hold throughout.
+                //
+                // Runs inside the same blocking game-thread action as the save, so the activation cannot
+                // race the snapshot boundary it exists to fix.
+                try
+                {
+                    if (playerManager.TryGetPlayer(connectionLogic.Peer, out var joiningPlayer) &&
+                        objectManager.TryGetObject(joiningPlayer.MobilePartyId, out MobileParty joiningParty) &&
+                        joiningParty?.IsActive == false)
+                    {
+                        // Captives stay parked - PlayerPartyVisibilityHandler deliberately keeps a
+                        // prisoner's party inactive, and the snapshot must not undo that.
+                        bool isCaptive =
+                            objectManager.TryGetObject(joiningPlayer.HeroId, out Hero joiningHero) &&
+                            (joiningHero.IsPrisoner || joiningHero.PartyBelongedToAsPrisoner != null);
+
+                        if (isCaptive)
+                        {
+                            Logger.Debug(
+                                "Leaving captive party {PartyId} parked in the join snapshot for peer {PeerId}",
+                                joiningParty.StringId,
+                                connectionLogic.Peer.Id);
+                        }
+                        else
+                        {
+                            joiningParty.IsActive = true;
+                            Logger.Information(
+                                "Activated party {PartyId} before the join snapshot so peer {PeerId} loads it already active",
+                                joiningParty.StringId,
+                                connectionLogic.Peer.Id);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // A failure here costs the joiner a few seconds of immobility, not the join itself.
+                    Logger.Error(ex, "Failed to activate the joining peer's party before the join snapshot");
                 }
 
                 var saveResults = saveInterface.SaveCurrentGame();

@@ -349,6 +349,57 @@ public class CoopBattleFinalizeTests : MapEventTestBase
         AssertPlayerEncounterState(Clients.Last(), PlayerEncounterState.CaptureHeroes);
     }
 
+    /// <summary>
+    /// A winner whose encounter holds the battle through its ENCOUNTERED PARTY rather than through
+    /// <c>_mapEvent</c> is staged for the results pass just the same.
+    /// </summary>
+    /// <remarks>
+    /// That is the shape a player fighting from inside a besieged settlement has: a settlement encounter, so
+    /// <c>PlayerEncounter.Battle</c> (which is only <c>_mapEvent</c>) is null and the battle is reachable just
+    /// through <c>EncounteredBattle</c>. Staging used to test <c>Battle</c> alone, so that player had no loot
+    /// or prisoners staged at all - a defender who won a siege in their own castle got nothing while an ally
+    /// who reinforced from outside collected everything - and, with nothing staged, the map-event-destroy
+    /// fallback then finished their encounter and left them on an unresponsive siege menu.
+    /// </remarks>
+    [Fact]
+    public void WinnerHoldingTheBattleThroughItsEncounteredParty_IsAlsoStagedForBattleResults()
+    {
+        var (ctx, _, _, _) = SetupTwoAlliedPlayersInBattle();
+
+        // One ordinary battle encounter, and one that only knows the battle through the party it encountered.
+        SetMockPlayerEncounter(Clients.First(), mapEventId: ctx.MapEventId);
+        SetMockPlayerEncounter(Clients.Last(), encounteredPartyId: ctx.DefenderPartyId);
+
+        var client1 = Clients.First();
+        client1.Call(() =>
+        {
+            Assert.True(client1.ObjectManager.TryGetObject<MapEvent>(ctx.MapEventId, out var mapEvent));
+            mapEvent.BattleState = BattleState.AttackerVictory;
+        }, ConcludedVictoryDisabledMethods());
+
+        AssertPlayerEncounterState(Clients.First(), PlayerEncounterState.CaptureHeroes);
+        AssertPlayerEncounterState(Clients.Last(), PlayerEncounterState.CaptureHeroes);
+    }
+
+    /// <summary>
+    /// The world-dependent steps a concluded victory would run, which need a live campaign/map scene. Shared by
+    /// the staging tests so both conclude a battle exactly the same way.
+    /// </summary>
+    private List<MethodBase> ConcludedVictoryDisabledMethods()
+        => MapEventDisabledMethods
+            .Append(AccessTools.Method(typeof(DefaultBattleRewardModel), nameof(DefaultBattleRewardModel.GetCaptureMemberChancesForWinnerParties)))
+            .Append(AccessTools.Method(typeof(MapEvent), "LootDefeatedPartyCasualties"))
+            .Append(AccessTools.Method(typeof(MapEvent), "LootDefeatedPartyItems"))
+            .Append(AccessTools.Method(typeof(MapEvent), "LootDefeatedPartyPrisoners"))
+            .Append(AccessTools.Method(typeof(MapEvent), "LootDefeatedPartyShips"))
+            .Append(AccessTools.Method(typeof(MapEvent), "CalculateMapEventResults"))
+            .Append(AccessTools.Method(typeof(MapEvent), "CommitCalculatedMapEventResults"))
+            .Append(AccessTools.Method(typeof(MapEvent), "CaptureDefeatedPartyMembers"))
+            .Append(AccessTools.Method(typeof(MapEvent), "MovePartyToSuitablePositionOnMapEventFinalize"))
+            .Append(AccessTools.Method(typeof(GameMenu), nameof(GameMenu.ExitToLast)))
+            .Append(AccessTools.Method(typeof(MapEventRegistry), "CloseDestroyedMapEventEncounterIfNeeded"))
+            .ToList();
+
     [Fact]
     public void DuplicateBattleStateChange_AfterServerConclusion_DoesNotPublishSecondClose()
     {

@@ -23,6 +23,24 @@ internal class LordConversationsCampaignBehaviorHandler : IHandler
     private const int PrisonerLiberationRelationReward = 10;
     private const int LetLordGoReward = 4;
 
+    /// <summary>
+    /// Relation credited for fighting on a lord's side in a battle they went on to win.
+    /// </summary>
+    /// <remarks>
+    /// The two constants above mirror vanilla exactly - LordConversationsCampaignBehavior exposes
+    /// <c>PlayerReleasesPrisonerRelationChange = 4</c> and <c>PlayerLiberatesPrisonerRelationChange = 10</c>.
+    /// This case has no vanilla constant to mirror: vanilla scales it inside the dialogue consequence from
+    /// the player's own map event, and on a dedicated server that map event belongs to a client and reads as
+    /// null - which is why the call here was commented out with a TODO and the favour went unrewarded
+    /// entirely.
+    ///
+    /// ponytail: a flat reward, matched to vanilla's other "you did me a favour" value, rather than a scaling
+    /// factor invented to look like vanilla's. Crediting a defensible fixed amount is closer to correct than
+    /// crediting nothing, and it needs no protocol change. Upgrade path if the scaling ever matters: compute
+    /// the value on the client, where the map event still exists, and carry it in LordHelpedInBattle.
+    /// </remarks>
+    private const int HelpedInBattleReward = 4;
+
     public LordConversationsCampaignBehaviorHandler(
         IObjectManager objectManager,
         INetwork network,
@@ -129,8 +147,11 @@ internal class LordConversationsCampaignBehaviorHandler : IHandler
             if (!objectManager.TryGetObjectWithLogging<Hero>(data.MainHeroId, out var mainHero)) return;
             if (!objectManager.TryGetObjectWithLogging<Hero>(data.ConversationHeroId, out var conversationHero)) return;
 
-            // TODO: PlayerMapEvent will be null. Need to get relation change without it
-            //ChangeRelationAction.ApplyRelationChangeBetweenHeroes(mainHero, conversationHero, relationChange);
+            // Credited here rather than left to vanilla: the client never reaches
+            // ChangeRelationAction.ApplyInternal (its prefix is ModInformation.IsServer), and the server has
+            // no PlayerMapEvent to scale the reward from, so without this the player fought the battle and
+            // got nothing for it. See HelpedInBattleReward for why the amount is flat.
+            ChangeRelationAction.ApplyRelationChangeBetweenHeroes(mainHero, conversationHero, HelpedInBattleReward);
 
             if (conversationHero.IsPrisoner)
             {

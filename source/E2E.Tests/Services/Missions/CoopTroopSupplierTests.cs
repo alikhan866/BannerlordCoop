@@ -80,16 +80,183 @@ public class CoopTroopSupplierTests
     }
 
     [Fact]
-    public void Supply_SpansMultipleParties_InOrder()
+    public void Supply_SpansMultipleParties_InProportion()
     {
         var supplier = new CoopTroopSupplier("M1", BattleSideEnum.Attacker, null, new BattleAgentBudget());
         supplier.SetReserve(new[] { Party("A", 2, seedBase: 100), Party("B", 3, seedBase: 200) });
 
         Assert.Equal(5, supplier.NumTroopsNotSupplied);
 
-        supplier.SupplyTroops(4); // 2 from A, then 2 from B
-        Assert.Equal(2, SuppliedFor(supplier, "A"));
-        Assert.Equal(2, SuppliedFor(supplier, "B"));
+        // 4 of 5, so each party gives up the same fraction rather than A being drained first.
+        supplier.SupplyTroops(4);
+        Assert.Equal(1, SuppliedFor(supplier, "A")); // 4 * 2/5
+        Assert.Equal(3, SuppliedFor(supplier, "B")); // 4 * 3/5
+    }
+
+    // --- a wave is drawn from every owned party at once -----------------------------------------------
+    // The engine asks for a wave and this supplier decides which of ITS parties fill it. Draining them in
+    // order emptied the first party completely before the second contributed anything, and the receiver's
+    // own party is deliberately first (so the local hero beats the render cap) - so a player in an army
+    // fielded 200 of their own men against the enemy's mixed 200 and fought a gauntlet alone, with the
+    // allied lords arriving one at a time only as those men died.
+    //
+    // Vanilla has no such ordering: MapEventSide.MakeReady builds ONE priority list across every party on
+    // the side, weighted by each party's size, sorts it, and AllocateTroops takes the first N. So a wave is
+    // a proportional cross-section of the whole side. These cover that shape for the parties one client owns.
+
+    [Fact]
+    public void Wave_IsDrawnFromEveryOwnedParty_NotJustTheFirst()
+    {
+        // The reported case: the player's own 200 plus four allied lords of 200, and a 200-man wave.
+        var supplier = new CoopTroopSupplier("M1", BattleSideEnum.Attacker, null, new BattleAgentBudget());
+        supplier.SetReserve(new[]
+        {
+            Party("player", 200, seedBase: 1000, isReceiverPlayerParty: true),
+            Party("lord1", 200, seedBase: 2000),
+            Party("lord2", 200, seedBase: 3000),
+            Party("lord3", 200, seedBase: 4000),
+            Party("lord4", 200, seedBase: 5000),
+        });
+
+        supplier.SupplyTroops(200);
+
+        // 200 across five equal parties: 40 each. Emphatically NOT 200 from the player and 0 from the lords.
+        foreach (var partyId in new[] { "player", "lord1", "lord2", "lord3", "lord4" })
+            Assert.Equal(40, SuppliedFor(supplier, partyId));
+    }
+
+    [Fact]
+    public void Wave_DeliversExactlyTheRequestedCount()
+    {
+        // Short-changing a wave is not a rounding nuisance: CheckDeployment reserves
+        // InitialSpawnNumber - ReservedTroopsCount and skips the whole side while the count falls short, so
+        // a side that never quite fills never gets planned and its players never spawn. Deliberately
+        // indivisible numbers.
+        var supplier = new CoopTroopSupplier("M1", BattleSideEnum.Attacker, null, new BattleAgentBudget());
+        supplier.SetReserve(new[]
+        {
+            Party("A", 333, seedBase: 1000),
+            Party("B", 333, seedBase: 2000),
+            Party("C", 334, seedBase: 3000),
+        });
+
+        foreach (var request in new[] { 1, 7, 50, 101, 337 })
+        {
+            var before = supplier.NumTroopsNotSupplied;
+            supplier.SupplyTroops(request);
+            Assert.Equal(before - request, supplier.NumTroopsNotSupplied);
+        }
+    }
+
+    [Fact]
+    public void Wave_TakesTheRemainderFromPartiesThatStillHaveTroops()
+    {
+        // A party too small for its proportional quota must not leave the wave under-delivered - the rest
+        // of the wave comes from whoever still has men.
+        var supplier = new CoopTroopSupplier("M1", BattleSideEnum.Attacker, null, new BattleAgentBudget());
+        supplier.SetReserve(new[]
+        {
+            Party("tiny", 2, seedBase: 1000),
+            Party("big", 98, seedBase: 2000),
+        });
+
+        supplier.SupplyTroops(50);
+
+        Assert.Equal(50, 100 - supplier.NumTroopsNotSupplied);
+        Assert.True(SuppliedFor(supplier, "tiny") <= 2, "cannot supply more than it holds");
+        Assert.Equal(50 - SuppliedFor(supplier, "tiny"), SuppliedFor(supplier, "big"));
+    }
+
+    [Fact]
+    public void Wave_StillFieldsTheReceiversOwnHero_WhenTheirPartyIsOneManInABigArmy()
+    {
+        // "One player with only himself" against an army: proportionally he rounds to nothing, but a player
+        // who never spawns has no agent to control and the deployment has no player.
+        var supplier = new CoopTroopSupplier("M1", BattleSideEnum.Attacker, null, new BattleAgentBudget());
+        supplier.SetReserve(new[]
+        {
+            Party("player", 1, seedBase: 1000, isReceiverPlayerParty: true),
+            Party("lord", 999, seedBase: 2000),
+        });
+
+        supplier.SupplyTroops(100);
+
+        Assert.Equal(1, SuppliedFor(supplier, "player"));
+        Assert.Equal(99, SuppliedFor(supplier, "lord")); // still exactly 100 in total
+    }
+
+    [Fact]
+    public void Wave_AcrossThreeOwners_ApportionsWithinEachAndSumsToTheAllocation()
+    {
+        // Both layers at once, with more than two clients: the side's wave is split BETWEEN owners
+        // (OwnedShareOf), and each owner then splits its own share ACROSS its parties. Neither layer may
+        // drop or duplicate a troop, and every owner's parties must contribute — the host holding several
+        // AI lords must not field them one party at a time any more than a single client does.
+        const int sideTotal = 900;
+        const int sideAllocation = 300;
+
+        // Host: its own party plus two AI lords. Two other players with one party each.
+        var host = new CoopTroopSupplier("M1", BattleSideEnum.Attacker, null, new BattleAgentBudget());
+        host.SetReserve(new[]
+        {
+            Party("host", 100, seedBase: 1000, isReceiverPlayerParty: true, sideOffset: 0, playerOwnedRank: 0),
+            Party("ai-1", 200, seedBase: 2000, sideOffset: 100),
+            Party("ai-2", 200, seedBase: 3000, sideOffset: 300),
+        }, sideTotal: sideTotal, playerOwnedParties: 3);
+
+        var second = new CoopTroopSupplier("M1", BattleSideEnum.Attacker, null, new BattleAgentBudget());
+        second.SetReserve(new[]
+        {
+            Party("p2", 200, seedBase: 4000, isReceiverPlayerParty: true, sideOffset: 500, playerOwnedRank: 1),
+        }, sideTotal: sideTotal, playerOwnedParties: 3);
+
+        var third = new CoopTroopSupplier("M1", BattleSideEnum.Attacker, null, new BattleAgentBudget());
+        third.SetReserve(new[]
+        {
+            Party("p3", 200, seedBase: 5000, isReceiverPlayerParty: true, sideOffset: 700, playerOwnedRank: 2),
+        }, sideTotal: sideTotal, playerOwnedParties: 3);
+
+        var owners = new[] { host, second, third };
+
+        // The between-owner split is exact.
+        var shares = owners.Select(o => o.OwnedShareOf(sideAllocation)).ToArray();
+        Assert.Equal(sideAllocation, shares.Sum());
+
+        // Each owner delivers exactly its own share.
+        for (int i = 0; i < owners.Length; i++)
+        {
+            var before = owners[i].NumTroopsNotSupplied;
+            owners[i].SupplyTroops(shares[i]);
+            Assert.Equal(shares[i], before - owners[i].NumTroopsNotSupplied);
+        }
+
+        // And the host drew from ALL THREE of its parties, not just the first.
+        foreach (var partyId in new[] { "host", "ai-1", "ai-2" })
+            Assert.True(SuppliedFor(host, partyId) > 0, $"{partyId} contributed nothing to the wave");
+
+        // Every player fielded someone, however small their share.
+        Assert.True(SuppliedFor(host, "host") > 0);
+        Assert.True(SuppliedFor(second, "p2") > 0);
+        Assert.True(SuppliedFor(third, "p3") > 0);
+    }
+
+    [Fact]
+    public void Wave_KeepsProportionAcrossSuccessiveWaves()
+    {
+        // Reinforcement waves re-apportion against what is LEFT, so the mix stays representative instead of
+        // drifting once a party runs dry.
+        var supplier = new CoopTroopSupplier("M1", BattleSideEnum.Attacker, null, new BattleAgentBudget());
+        supplier.SetReserve(new[]
+        {
+            Party("A", 100, seedBase: 1000),
+            Party("B", 100, seedBase: 2000),
+        });
+
+        supplier.SupplyTroops(50);
+        supplier.SupplyTroops(50);
+
+        Assert.Equal(50, SuppliedFor(supplier, "A"));
+        Assert.Equal(50, SuppliedFor(supplier, "B"));
     }
 
     [Fact]
@@ -149,7 +316,7 @@ public class CoopTroopSupplierTests
         // same troops). Parties that remain keep their monotonic pointer.
         var supplier = new CoopTroopSupplier("M1", BattleSideEnum.Defender, null, new BattleAgentBudget());
         supplier.SetReserve(new[] { Party("returned", 4, seedBase: 100), Party("kept", 3, seedBase: 200) });
-        supplier.SupplyTroops(1); // pointer advanced on "returned" before the shrink lands
+        supplier.SupplyOneTroopFromParty("returned"); // pointer advanced on "returned" before the shrink lands
 
         supplier.SetReserve(new[] { Party("kept", 3, seedBase: 200) });
 

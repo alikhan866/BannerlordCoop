@@ -58,14 +58,28 @@ internal class BattleSimulationStartPatch
         if (coordinator == null)
             return true; // not wired (shouldn't happen in a live session) — fall back to native behavior
 
-        var mapEvent = GetPlayerEncounterBattleForTrace() ?? MobileParty.MainParty?.MapEvent;
+        // Every way an encounter can hold its battle, not just PlayerEncounter.Battle: a player helping an
+        // ally has an encounter with that ALLY's party, so the battle is only reachable through
+        // EncounteredBattle.
+        var mapEvent = LocalBattleLookup.Resolve();
         if (mapEvent == null)
-            return true;
+        {
+            // Fail the way the attack option does (EncounterAttackConsequencePatch): do nothing and leave the
+            // menu up. Running the native consequence here instead opened the auto-resolve scoreboard WITHOUT
+            // the server having accepted it and without this client becoming the pacer, so no round ever
+            // advanced and no result ever arrived - the player sat on a battle screen with no Done button,
+            // their party stuck in the battle. A menu that stays put is recoverable; that was not.
+            Logger.Warning("Client clicked send-troops but no battle could be resolved for it; leaving the menu open");
+            return false;
+        }
 
         if (!ContainerProvider.TryResolve<IObjectManager>(out var objectManager))
             return true;
         if (!objectManager.TryGetId(mapEvent, out var mapEventId))
+        {
+            Logger.Warning("Client clicked send-troops for a battle the object manager does not know; leaving the menu open");
             return false;
+        }
         if (!objectManager.TryGetId(MobileParty.MainParty, out var attackerPartyId))
             return false;
 

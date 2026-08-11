@@ -13,6 +13,7 @@ using TaleWorlds.CampaignSystem.Actions;
 using TaleWorlds.CampaignSystem.CampaignBehaviors;
 using TaleWorlds.CampaignSystem.Encounters;
 using TaleWorlds.CampaignSystem.GameMenus;
+using TaleWorlds.CampaignSystem.MapEvents;
 using TaleWorlds.CampaignSystem.Party;
 using TaleWorlds.CampaignSystem.Settlements;
 using TaleWorlds.CampaignSystem.Siege;
@@ -170,6 +171,12 @@ public interface ISiegeEventInterface : IGameAbstraction
     /// assault map event, so it can then enter the mission.
     /// </summary>
     void PromptSiegeAssault(MobileParty attackerParty, Settlement settlement);
+
+    /// <summary>
+    /// Adopts an already-replicated siege assault this party is seated in as the local player encounter.
+    /// </summary>
+    /// <returns>True when an encounter now exists (adopted here or already present).</returns>
+    bool TryAdoptReplicatedAssaultEncounter();
 
     /// <summary>
     /// Records the aftermath the server applied so the local settlement-taken menus narrate it, and
@@ -734,10 +741,14 @@ internal class SiegeEventInterface : ISiegeEventInterface, IDisposable
     {
         // Mirrors the defender branch of vanilla EncounterManager.StartSettlementEncounter, which never
         // runs on this machine because the attacker party is not controlled here.
-        if (MobileParty.MainParty?.CurrentSettlement != settlement) return;
-
         var mapEvent = attackerParty.MapEvent;
         if (mapEvent == null) return;
+
+        if (MobileParty.MainParty?.CurrentSettlement != settlement)
+        {
+            PromptSiegeDefenseFromOutside(mapEvent, settlement);
+            return;
+        }
 
         if (PartyBase.MainParty.MapEventSide != mapEvent.DefenderSide)
         {
@@ -764,6 +775,98 @@ internal class SiegeEventInterface : ISiegeEventInterface, IDisposable
             PlayerEncounter.Start();
             PlayerEncounter.Current.Init(attackerParty.Party, settlement.Party, settlement);
         }
+    }
+
+    /// <summary>
+    /// Seats a relief force - a defender fighting the assault from OUTSIDE the walls - in its player encounter.
+    /// </summary>
+    /// <remarks>
+    /// The defender prompt used to require <c>CurrentSettlement == settlement</c>, i.e. standing inside the
+    /// besieged town. A player who marches to relieve their own settlement and answers "help the defenders"
+    /// never satisfies that, so the prompt returned before establishing a PlayerEncounter - while the server
+    /// had already seated the party on the defender side.
+    ///
+    /// The result was a player who was demonstrably IN the battle (their party listed on the defender side,
+    /// counted in its strength) and could do nothing about it: with no PlayerEncounter,
+    /// <see cref="Patches.EncounterAssaultInitGuardPatch"/> bounces the encounter menu back on every init, so
+    /// the assault menu renders with "Leave..." as its only option. Measured live at Syronea (town_ES7): four
+    /// attempts, each logging "leaving this to vanilla ... besieger leader is already in a battle", each
+    /// bounced straight back.
+    ///
+    /// Uses the PARAMETERLESS Init(), for the same reason the besieger branch does: it adopts
+    /// MainParty.MapEvent through InitAux, whereas the 3-arg overload the inside-defender uses re-creates the
+    /// siege event - which for a party the server already seated would desync it.
+    ///
+    /// Requires the authoritative defender seat. Without it there is no replicated event to adopt, and
+    /// starting an encounter here would invent one locally.
+    /// </remarks>
+    /// <summary>
+    /// Adopts an already-replicated siege assault this party is seated in as the local player encounter.
+    /// </summary>
+    /// <remarks>
+    /// The prompts that normally establish the encounter - NetworkPromptSiegeAssault and
+    /// NetworkPromptSiegeDefense - are ONE-SHOT broadcasts sent when the assault begins. Anyone who is not
+    /// listening at that instant never gets one: a relief force that answers "help the defenders" after the
+    /// walls are already being stormed, a player who joins the defenders late, or any client that
+    /// reconnects (or whose server restarts) while the assault is in progress.
+    ///
+    /// Such a party is seated in the battle by the server and counted in its side's strength, but has no
+    /// PlayerEncounter - so <see cref="Patches.EncounterAssaultInitGuardPatch"/> bounces the encounter menu
+    /// on every init and the assault menu renders with "Leave..." as its only option, permanently. Measured
+    /// live at Syronea: zero NetworkPromptSiegeDefense sent all session, because the assault had started
+    /// before the server loaded the save at all.
+    ///
+    /// The seat is the precondition, deliberately. It is the server's own statement that this party belongs
+    /// in this battle, so adopting is recognising replicated state rather than inventing local state. With no
+    /// seat we are in the frame-or-two race the guard was written for, and bouncing is still right.
+    ///
+    /// Parameterless Init() for the same reason the besieger branch uses it: it adopts MainParty.MapEvent
+    /// through InitAux, where the 3-arg overload re-creates the siege event and would desync a party the
+    /// server already placed.
+    /// </remarks>
+    public bool TryAdoptReplicatedAssaultEncounter()
+    {
+        if (PlayerEncounter.Current != null) return true;
+
+        var mainParty = MobileParty.MainParty;
+        var mapEvent = mainParty?.MapEvent;
+        if (mapEvent == null || !mapEvent.IsSiegeAssault) return false;
+
+        // No seat means the sides have not replicated yet - that IS the race, so let the caller bounce.
+        if (PartyBase.MainParty?.MapEventSide == null) return false;
+
+        using (new AllowedThread())
+        {
+            PlayerEncounter.Start();
+            PlayerEncounter.Init();
+        }
+
+        Logger.Information(
+            "Adopted the replicated siege assault at {Settlement} as the local player encounter; no prompt was received for it",
+            mapEvent.MapEventSettlement?.StringId ?? "<none>");
+
+        return PlayerEncounter.Current != null;
+    }
+
+    private void PromptSiegeDefenseFromOutside(MapEvent mapEvent, Settlement settlement)
+    {
+        if (PartyBase.MainParty?.MapEventSide != mapEvent.DefenderSide) return;
+        if (MobileParty.MainParty?.MapEvent == null) return;
+
+        using (new AllowedThread())
+        {
+            if (PlayerEncounter.Current != null)
+            {
+                PlayerEncounter.Finish(forcePlayerOutFromSettlement: false);
+            }
+
+            PlayerEncounter.Start();
+            PlayerEncounter.Init();
+        }
+
+        Logger.Information(
+            "Seated a relief defender in the assault encounter at {Settlement} from outside the walls",
+            settlement.StringId);
     }
 
     public void PromptSiegeAssault(MobileParty attackerParty, Settlement settlement)

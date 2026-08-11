@@ -22,6 +22,7 @@ namespace Coop.Core.Server.Services.Stances.Handlers
             this.objectManager = objectManager;
             messageBroker.Subscribe<FactionWarDeclared>(HandleLocalWarDeclared);
             messageBroker.Subscribe<FactionPeaceMade>(HandleLocalPeaceMade);
+            messageBroker.Subscribe<WarStatsRecorded>(HandleLocalWarStats);
         }
 
         private void HandleLocalWarDeclared(MessagePayload<FactionWarDeclared> obj)
@@ -44,10 +45,25 @@ namespace Coop.Core.Server.Services.Stances.Handlers
             network.SendAll(new NetworkMakePeace(faction1Id, faction2Id, payload.DailyTribute, payload.DailyTributeDuration, payload.Detail));
         }
 
+        private void HandleLocalWarStats(MessagePayload<WarStatsRecorded> obj)
+        {
+            var payload = obj.What;
+
+            if (!objectManager.TryGetIdWithLogging(payload.Faction1, out var faction1Id)) return;
+            if (!objectManager.TryGetIdWithLogging(payload.Faction2, out var faction2Id)) return;
+
+            network.SendAll(new NetworkWarStats(faction1Id, faction2Id,
+                payload.TroopCasualties1, payload.TroopCasualties2,
+                payload.SuccessfulSieges1, payload.SuccessfulSieges2,
+                payload.SuccessfulTownSieges1, payload.SuccessfulTownSieges2,
+                payload.SuccessfulRaids1, payload.SuccessfulRaids2));
+        }
+
         public void Dispose()
         {
             messageBroker.Unsubscribe<FactionWarDeclared>(HandleLocalWarDeclared);
             messageBroker.Unsubscribe<FactionPeaceMade>(HandleLocalPeaceMade);
+            messageBroker.Unsubscribe<WarStatsRecorded>(HandleLocalWarStats);
         }
     }
 }

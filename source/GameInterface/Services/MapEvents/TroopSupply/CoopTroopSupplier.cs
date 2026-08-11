@@ -158,6 +158,57 @@ public class CoopTroopSupplier : IMissionTroopSupplier
         }
     }
 
+    /// <summary>
+    /// Winds every party's supplied pointer back to the start of its reserve, for a round restart.
+    /// </summary>
+    /// <remarks>
+    /// A restart clears the field and spawns the battle again from scratch, so the reserve has to be drawable
+    /// from the top - otherwise the second round can only field whatever the first round had not reached, and a
+    /// side that had already spawned most of its men would come back nearly empty.
+    ///
+    /// Deliberately separate from <see cref="SetReserve"/>, which refuses to rewind: an authoritative resend that
+    /// moved a pointer backwards would re-supply troops that are already on the field, so that guard has to stay.
+    /// A restart is the one case where rewinding is the whole point, and saying so explicitly keeps the two
+    /// intentions from being confused for one another.
+    ///
+    /// Casualty counters are left alone. They describe men who died in the battle, and a restart re-forms the
+    /// lines - it does not resurrect anyone the campaign has already been told about.
+    /// </remarks>
+    public void RewindForRoundRestart()
+    {
+        lock (gate)
+        {
+            foreach (var party in parties) party.Supplied = 0;
+            reserveRevision++;
+        }
+
+        Logger.Information("[TroopSupply] Supplier {MapEvent} side {Side}: rewound for a round restart", MapEventId, Side);
+    }
+
+    /// <summary>
+    /// Hands one troop of <paramref name="partyId"/> back to the reserve, so it can be fielded again later.
+    /// </summary>
+    /// <remarks>
+    /// Used when a troop is stood down to keep a side within the battle size. The man has not died and has not
+    /// left the battle - he is waiting again, exactly like one who was never fielded - so the pointer moves
+    /// back one and he returns through the ordinary reinforcement path as casualties make room. Without this he
+    /// would be gone from the fight for good, which is not what standing down means.
+    /// </remarks>
+    public void ReturnOneToReserve(string partyId)
+    {
+        if (string.IsNullOrEmpty(partyId)) return;
+
+        lock (gate)
+        {
+            foreach (var party in parties)
+            {
+                if (party.PartyId != partyId) continue;
+                if (party.Supplied > 0) party.Supplied--;
+                return;
+            }
+        }
+    }
+
     public int NumRemovedTroops { get { lock (gate) { return numWounded + numKilled + numRouted; } } }
 
     /// <summary>Whether the server's reserve has arrived (counts/identity known and final).</summary>
@@ -293,7 +344,24 @@ public class CoopTroopSupplier : IMissionTroopSupplier
             if (owned <= 0) return 0;
 
             var total = sideTotalTroops > 0 ? sideTotalTroops : owned;
-            if (owned >= total) return sideAllocation;
+            if (owned >= total)
+            {
+                // Claiming the WHOLE side allocation is only correct when this client really does own the whole
+                // side. With no side total from the server the test cannot tell the difference: total collapses
+                // to owned, so it passes for everyone, and every owner fields the side's entire allowance.
+                //
+                // Measured live: battleSize=400 with 668 agents on the field, and 320 with 518. Logged rather
+                // than clamped, because guessing a smaller share without a denominator risks the opposite
+                // failure - troops that never arrive - and this line proves which case actually fires.
+                if (sideTotalTroops <= 0)
+                {
+                    Logger.Warning(
+                        "[TroopSupply] {MapEvent} side {Side}: no side total from the server, so this client is claiming the FULL allocation of {Allocation} for the {Owned} troops it owns. If another owner does the same, the side fields more than the battle size allows",
+                        MapEventId, Side, sideAllocation, owned);
+                }
+
+                return sideAllocation;
+            }
 
             // One troop of the allocation is set aside for each PLAYER-owned party on the side, before any
             // proportional split happens. That is what makes "every player fields an agent" and "the slices
@@ -445,6 +513,31 @@ public class CoopTroopSupplier : IMissionTroopSupplier
         // planned, so the player's team never spawned and the player had no agent on the field.
         if (numberToAllocate <= 0) return Array.Empty<IAgentOriginBase>();
 
+        // ...but the number arriving is still the engine's idea of the shortfall, and in a coop battle that
+        // idea is wrong. The engine counts a side as `spawned - removed` PER SUPPLIER, so it cannot see the
+        // agents a peer replicated, nor the ones ReinforcementFielder spawns directly for a party that joined
+        // mid-battle. It measures a side of 190 as a side of 90 and asks for the difference. Live, on a battle
+        // sized for 400: three separate requests for 101 men against room for about 13, each landing in under
+        // two seconds and each cut straight back down by the field balancer - spending 300 men out of a reserve
+        // of 534 who never fought, until the reserve read zero and the side could not reinforce at all.
+        //
+        // So the wave is capped by what the FIELD has room for rather than by what the engine believes.
+        // Deliberately this client's OWNED share of that room (the same apportionment that splits every other
+        // side-wide figure), so several owners filling one side cannot each supply all of it.
+        //
+        // Only reinforcement is capped. BattleFieldRoom answers Unlimited while the opening wave is still
+        // landing, because CheckDeployment skips a whole side - plan-making included - if its supplier
+        // under-delivers, and a skipped side never spawns the player an agent.
+        int myQuota = RemainingFieldQuota(ResolveMapEvent());
+        int capped = CapWaveToQuota(numberToAllocate, myQuota);
+        if (capped != numberToAllocate)
+        {
+            Logger.Information("[TroopSupply] {MapEvent} side {Side}: engine asked for {Req}, my remaining quota is {Quota}; supplying {Capped}",
+                MapEventId, Side, numberToAllocate, myQuota, capped);
+            numberToAllocate = capped;
+        }
+        if (numberToAllocate <= 0) return Array.Empty<IAgentOriginBase>();
+
         // BR-110: allocate no more troops than the engine has RENDER-SLOT capacity for — a mounted troop needs
         // two slots (rider + horse). The unallocated remainder stays UNSUPPLIED (wave-eligible), so the native
         // wave logic re-requests it as casualties free slots; the supplied pointer stays aligned with what can
@@ -459,28 +552,121 @@ public class CoopTroopSupplier : IMissionTroopSupplier
         int supplied = 0;
         lock (gate)
         {
+            // Each party gives up its own share of the wave. Draining them in order instead emptied the first
+            // party before the second contributed anything, and the receiver's own party is deliberately first
+            // (below), so a player in an army fielded their whole party against the enemy's mixed wave and
+            // fought it alone - the allied lords trickled in one at a time as those men died.
+            var quota = BuildWaveQuota(numberToAllocate);
+
             bool stop = false;
-            foreach (var party in parties)
+            for (int i = 0; i < parties.Count && !stop; i++)
             {
-                while (!stop && supplied < numberToAllocate && party.Supplied < party.Entries.Length)
+                var party = parties[i];
+                int take = quota[i];
+                while (take > 0 && party.Supplied < party.Entries.Length)
                 {
                     var origin = CreateOrigin(party.Entries[party.Supplied], party.PartyId);
                     int slots = SlotsForOrigin(origin);
-                    // Stop rather than skip: the supplied pointer advances sequentially, so a troop that does
-                    // not fit now must remain unsupplied (wave-eligible) instead of being jumped over.
+                    // Stop rather than skip: the supplied pointer advances sequentially within a party, so a
+                    // troop that does not fit now must remain unsupplied (wave-eligible), not be jumped over.
                     if (slots > slotBudget) { stop = true; break; }
 
                     party.Supplied++;
                     supplied++;
+                    take--;
                     slotBudget -= slots;
                     if (origin != null) origins.Add(origin);
                 }
-                if (stop || supplied >= numberToAllocate) break;
             }
         }
         Logger.Information("[TroopSupply] {MapEvent} side {Side}: SupplyTroops({Req}) -> {Ret} origins ({Withheld} withheld at the engine agent limit), {Remaining} remaining",
             MapEventId, Side, numberToAllocate, origins.Count, numberToAllocate - supplied, NumTroopsNotSupplied);
         return origins;
+    }
+
+    /// <summary>
+    /// How many troops each owned party contributes to one wave, in proportion to what it has LEFT.
+    /// </summary>
+    /// <remarks>
+    /// This is the per-party counterpart of <see cref="OwnedShareOf"/> (which splits a wave between CLIENTS),
+    /// and it mirrors what vanilla does for a whole side: <c>MapEventSide.MakeReady</c> builds one priority
+    /// list spanning every party, weighted by party size, sorts it, and <c>AllocateTroops</c> takes the first
+    /// N - so a vanilla wave is a proportional cross-section of the side rather than one party at a time.
+    ///
+    /// Same cumulative-flooring trick as <see cref="ApportionByInterval"/>: each party takes the difference
+    /// between the wave scaled to the END of its range and to its START, over contiguous non-overlapping
+    /// ranges, so the shares sum to EXACTLY the wave with nothing lost to rounding. That exactness matters -
+    /// CheckDeployment reserves <c>InitialSpawnNumber - ReservedTroopsCount</c> and skips the whole side while
+    /// the count falls short, so a wave that quietly under-delivers stops the side being planned at all.
+    ///
+    /// Weighting by REMAINING rather than by original size keeps later waves representative as parties run
+    /// dry, and guarantees a party is never handed more than it holds (for a wave no larger than the total
+    /// remaining, its share cannot exceed its own remainder), so no party can under-deliver its quota.
+    ///
+    /// Callers hold <see cref="gate"/>.
+    /// </remarks>
+    private int[] BuildWaveQuota(int numberToAllocate)
+    {
+        var quota = new int[parties.Count];
+
+        long totalRemaining = 0;
+        for (int i = 0; i < parties.Count; i++)
+            totalRemaining += parties[i].Entries.Length - parties[i].Supplied;
+        if (totalRemaining <= 0) return quota;
+
+        // Asking for more than exists is normal (the engine asks for a side's whole deficit); apportioning the
+        // capped figure is what keeps each party's share inside its own remainder.
+        long target = Math.Min(numberToAllocate, totalRemaining);
+
+        long cumulative = 0;
+        long allocatedSoFar = 0;
+        for (int i = 0; i < parties.Count; i++)
+        {
+            long remaining = parties[i].Entries.Length - parties[i].Supplied;
+            cumulative += remaining;
+            // long throughout: cumulative * target overflows int for a large army and a large wave, and an
+            // overflow here would hand out a negative or wrapped share.
+            long end = cumulative * target / totalRemaining;
+            quota[i] = (int)Math.Min(end - allocatedSoFar, remaining);
+            allocatedSoFar += quota[i];
+        }
+
+        GuaranteeReceiverPlayerATroop(quota, target);
+        return quota;
+    }
+
+    /// <summary>
+    /// Makes sure the receiver's own party contributes to a non-empty wave, taking the troop from the largest
+    /// share so the wave still totals exactly what was asked for.
+    /// </summary>
+    /// <remarks>
+    /// A player whose party is tiny next to the army it fights with rounds to nothing - "one player with only
+    /// himself" alongside a 999-strong lord is the extreme case. That player would field no agent at all,
+    /// which is not a cosmetic loss: they have nothing to control, and the spawn handler reads a missing
+    /// origin on the side holding the local player as a reason to abort the battle.
+    /// </remarks>
+    private void GuaranteeReceiverPlayerATroop(int[] quota, long target)
+    {
+        if (playerPartyId == null || target <= 0) return;
+
+        int playerIndex = -1;
+        for (int i = 0; i < parties.Count; i++)
+        {
+            if (parties[i].PartyId != playerPartyId) continue;
+            playerIndex = i;
+            break;
+        }
+
+        if (playerIndex < 0 || quota[playerIndex] > 0) return;
+        if (parties[playerIndex].Supplied >= parties[playerIndex].Entries.Length) return; // nothing left to give
+
+        int largest = -1;
+        for (int i = 0; i < quota.Length; i++)
+            if (quota[i] > 0 && (largest < 0 || quota[i] > quota[largest])) largest = i;
+        if (largest < 0) return;
+
+        quota[largest]--;
+        quota[playerIndex]++;
     }
 
     // BR-110: render slots one supplied origin will consume when spawned — a mounted troop spawns a rider and a
@@ -574,6 +760,95 @@ public class CoopTroopSupplier : IMissionTroopSupplier
 
         return ResolveParty(partyId);
     }
+
+    /// <summary>
+    /// How large a wave may actually be supplied: what was asked for, or this client's share of the room the
+    /// field has left, whichever is smaller.
+    /// </summary>
+    /// <param name="requested">What the engine asked for - already this client's share of the phase.</param>
+    /// <param name="sideRoom">Room left on the side, or <see cref="BattleFieldRoom.Unlimited"/>.</param>
+    /// <param name="ownedShareOf">This client's slice of a side-wide figure.</param>
+    /// <remarks>
+    /// Unlimited must pass the request through UNTOUCHED rather than take a share of it. It is the answer both
+    /// while the opening wave is still landing and when the mission has no battle sizing at all, and in the
+    /// first of those the engine cannot tolerate being short-changed: <c>CheckDeployment</c> skips a whole side
+    /// - its plan-making included - while its supplier under-delivers, so a side quietly given a fraction of
+    /// its deployment is never planned and never spawns the player an agent.
+    ///
+    /// The share is taken of the ROOM, not of the request, because room is a side-wide measurement. Several
+    /// clients filling one side each see the same room, and without the share each would supply all of it.
+    /// </remarks>
+    internal static int CapWaveToQuota(int requested, int remainingQuota)
+    {
+        if (remainingQuota == BattleFieldRoom.Unlimited) return requested;
+        if (remainingQuota <= 0) return 0;
+
+        return Math.Min(requested, remainingQuota);
+    }
+
+    /// <summary>
+    /// How many more men THIS client may field on its side: its share of the side's allocation, less the men
+    /// it already has standing there.
+    /// </summary>
+    /// <remarks>
+    /// A private quota rather than a share of the contended leftovers. The previous rule - this client's share
+    /// of the room still free on the side - reads zero for everyone the moment the side is full, and every
+    /// share of zero is zero. That made fielding a race: as casualties opened room, whoever asked first took
+    /// it, and the battle host asks constantly while a joining client asks every few seconds.
+    ///
+    /// A joining player lost that race for an entire battle: one troop fielded, his own hero, then "asked for
+    /// 64, room for 0" every three seconds while holding 950 men in reserve. He had nothing of his own on the
+    /// field, which is also why he had nothing to command.
+    ///
+    /// Counted from THIS supplier's own agents, not the side's, so another owner filling its quota can never
+    /// consume ours. Unlimited passes straight through: it means no sizing exists yet, and deployment must not
+    /// be short-changed.
+    /// </remarks>
+    public int RemainingFieldQuota(MapEvent mapEvent)
+    {
+        var target = BattleFieldRoom.SideTarget(mapEvent, Side);
+        if (target == BattleFieldRoom.Unlimited) return BattleFieldRoom.Unlimited;
+
+        return Math.Max(0, OwnedShareOf(target) - CountMyTroopsOnField(Mission.Current));
+    }
+
+    /// <summary>Live men on the field that came out of THIS supplier's reserve.</summary>
+    /// <remarks>
+    /// Matched by the party the troop was supplied from, which is the only link back to a supplier that
+    /// survives replication and ownership changes. Guarded because it walks the agent list on the game thread
+    /// and an agent mid-removal is not guaranteed to answer.
+    /// </remarks>
+    private int CountMyTroopsOnField(Mission mission)
+    {
+        var agents = mission?.Agents;
+        if (agents == null) return 0;
+
+        int count = 0;
+        foreach (var agent in agents)
+        {
+            try
+            {
+                if (agent == null || !agent.IsActive() || !agent.IsHuman) continue;
+                if ((agent.Team?.Side ?? BattleSideEnum.None) != Side) continue;
+                if (agent.Origin is not CoopAgentOrigin origin) continue;
+                if (!ContainsParty(origin.MapEventPartyId)) continue;
+
+                count++;
+            }
+            catch
+            {
+                // An agent that cannot answer is one we should not count; it is on its way off the field.
+            }
+        }
+        return count;
+    }
+
+    // The battle this supplier serves, or null when it cannot be resolved this instant — which the caller must
+    // read as "cannot verify the sizing", not as "there is no sizing".
+    private MapEvent ResolveMapEvent()
+        => objectManager != null && objectManager.TryGetObject<MapEvent>(MapEventId, out var mapEvent)
+            ? mapEvent
+            : null;
 
     // partyId is a MapEventParty object id (what the builder stored), not a MobileParty id. MapEventParty.Party
     // is the PartyBase the engine needs for the agent's team/combatant and player-command checks.

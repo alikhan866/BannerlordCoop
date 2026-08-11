@@ -4,6 +4,7 @@ using Common.Messaging;
 using GameInterface.Services.MapEvents;
 using GameInterface.Services.MapEvents.Messages;
 using Missions.Agents;
+using Missions.Agents.Patches;
 using Missions.Messages;
 using Missions.Missiles.Handlers;
 using Missions.Missiles.Message;
@@ -154,6 +155,10 @@ public class BattleDamageRouter : IBattleDamageRouter
         reconstructions.Clear();
         reconstructionHistory.Clear();
         while (inboundDamage.TryDequeue(out _)) { }
+
+        // Agent indices are unique within a mission and reused by the next one, so a tally carried across would
+        // attribute a fresh agent's first hit to whatever stood at that index last battle.
+        ResetDamageTally();
 
         if (BattleSpawnGate.MountAuthorityProbe == mountAuthorityProbe)
             BattleSpawnGate.MountAuthorityProbe = null;
@@ -346,8 +351,27 @@ public class BattleDamageRouter : IBattleDamageRouter
             return;
         }
 
-        Logger.Warning(
-            "Local hit on an unregistered puppet could not be routed");
+        // Nobody owns this agent, so there is no peer to route the blow to - and dropping it here is what made
+        // troops INVULNERABLE. The chain is short and complete: RegisterBlowPatch suppresses vanilla's local
+        // application for any agent that is not locally controlled, that suppressed hit is published as a
+        // BattlePuppetHit to be routed instead, and this is the routing failing. Suppressed locally, dropped
+        // remotely: the blow simply ceases to exist, and the man can be hit forever.
+        //
+        // Measured after a host migration: 483 dropped hits on one client in three minutes, against agents
+        // standing in the middle of a melee taking no damage at all.
+        //
+        // So an unroutable hit is applied HERE instead. That is the correct owner by default - an agent no peer
+        // claims is nobody's puppet, and this client is the one that saw the blow land - and it is strictly
+        // better than the alternative in every case: the worst outcome of applying it locally is that the blow
+        // resolves on the wrong node, while the worst outcome of dropping it is a man who cannot be killed.
+        Logger.Warning("Local hit on an unregistered agent could not be routed; applying it locally so the blow is not lost");
+
+        var orphan = hit.Victim;
+        if (orphan == null || !orphan.IsActive()) return;
+
+        var localBlow = hit.Blow;
+        var localCollision = hit.CollisionData;
+        RegisterBlowPatch.RunOriginalRegisterBlow(orphan, localBlow, localCollision);
     }
 
     private void Handle_NetworkApplyBattleDamage(MessagePayload<NetworkApplyBattleDamage> payload)
@@ -474,6 +498,76 @@ public class BattleDamageRouter : IBattleDamageRouter
             reconstructions.Remove((damage.AttackerAgentId, damage.MissileShotSequence));
     }
 
+    // Cumulative routed damage per agent index, for the unkillable-troop diagnostic below.
+    private static readonly Dictionary<int, float> DamageTakenByAgent = new();
+    private static readonly HashSet<int> ReportedUnkillable = new();
+
+    /// <summary>
+    /// Totals the routed damage an agent has absorbed, and says so once when that total passes what should
+    /// have killed it twice over.
+    /// </summary>
+    /// <remarks>
+    /// The unkillable-troop reports have never had evidence attached, because the failure is invisible from the
+    /// attacking side: hits routed to an owner who receives and then ignores them look exactly like hits that
+    /// were applied. Counting the damage locally is what turns "he would not die" into a line naming the agent
+    /// and the total it survived, on whichever machine it happens.
+    ///
+    /// Deliberately not a fix, and deliberately not a correction - it changes nothing about the blow. It only
+    /// makes the next occurrence answerable instead of anecdotal.
+    /// </remarks>
+    /// <summary>Adds to an agent's running total. The arithmetic alone, so it can be asserted without a mission.</summary>
+    internal static float NoteDamageTaken(int agentIndex, float inflicted)
+    {
+        DamageTakenByAgent.TryGetValue(agentIndex, out var total);
+
+        // Negative values are clamped rather than subtracted: healing and zeroed blows both arrive here, and
+        // letting them unwind the tally would mask the very pattern it exists to expose.
+        total += Math.Max(0f, inflicted);
+        DamageTakenByAgent[agentIndex] = total;
+        return total;
+    }
+
+    internal static float NoteDamageTaken(Agent victim, float inflicted)
+    {
+        if (victim == null) return 0f;
+
+        // Every engine read here is guarded, because this runs on EVERY routed blow. An exception raised in a
+        // diagnostic would propagate into the damage path and stop the blow being applied - turning a tool for
+        // finding unkillable troops into a cause of them.
+        int index;
+        try { index = victim.Index; }
+        catch { return 0f; }
+
+        float total = NoteDamageTaken(index, inflicted);
+
+        try
+        {
+            // Twice the agent's starting health is well beyond any legitimate run of glancing blows, and the
+            // report is one-shot per agent so a genuinely stuck one cannot drown the log it exists to explain.
+            float suspicious = Math.Max(1f, victim.HealthLimit) * 2f;
+            if (total >= suspicious && ReportedUnkillable.Add(index))
+            {
+                Logger.Warning(
+                    "[BattleSync] Agent {Agent} (#{Index}) has absorbed {Total} routed damage against a health limit of {Limit} and is still standing at {Health}; this is the unkillable-troop signature",
+                    victim.Name, index, total, victim.HealthLimit, victim.Health);
+            }
+        }
+        catch
+        {
+            // A diagnostic that cannot describe itself is still a diagnostic; the tally is the part that
+            // matters and it has already been recorded.
+        }
+
+        return total;
+    }
+
+    /// <summary>Clears the per-agent damage tally between missions so indices are not carried across.</summary>
+    internal static void ResetDamageTally()
+    {
+        DamageTakenByAgent.Clear();
+        ReportedUnkillable.Clear();
+    }
+
     private void TryApplyNetworkDamage(NetworkApplyBattleDamage damage)
     {
         try
@@ -539,8 +633,17 @@ public class BattleDamageRouter : IBattleDamageRouter
             blow.WeaponRecord.AffectorWeaponSlotOrMissileIndex = -1;
         }
 
-        Logger.Information("[BattleSync] Applying routed blow to {Agent}: dmg={Damage}, missile={Missile}, health={Health}",
-            victim.Name, blow.InflictedDamage, wasMissile, victim.Health);
+        // Identify the VICTIM, not just its troop type.
+        //
+        // A player reported a man who could not be killed, and this log could not answer it: every line said
+        // "Imperial Bucellarii", a type dozens of agents share, so a health sequence that appears to jump back
+        // up (8 then 100) is indistinguishable from a different man being hit. There is no way to follow one
+        // agent through the file, and therefore no way to tell an agent absorbing damage forever from a crowd
+        // taking one hit each.
+        //
+        // The agent index is unique within a mission and free to read, so the file can be grouped by it.
+        Logger.Information("[BattleSync] Applying routed blow to {Agent} (#{Index}): dmg={Damage}, missile={Missile}, health={Health}, taken={Taken}",
+            victim.Name, victim.Index, blow.InflictedDamage, wasMissile, victim.Health, NoteDamageTaken(victim, blow.InflictedDamage));
         BattleSpawnGate.RunWithRoutedAttackerWeapon(damage.AttackerWeapon,
             () => victim.RegisterBlow(blow, in collisionData));
 

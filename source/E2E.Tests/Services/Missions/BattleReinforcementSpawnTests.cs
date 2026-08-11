@@ -155,4 +155,59 @@ public class BattleReinforcementSpawnTests : MissionTestEnvironment
 
         GC.KeepAlive(controller);
     }
+
+    /// <summary>
+    /// A party sitting in the battle that no reserve holds is fielded even though no broadcast ever named it.
+    /// </summary>
+    /// <remarks>
+    /// The involved-parties broadcast is not a complete account of who is in a battle: it is only sent while
+    /// the AI-join window is open, and reserves are built once at entry and never extended. A party joining a
+    /// live battle after that window is therefore in the map event — counted in the odds and on the
+    /// scoreboard's side total — with nothing fielding it.
+    ///
+    /// Observed live as a sally-out whose attacker side listed twenty parties and fielded eight troops between
+    /// them, the reserve having been built from a single party. Note this test never publishes the broadcast:
+    /// the party is added to the map event and nothing else, which is precisely the case that used to spawn
+    /// nobody.
+    /// </remarks>
+    [Fact]
+    public void APartyInTheBattleThatNoReserveHolds_IsFieldedWithoutABroadcast()
+    {
+        using var fixture = new MissionEngineFixture();
+        var (mapEventId, _) = SetupCoopBattle("host", "client");
+        var host = Clients.First();
+
+        CoopBattleController controller = null;
+        MockMission mock = null;
+        host.Call(() =>
+        {
+            mock = fixture.CreateMission(host);
+            controller = host.Resolve<CoopBattleController>();
+        });
+
+        EnterBattle(host, mapEventId);
+
+        // Join the battle AFTER it is under way, the way a lord riding in late does — and deliberately do not
+        // announce it.
+        var lateMapEventPartyId = AddAiReinforcementParty(mapEventId, host);
+
+        host.Call(() =>
+        {
+            controller.OnDeploymentFinished();
+            int beforeSweep = mock.Agents.Count;
+
+            controller.OnMissionTick(0.1f);
+
+            Assert.True(mock.Agents.Count > beforeSweep,
+                "a party in the battle that no reserve holds must still be fielded");
+
+            // And only once: a second tick finds it already reinforced.
+            int afterSweep = mock.Agents.Count;
+            controller.OnMissionTick(0.1f);
+            Assert.Equal(afterSweep, mock.Agents.Count);
+        });
+
+        Assert.NotNull(lateMapEventPartyId);
+        GC.KeepAlive(controller);
+    }
 }

@@ -1,10 +1,12 @@
 ﻿using Common;
+using Common.Logging;
 using Common.Messaging;
 using Common.Network;
 using Common.Network.Coalescing;
 using Coop.Core.Server.Connections.Messages;
 using Coop.Core.Server.Services.MobileParties;
 using LiteNetLib;
+using Serilog;
 
 namespace Coop.Core.Server.Connections.States;
 
@@ -30,8 +32,28 @@ public class LoadingState : ConnectionStateBase
     private readonly IJoinCampaignBaselineSender campaignBaselineSender;
     private readonly IConnectionMessageQueue connectionMessageQueue;
     private readonly ISendCoalescer coalescer;
+    private static readonly ILogger Logger = LogManager.GetLogger<LoadingState>();
+
     private volatile JoinPhase phase;
     private int initialBaselinesSent;
+    private int baselinesSent;
+
+    /// <summary>
+    /// How many baselines may be sent WITHOUT the join making progress before the server gives up.
+    /// </summary>
+    /// <remarks>
+    /// Counts consecutive sends only, and resets on every forward step. A joining client legitimately asks
+    /// for baseline after baseline while it catches up - <c>BaselineRequested</c> is the normal mechanism,
+    /// not an error signal - so a cap on the TOTAL disconnects healthy joins. That is not hypothetical: an
+    /// earlier attempt capped the total at 12 and dropped both clients mid-join.
+    ///
+    /// What must not be unbounded is retrying with no progress at all. Measured live at roughly nine
+    /// resends a second of a ~5.5 MB payload, about 550 KB/s, sustained until the player gave up - and that
+    /// is per stuck peer, so a third player in the same state adds another while the campaign stays paused
+    /// for everyone. Giving up loudly beats saturating the session forever: the client log already names
+    /// which parties diverged, so a disconnect leaves a diagnosis behind rather than a hang.
+    /// </remarks>
+    private const int MaxBaselinesWithoutProgress = 25;
 
     public LoadingState(
         IConnectionLogic connectionLogic,
@@ -91,6 +113,11 @@ public class LoadingState : ConnectionStateBase
         var peer = (NetPeer)payload.Who;
         if (peer != ConnectionLogic.Peer) return;
 
+        // Reset the no-progress counter on signals that mean the join ADVANCED. BaselineRequested is
+        // deliberately excluded: it is the retry itself, and resetting on it would leave the cap unable to
+        // ever fire - which is the exact livelock it exists to stop.
+        if (payload.What.Signal != JoinSyncSignal.BaselineRequested) baselinesSent = 0;
+
         switch (payload.What.Signal)
         {
             case JoinSyncSignal.ReplayApplied when phase == JoinPhase.WaitingForReplayApplied:
@@ -117,6 +144,21 @@ public class LoadingState : ConnectionStateBase
 
     private void QueueBaseline(NetPeer peer, bool isFinal, string context)
     {
+        if (++baselinesSent > MaxBaselinesWithoutProgress)
+        {
+            Logger.Error(
+                "Join for peer {PeerId} sent {Max} baselines without the join advancing (phase {Phase}, last trigger " +
+                "{Context}). Disconnecting instead of resending forever - the client's world disagrees with the " +
+                "server's, and that client's log names the diverging parties",
+                peer.Id,
+                MaxBaselinesWithoutProgress,
+                phase,
+                context);
+
+            peer.Disconnect();
+            return;
+        }
+
         JoinPhase queued = isFinal ? JoinPhase.FinalBaselineQueued : JoinPhase.InitialBaselineQueued;
         JoinPhase waiting = isFinal ? JoinPhase.WaitingForFinalBaseline : JoinPhase.WaitingForInitialBaseline;
         phase = queued;

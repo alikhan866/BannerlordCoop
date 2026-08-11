@@ -127,10 +127,76 @@ namespace GameInterface.Services.Kingdoms.Extentions
             {
                 return;
             }
+            if (TryRedirectPlayerAllianceOffer(this._decision, this._chosenOutcome))
+            {
+                return;
+            }
             if (this._decision.OnShowDecision())
             {
                 this.ApplyChosenOutcome();
             }
+        }
+
+        /// <summary>
+        /// An NPC kingdom wanting an alliance with a player's kingdom is an OFFER, never a decision the
+        /// NPC side may conclude alone. Mirror it into the player's kingdom so the synchronized vote
+        /// decides, and refuse it outright if anything resolves it without them.
+        /// </summary>
+        /// <remarks>
+        /// <c>StartAllianceDecision</c> lives in the PROPOSING kingdom - <c>StartAllianceDecision(proposerClan,
+        /// kingdomToStartAllianceWith)</c> - so an offer aimed at a player's realm sits in a council with no
+        /// player clan in it. <c>KingdomInterface.AddDecision</c> therefore sees no eligible player, hands it to
+        /// the AI election, and the alliance forms with the player never asked. Observed repeatedly: a player
+        /// kingdom was signed into alliances with Wang, Western Empire and Southern Empire in one session, and
+        /// because alliance state is not replicated the player's own screen still showed them afterwards.
+        ///
+        /// This mirrors <see cref="TryRedirectPlayerPeaceOffer"/>, which fixes the identical shape for peace.
+        /// Returning true CONSUMES the NPC decision on every instance, so the default when nobody votes is
+        /// "no alliance" - the safe direction, since an unwanted alliance drags a kingdom into its ally's wars
+        /// through call-to-war agreements.
+        /// </remarks>
+        internal static bool TryRedirectPlayerAllianceOffer(KingdomDecision decision, DecisionOutcome chosenOutcome)
+        {
+            if (decision is not StartAllianceDecision allianceDecision
+                || allianceDecision.KingdomToStartAllianceWith is not Kingdom playerKingdom
+                || !playerKingdom.Clans.Any(clan => clan.IsPlayerClan()))
+            {
+                return false;
+            }
+
+            // Consume the NPC decision everywhere. Only the authoritative server authors the offer that
+            // is then replicated, and only an accepted proposal is worth putting to a vote at all.
+            if (chosenOutcome is not StartAllianceDecision.StartAllianceDecisionOutcome { ShouldAllianceBeStarted: true }
+                || !ModInformation.IsServer)
+            {
+                return true;
+            }
+
+            Kingdom proposingKingdom = allianceDecision.Kingdom;
+            if (proposingKingdom == null || playerKingdom.RulingClan == null)
+            {
+                return true;
+            }
+
+            bool offerAlreadyPending = playerKingdom.UnresolvedDecisions
+                .OfType<StartAllianceDecision>()
+                .Any(existing => existing.KingdomToStartAllianceWith == proposingKingdom);
+            if (offerAlreadyPending)
+            {
+                return true;
+            }
+
+            playerKingdom.AddDecision(
+                new StartAllianceDecision(playerKingdom.RulingClan, proposingKingdom),
+                ignoreInfluenceCost: true);
+            return true;
+        }
+
+        /// <summary>An alliance decision sitting in a player's kingdom, awaiting their vote.</summary>
+        internal static bool IsPendingPlayerAllianceOffer(KingdomDecision decision)
+        {
+            return decision is StartAllianceDecision
+                   && decision.Kingdom?.Clans.Any(clan => clan.IsPlayerClan()) == true;
         }
 
         /// <summary>

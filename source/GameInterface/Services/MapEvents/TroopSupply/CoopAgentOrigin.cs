@@ -38,6 +38,9 @@ public class CoopAgentOrigin : IAgentOriginBase
 
     /// <summary>The server's MapEventParty id this troop was supplied under, carried so the spawn
     /// broadcast doesn't depend on re-deriving it from the local map-event membership.</summary>
+    /// <summary>The supplier this troop was drawn from, so it can be handed back. Null outside a supplier.</summary>
+    public CoopTroopSupplier Supplier => _supplier;
+
     public string MapEventPartyId { get; }
 
     bool IAgentOriginBase.HasThrownWeapon => _hasThrownWeapon;

@@ -4,6 +4,7 @@ using Common.Messaging;
 using Common.Network;
 using GameInterface.Services.Entity;
 using GameInterface.Services.MapEvents;
+using GameInterface.Services.MapEvents.Messages;
 using GameInterface.Services.ObjectManager;
 using GameInterface.Services.Players;
 using LiteNetLib;
@@ -78,7 +79,10 @@ public class CoopBattleController : CoopMissionController
 
     // Whether the pre-live hold on vanilla's battle-end checks has been lifted (see OnMissionTick).
     private bool endConditionHoldReleased;
+    private int reserveRevisionAtRestartRequest;
     private readonly ISupplyProgressReporter supplyReporter;
+    private readonly IBattleRoundRestarter roundRestarter;
+    private readonly IBattleFieldBalancer fieldBalancer;
     private readonly BattleTeamDiagnostics diagnostics = new BattleTeamDiagnostics();
 
     public CoopBattleController(
@@ -142,8 +146,11 @@ public class CoopBattleController : CoopMissionController
         Deployment = deployment;
         ResultCommitter = new BattleResultCommitter(network, relayNetwork, session);
         SiegeEngineStateReporter = new SiegeEngineStateReporter(objectManager, session, hostRegistry, relayNetwork);
+        roundRestarter = new BattleRoundRestarter(() => Mission, PerformRoundRestart, ReservesRebuiltSinceRestartScheduled);
+        fieldBalancer = new BattleFieldBalancer(objectManager, coopMissionComponent, session);
         messageBroker.Subscribe<NetworkBattleResultSnapshot>(Handle_BattleResultSnapshot);
         messageBroker.Subscribe<NetworkBattleHostAssigned>(Handle_BattleHostAssigned);
+        messageBroker.Subscribe<NetworkBattleRoundRestartScheduled>(Handle_BattleRoundRestartScheduled);
 
         // Decode order clips during battle setup so the first issued order does not hitch.
         coopMissionComponent.AgentVoiceHandler.WarmUp();
@@ -167,6 +174,7 @@ public class CoopBattleController : CoopMissionController
         Deployment.Dispose();
         messageBroker.Unsubscribe<NetworkBattleResultSnapshot>(Handle_BattleResultSnapshot);
         messageBroker.Unsubscribe<NetworkBattleHostAssigned>(Handle_BattleHostAssigned);
+        messageBroker.Unsubscribe<NetworkBattleRoundRestartScheduled>(Handle_BattleRoundRestartScheduled);
 
         // OnMissionTick sets these each frame; reset them here (their owner) so a stale authority
         // never bleeds into the next siege before the first tick refreshes it.
@@ -198,10 +206,120 @@ public class CoopBattleController : CoopMissionController
             Logger.Warning("[BattleHost] Battle mission finished loading with no instance session — cannot announce mission-ready");
     }
 
+    /// <summary>
+    /// The server has decided this battle is now a different fight and everyone should re-form around it.
+    /// </summary>
+    /// <remarks>
+    /// Reserves are re-requested here rather than waited for: the server has already dropped this battle's
+    /// ledger, so this asks it to rebuild ours around everyone now present. The countdown covers the round trip,
+    /// which is why the restart is deferred rather than run on arrival.
+    /// </remarks>
+    private void Handle_BattleRoundRestartScheduled(MessagePayload<NetworkBattleRoundRestartScheduled> payload)
+    {
+        var message = payload.What;
+        if (!Session.HasInstance || message.MapEventId != Session.InstanceId) return;
+
+        RequestRebuiltReserves();
+        roundRestarter.Schedule(message.CountdownSeconds, message.RestartSequence);
+    }
+
+    /// <summary>
+    /// True once the server's rebuilt reserve has landed for this restart.
+    /// </summary>
+    /// <remarks>
+    /// The revision advances only when a reserve is REPLACED, so comparing against the value captured when the
+    /// restart was scheduled distinguishes the rebuilt reserve from the one already in hand. Without this the
+    /// restart would fire purely on its timer, and a client whose reply was slow would re-form from the old
+    /// reserve while everyone else used the new one.
+    /// </remarks>
+    private bool ReservesRebuiltSinceRestartScheduled()
+    {
+        var spawnHandler = Mission?.GetMissionBehavior<CoopBattleMissionSpawnHandler>();
+        if (spawnHandler == null) return true; // nothing to wait for
+
+        return spawnHandler.ReserveRevision > reserveRevisionAtRestartRequest;
+    }
+
+    private void RequestRebuiltReserves()
+    {
+        var controllerId = Session.OwnControllerId;
+        if (string.IsNullOrEmpty(controllerId)) return;
+
+        // Captured BEFORE the request goes out, so the reply cannot land between the read and the send and be
+        // mistaken for the reserve we already had.
+        reserveRevisionAtRestartRequest =
+            Mission?.GetMissionBehavior<CoopBattleMissionSpawnHandler>()?.ReserveRevision ?? int.MaxValue;
+
+        network.SendAll(new NetworkRequestBattleReserves(Session.InstanceId, controllerId));
+    }
+
+    /// <summary>
+    /// Clears the field and re-forms the battle around the totals as they now stand.
+    /// </summary>
+    /// <remarks>
+    /// Order matters: everyone comes off the field BEFORE the spawn bookkeeping is reset. Resetting first would
+    /// leave the engine believing it had spawned nobody while the mission was still full of troops, and it would
+    /// spawn a second army on top of the first.
+    ///
+    /// <c>FadeOut</c> rather than Die/MakeDead, matching <see cref="BattleAuthorityMigrator"/>: these men are
+    /// being re-formed, not killed, and the campaign must not be told otherwise.
+    /// </remarks>
+    private void PerformRoundRestart()
+    {
+        var mission = Mission;
+        var spawnHandler = mission?.GetMissionBehavior<CoopBattleMissionSpawnHandler>();
+        if (spawnHandler == null)
+        {
+            Logger.Warning("[BattleSync] Round restart skipped: no coop spawn handler on this mission");
+            return;
+        }
+
+        // Re-arm the end-condition hold BEFORE clearing the field. Between the fade-out and the re-spawn both
+        // sides are momentarily empty, which is exactly the shape vanilla's end checks read as "a side has been
+        // wiped out" - so a restart with the checks live would conclude the battle instead of re-forming it.
+        // The gate in OnMissionTick is one-shot and has already released by now, so it has to be re-armed; it
+        // re-releases on its own terms once both sides field a live agent again.
+        var battleEndLogic = mission.GetMissionBehavior<BattleEndLogic>();
+        battleEndLogic?.ChangeCanCheckForEndCondition(false);
+        endConditionHoldReleased = false;
+
+        var registry = coopMissionComponent.AgentRegistry;
+        var cleared = 0;
+
+        // FadeOut is the only "take this agent off the field" call the engine offers, and it reports Routed -
+        // a withdrawal. These men are being re-formed, not fleeing, so the scope holds the scoreboard, the
+        // campaign battle result and the coop rout broadcast off them for exactly this loop.
+        using (BattleRoundRestartScope.Enter())
+        {
+            foreach (var agent in mission.Agents.ToArray())
+            {
+                if (agent == null || !agent.IsActive()) continue;
+
+                // Never take the local player's own agent off the field. Fading it leaves Mission.MainAgent
+                // null, and the mission falls back to its spectator presentation - the "Toggle scoreboard /
+                // Toggle Fast Forward" prompts - with the player unable to act until something re-assigns a
+                // main agent, which nothing here does. Keeping the hero standing also satisfies the rule the
+                // restart is supposed to preserve anyway: the controlling player always has an agent.
+                if (agent == mission.MainAgent) continue;
+                if (agent.IsMount && agent.RiderAgent == mission.MainAgent) continue;
+
+                agent.FadeOut(false, true);
+                cleared++;
+            }
+            registry?.Clear();
+        }
+
+        spawnHandler.ResetForRoundRestart();
+
+        Logger.Information("[BattleSync] Round restart cleared {Cleared} agent(s) and re-sized the battle", cleared);
+    }
+
     public override void OnMissionTick(float dt)
     {
         // Reliable spawn work is queued before this frame's unreliable movement traffic.
         replicator.FlushPendingSpawns();
+        roundRestarter.Tick(dt);
+        fieldBalancer.Tick(dt);
         base.OnMissionTick(dt);
 
         // The mission host is the single siege authority (engine deployment and machine simulation);

@@ -92,7 +92,25 @@ public class BattleInstanceLifecycle : IBattleInstanceLifecycle
         // OpenBattleMission can fire more than once around an encounter; connect once per mission.
         if (!session.TryBegin(mapEventId)) return;
 
-        Logger.Information("[BattleSync] Requesting P2P battle instance mapEvent={MapEventId}", mapEventId);
+        // What KIND of battle this is, recorded at the moment of entry.
+        //
+        // A player reinforcing an ally who was mid-siege-assault reported landing in a FIELD battle instead of
+        // the ally's siege - two players who should have been in one fight ending up in two. The logs could not
+        // answer it: entry recorded the map event id and nothing about the event, so "I expected the siege and
+        // got a field" and "I joined a different map event entirely" look identical afterwards.
+        //
+        // Every discriminating fact is here at entry and free to read, so it is recorded rather than inferred
+        // later: which event, what shape of battle, and which settlement it belongs to.
+        Logger.Information(
+            "[BattleSync] Requesting P2P battle instance mapEvent={MapEventId} type=(assault={Assault}, sallyOut={SallyOut}, siegeOutside={SiegeOutside}, raid={Raid}) settlement={Settlement} sides=({Att} vs {Def})",
+            mapEventId,
+            SafeFlag(() => mapEvent.IsSiegeAssault),
+            SafeFlag(() => mapEvent.IsSallyOut),
+            SafeFlag(() => mapEvent.MapEventSettlement?.SiegeEvent != null),
+            SafeFlag(() => mapEvent.IsRaid),
+            SafeName(() => mapEvent.MapEventSettlement?.Name?.ToString()),
+            SafeCount(() => mapEvent.AttackerSide?.Parties?.Count),
+            SafeCount(() => mapEvent.DefenderSide?.Parties?.Count));
 
         network.Start();
         network.ConnectToInstance(mapEventId);
@@ -100,6 +118,23 @@ public class BattleInstanceLifecycle : IBattleInstanceLifecycle
 
         relayNetwork.SendAll(new NetworkMissionEntered(session.OwnControllerId, mapEventId));
         Logger.Information("[Relay] Announced MissionEntered for battle instance {Instance}", mapEventId);
+    }
+
+    // Diagnostics must never be the reason a battle fails to start, and every one of these reads can touch a
+    // half-built map event during entry. A field that cannot be read says so instead of throwing.
+    private static object SafeFlag(System.Func<bool> read)
+    {
+        try { return read(); } catch { return "?"; }
+    }
+
+    private static object SafeName(System.Func<string> read)
+    {
+        try { return read() ?? "<none>"; } catch { return "?"; }
+    }
+
+    private static object SafeCount(System.Func<int?> read)
+    {
+        try { return read()?.ToString() ?? "?"; } catch { return "?"; }
     }
 
     public void Leave()

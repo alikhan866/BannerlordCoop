@@ -36,6 +36,16 @@ public class CoopBattleMissionSpawnHandler : SandBoxMissionSpawnHandler
 
     // Latched once the sides are sized jointly; both are held at zero until then.
     private bool _sized;
+    // True only for the duration of a round-restart init; see IsLateJoin.
+    private bool _restartingRound;
+
+    // The reserve revision the current sizing was derived from, so a later reserve can be noticed.
+    private int _sizedAtReserveRevision = -1;
+
+    // Per side: the opening wave a late joiner was NOT allowed to put out, kept so its reinforcement ceiling can
+    // be restored once the single man it was allowed has landed. Zero on any client that started the battle.
+    private readonly int[] _openingWaveHeldBack = new int[2];
+    private bool _lateJoinCeilingRestored;
 
     // Time spent holding both sides while a reserve is in flight (only accrues on the held path).
     private float _heldSeconds;
@@ -44,6 +54,16 @@ public class CoopBattleMissionSpawnHandler : SandBoxMissionSpawnHandler
     // Gated on by CoopBattleDeploymentMissionController: a game-thread latch, not the suppliers' network-thread
     // IsPopulated (which could read true mid-frame before Init has actually sized).
     public bool IsSized => _sized;
+
+    /// <summary>
+    /// Advances whenever either side's reserve is replaced by the server, so a caller can tell a rebuilt
+    /// reserve from the one it already had.
+    /// </summary>
+    /// <remarks>
+    /// Summed rather than exposed per side because callers only ever ask "has the server sent me anything new",
+    /// and a restart replaces both sides together.
+    /// </remarks>
+    internal int ReserveRevision => _defenderSupplier.ReserveRevision + _attackerSupplier.ReserveRevision;
 
     public CoopBattleMissionSpawnHandler(CoopTroopSupplier defenderSupplier, CoopTroopSupplier attackerSupplier,
         IMessageBroker messageBroker, BattleSideEnum playerSide)
@@ -67,6 +87,7 @@ public class CoopBattleMissionSpawnHandler : SandBoxMissionSpawnHandler
             {
                 // On-time (common): both reserves present, so size before the first tick.
                 RunJointInit(sizing);
+                _sizedAtReserveRevision = ReserveRevision;
                 _sized = true;
                 Logger.Information("[BattleSync] Coop spawn sized on start: Defender={Def}, Attacker={Atk}", sizing.DefenderOwned, sizing.AttackerOwned);
                 return;
@@ -92,7 +113,16 @@ public class CoopBattleMissionSpawnHandler : SandBoxMissionSpawnHandler
     public override void OnMissionTick(float dt)
     {
         base.OnMissionTick(dt);
-        if (_sized || _invalidBattleAbortRequested) return;
+
+        if (_sized)
+        {
+            ReSizeIfReservesChangedBeforeAnythingSpawned();
+            RestoreLateJoinReinforcementCeiling();
+            GrowPhaseBudgetToReserve();
+            return;
+        }
+
+        if (_invalidBattleAbortRequested) return;
 
         _heldSeconds += dt;
         var sizing = ReadSizing();
@@ -110,7 +140,55 @@ public class CoopBattleMissionSpawnHandler : SandBoxMissionSpawnHandler
         // so the joint Init cannot hit its invalid 0/0 split.
         RunJointInit(sizing);
         LogSizingCompleted(sizing);
+        _sizedAtReserveRevision = ReserveRevision;
         _sized = true;
+    }
+
+    /// <summary>
+    /// Whether the battle should be sized again: only before the opening wave, and only if the reserve the
+    /// current sizing came from has been superseded.
+    /// </summary>
+    /// <remarks>
+    /// Separated so the rule can be asserted directly. Both halves matter and for different reasons - the
+    /// revision check is what makes a battle that grew during deployment get re-sized at all, and the
+    /// initial-spawn check is what stops that ever happening over a populated field.
+    /// </remarks>
+    internal static bool ShouldReSize(bool initialSpawnOver, int sizedAtReserveRevision, int currentReserveRevision)
+        => !initialSpawnOver && currentReserveRevision != sizedAtReserveRevision;
+
+    /// <summary>
+    /// Re-derives the battle's sizing when the server sends a changed reserve BEFORE anything has spawned.
+    /// </summary>
+    /// <remarks>
+    /// Sizing used to latch permanently the moment both reserves landed, which is wrong whenever the battle
+    /// grows between entering it and starting it. Lords joining while a player sits on the deployment screen
+    /// are the ordinary case: the engine's opening wave is then split from totals that are already stale, and
+    /// since nothing corrects the field afterwards the battle simply starts over its size. Measured at 445
+    /// agents on a battle sized for 400, decaying only as men died.
+    ///
+    /// It also desynchronises clients. Each latches at whatever the reserve happened to be when ITS pair
+    /// arrived, so two clients entering the same battle a few seconds apart size it differently and spawn
+    /// different numbers. Re-sizing to the latest reserve makes them converge on the same figures.
+    ///
+    /// Strictly gated on the engine's own <c>IsInitialSpawnOver</c>. Before the opening wave there are no
+    /// agents to disturb and this is the same call the initial sizing makes; after it, re-running Init over a
+    /// populated field is precisely the class of change that caused the round-restart's failures, so it simply
+    /// does not run. Safe by construction rather than by care.
+    /// </remarks>
+    private void ReSizeIfReservesChangedBeforeAnythingSpawned()
+    {
+        var revision = ReserveRevision;
+        if (!ShouldReSize(_missionAgentSpawnLogic.IsInitialSpawnOver, _sizedAtReserveRevision, revision)) return;
+
+        var sizing = ReadSizing();
+        if (!sizing.SizeNow) return;
+
+        RunJointInit(sizing);
+        _sizedAtReserveRevision = revision;
+
+        Logger.Information(
+            "[BattleSync] Reserves changed before the opening wave; re-sized to Defender={Def}, Attacker={Atk}",
+            sizing.DefenderOwned, sizing.AttackerOwned);
     }
 
     private bool ShouldContinueHolding(SideSizing sizing)
@@ -186,6 +264,71 @@ public class CoopBattleMissionSpawnHandler : SandBoxMissionSpawnHandler
         return new SideSizing(defenderPopulated, attackerPopulated, defenderOwned, attackerOwned);
     }
 
+    /// <summary>
+    /// Re-forms the battle around the totals as they now stand: rewinds the reserves, clears the engine's
+    /// per-side spawn bookkeeping, and re-runs the joint init so the battle-size split reflects the
+    /// reinforcements rather than whoever happened to be present at the opening bell.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately does NOT despawn anyone - that is the caller's job, and it has to happen first. This method
+    /// only resets the accounting, so calling it with agents still on the field would leave the engine believing
+    /// it has spawned nobody while the mission is full of troops, and it would spawn a second army on top.
+    ///
+    /// <c>_numSpawnedTroops</c> and the reserved/queued origin lists are what <c>CheckDeployment</c> and
+    /// <c>CheckReinforcementSpawn</c> read to decide whether a side still owes the field anyone. Left at their
+    /// end-of-round values, the restarted round would believe every side was already full and spawn nothing at
+    /// all - which is the failure this reset exists to prevent.
+    /// </remarks>
+    internal void ResetForRoundRestart()
+    {
+        _defenderSupplier.RewindForRoundRestart();
+        _attackerSupplier.RewindForRoundRestart();
+
+        _missionAgentSpawnLogic._sidesWhereSpawnOccured?.Clear();
+
+        foreach (var context in _missionAgentSpawnLogic._battleSideSpawnContexts)
+        {
+            if (context == null) continue;
+
+            context._numSpawnedTroops = 0;
+            context._reinforcementsSpawnedInLastBatch = 0;
+            context._reservedTroops?.Clear();
+            context._spawnedFormations?.Clear();
+            context._reinforcementTroopFormationAssignments?.Clear();
+
+            // Per-team queues of origins waiting to be spawned. The team entries themselves are kept - the teams
+            // still exist across a restart - and only the queued origins are dropped, since they will be drawn
+            // again from the rewound reserve.
+            foreach (var (_, origins) in context._troopOriginsToSpawnPerTeam)
+                origins?.Clear();
+        }
+
+        // Marks this init as a restart rather than a late join, so the sides put their full re-derived opening
+        // wave back on the field instead of the single hero a genuine late joiner is limited to.
+        _restartingRound = true;
+        try
+        {
+            _sized = false;
+            var sizing = ReadSizing();
+            RunJointInit(sizing);
+            _sized = true;
+
+            // RunJointInit deliberately leaves both sides spawn-DISABLED, because at battle start the native
+            // SetupTeams re-enables them one side at a time. SetupTeams does not run again for a restart, so
+            // without this the re-formed round would be correctly sized and then spawn absolutely nobody.
+            _missionAgentSpawnLogic.StartSpawner(BattleSideEnum.Defender);
+            _missionAgentSpawnLogic.StartSpawner(BattleSideEnum.Attacker);
+
+            Logger.Information(
+                "[BattleSync] Round restarted; re-sized from defender {Defender} / attacker {Attacker}",
+                sizing.DefenderOwned, sizing.AttackerOwned);
+        }
+        finally
+        {
+            _restartingRound = false;
+        }
+    }
+
     // Re-run the engine's Init with the real totals (initial == total; Init applies the joint cap, wave split and
     // agent counts). Clear the placeholder phases first — InitWithSinglePhase appends, so a leftover held phase
     // would leave two active phases. Nothing spawned while held, so no double-spawn.
@@ -234,13 +377,201 @@ public class CoopBattleMissionSpawnHandler : SandBoxMissionSpawnHandler
     /// </remarks>
     private void ClampPhasesToOwnedShare(BattleSideEnum side, CoopTroopSupplier supplier)
     {
+        bool joiningInProgress = IsLateJoin();
+
+        // Accumulated INSIDE the loop, from the value before the clamp. Reading it back afterwards is a bug
+        // that hides perfectly: the loop has already overwritten InitialSpawnNumber with 1, so the "wave held
+        // back" reads as 1, and restoring a ceiling of 1 restores exactly the ceiling that was broken. Live,
+        // that left a joining player's supplier asked for one troop and never asked again, with 950 of his men
+        // waiting - the very symptom the restore exists to cure, unchanged.
+        int openingWaveHeldBack = 0;
+
         foreach (var phase in _missionAgentSpawnLogic._phases[(int)side])
         {
             phase.TotalSpawnNumber = ReachableSpawnNumber(phase.TotalSpawnNumber, supplier);
-            phase.InitialSpawnNumber = ReachableSpawnNumber(phase.InitialSpawnNumber, supplier);
             phase.RemainingSpawnNumber = ReachableSpawnNumber(phase.RemainingSpawnNumber, supplier);
+
+            var reachable = ReachableSpawnNumber(phase.InitialSpawnNumber, supplier);
+            var (opening, heldBack) = OpeningAndHeldBack(joiningInProgress, reachable);
+
+            phase.InitialSpawnNumber = opening;
+            openingWaveHeldBack += heldBack;
         }
+
+        // A late joiner is held to one man now, but that one man must not also become its reinforcement
+        // ceiling for the rest of the battle - see RestoreLateJoinReinforcementCeiling.
+        _openingWaveHeldBack[(int)side] = joiningInProgress ? openingWaveHeldBack : 0;
+        _lateJoinCeilingRestored = false;
     }
+
+    /// <summary>
+    /// Gives a client that joined mid-battle back a reinforcement budget, once its opening man is standing.
+    /// </summary>
+    /// <remarks>
+    /// The engine sizes every reinforcement wave as
+    /// <c>Min(batch, phase.InitialSpawnedNumber - NumberOfActiveTroops)</c> - see
+    /// <c>MissionBattleSideSpawnContext.ComputeBalancedBatch</c>. <c>InitialSpawnedNumber</c> is how many this
+    /// client actually put out in the opening wave, and for a late joiner
+    /// <see cref="OpeningSpawnForLateJoiner"/> deliberately makes that ONE. So the moment their hero is alive
+    /// the ceiling reads 1 - 1 = 0, and it never rises again: that client cannot field another man for the
+    /// whole battle, however many casualties open up in front of it.
+    ///
+    /// Observed exactly so. A player joined a live battle holding eight parties and 952 men; his supplier was
+    /// asked for a single troop at 11:20:45 and never asked again. He fought alone, with an army he could see
+    /// on the scoreboard and could not command, and the seven allied lords in his reserve finished the battle
+    /// with no kills and no losses.
+    ///
+    /// The one-man opening wave is still right - dropping 952 men onto a field sized for 400 is what it was
+    /// written to prevent. What was wrong is reusing it as the ceiling. So the opening stays clamped and the
+    /// ceiling is restored afterwards to the share this client would ordinarily hold, and the men arrive through
+    /// the ordinary reinforcement path as room appears - which is the behaviour the clamp intended all along.
+    /// </remarks>
+    internal static int ReinforcementCeiling(bool lateJoin, int spawnedInOpeningWave, int openingWaveHeldBack)
+        => lateJoin ? Math.Max(spawnedInOpeningWave, openingWaveHeldBack) : spawnedInOpeningWave;
+
+    /// <summary>
+    /// Keeps a phase's spawn budget in step with a reserve that grew after the battle started.
+    /// </summary>
+    /// <remarks>
+    /// <c>AddPhase</c> stores <c>TotalSpawnNumber</c> and derives
+    /// <c>RemainingSpawnNumber = TotalSpawnNumber - InitialSpawnNumber</c>, and the total is a hard ceiling on
+    /// how many men this client will EVER put on the field. It is computed once, from the reserve as it stood
+    /// when the battle was sized - and a coop battle grows: lords ride in for minutes afterwards and their
+    /// troops go into the supplier, but the phase budget does not move.
+    ///
+    /// The result is a side that stops reinforcing long before it is spent. Measured live: a phase total of
+    /// 534 with 331 left to spawn, while the supplier behind it still held 1,108 men. Those 1,108 could never
+    /// be drawn. The side ran dry at roughly a third of its strength, read as depleted, and ended the battle -
+    /// which is exactly "1,500 against 500, and it finished after I killed about 500".
+    ///
+    /// Raising the ceiling spawns nobody by itself; it only stops the engine believing it has run out. How many
+    /// men stand on the field at once is still governed by the battle size, which is enforced separately at the
+    /// supplier. And it only ever raises: lowering a budget mid-battle would cut off a side that is currently
+    /// drawing on it.
+    ///
+    /// <c>InitialSpawnNumber</c> is deliberately untouched. That is the opening wave and the reinforcement
+    /// ceiling, not the total, and rewriting it here would re-open the late-joiner problem this class already
+    /// solves elsewhere.
+    /// </remarks>
+    internal static bool ShouldGrowPhaseBudget(int phaseTotal, int ownedReserveTotal)
+        => ownedReserveTotal > phaseTotal;
+
+    private void GrowPhaseBudgetToReserve()
+    {
+        GrowPhaseBudgetToReserve(BattleSideEnum.Defender, _defenderSupplier);
+        GrowPhaseBudgetToReserve(BattleSideEnum.Attacker, _attackerSupplier);
+    }
+
+    private void GrowPhaseBudgetToReserve(BattleSideEnum side, CoopTroopSupplier supplier)
+    {
+        var phases = _missionAgentSpawnLogic._phases[(int)side];
+        if (phases.Count != 1) return; // sized with InitWithSinglePhase; anything else is not ours to re-budget
+
+        var phase = phases[0];
+        var owned = supplier.TotalTroops;
+        if (!ShouldGrowPhaseBudget(phase.TotalSpawnNumber, owned)) return;
+
+        var grewBy = owned - phase.TotalSpawnNumber;
+        phase.TotalSpawnNumber = owned;
+        phase.RemainingSpawnNumber += grewBy;
+
+        Logger.Information(
+            "[BattleSync] {Side} reserve grew to {Owned}; phase budget raised by {GrewBy} so the new arrivals can still be fielded",
+            side, owned, grewBy);
+    }
+
+    private void RestoreLateJoinReinforcementCeiling()
+    {
+        if (_lateJoinCeilingRestored) return;
+        if (!_missionAgentSpawnLogic.IsInitialSpawnOver) return;
+
+        _lateJoinCeilingRestored = true;
+
+        int restored = 0;
+        foreach (BattleSideEnum side in new[] { BattleSideEnum.Defender, BattleSideEnum.Attacker })
+        {
+            var heldBack = _openingWaveHeldBack[(int)side];
+            if (heldBack <= 0) continue;
+
+            foreach (var phase in _missionAgentSpawnLogic._phases[(int)side])
+            {
+                phase.InitialSpawnedNumber = ReinforcementCeiling(true, phase.InitialSpawnedNumber, heldBack);
+                restored += heldBack;
+            }
+        }
+
+        if (restored > 0)
+            Logger.Information("[BattleSync] Joined a battle in progress; reinforcement ceiling restored so the rest of this client's force can arrive as room appears");
+    }
+
+    /// <summary>
+    /// What a client joining a battle ALREADY UNDERWAY may put on the field immediately: just enough to give
+    /// the player an agent. The rest of its force stays in <c>RemainingSpawnNumber</c> and arrives through the
+    /// engine's ordinary reinforcement waves, as casualties make room.
+    /// </summary>
+    /// <remarks>
+    /// The initial spawn number is an OPENING wave - it assumes an empty field. A client arriving mid-battle
+    /// computed one anyway and dumped its whole owned force in at once: a player joining a fight already
+    /// holding 392 men took that side to 532 in one step, eight allied parties appearing together, far past
+    /// what the battle was sized for.
+    ///
+    /// One troop, not zero: the receiver's own party is supplied first and its hero first within it (the
+    /// reserve is built heroes-first, and <c>CoopTroopSupplier.GuaranteeReceiverPlayerATroop</c> reserves it a
+    /// place), so one is exactly the player's hero. Zero would leave the joining player with no agent to
+    /// control, which the spawn handler treats as a battle it cannot start.
+    /// </remarks>
+    internal static int OpeningSpawnForLateJoiner(int reachableInitial) => Math.Min(1, reachableInitial);
+
+    /// <summary>
+    /// Both halves of the decision at once: what this phase opens with, and what was held back from it.
+    /// </summary>
+    /// <remarks>
+    /// Returned together, from one reading, on purpose. Both are derived from the SAME pre-clamp number, and
+    /// the obvious way to write it - clamp the phase, then read the phase back to see what was held back - is
+    /// wrong in a way nothing reveals: the clamp has already replaced the number with 1, so the held-back wave
+    /// reads as 1, and restoring a ceiling of 1 restores precisely the ceiling that was broken. Live, that left
+    /// a joining player's supplier asked for a single troop and never asked again, with 950 men waiting, while
+    /// the code that was supposed to have fixed it ran every tick.
+    ///
+    /// Taking one input and returning both outputs makes that mistake unavailable rather than merely tested
+    /// for: there is no clamped value in scope to read by accident.
+    /// </remarks>
+    internal static (int Opening, int HeldBack) OpeningAndHeldBack(bool lateJoin, int reachableInitial)
+        => lateJoin
+            ? (OpeningSpawnForLateJoiner(reachableInitial), reachableInitial)
+            : (reachableInitial, 0);
+
+    /// <summary>
+    /// Whether this client is entering a battle that has already gone live, rather than starting one.
+    /// </summary>
+    /// <remarks>
+    /// Activation is the "the fighting has begun" signal: the host raises it on the first deployment finish
+    /// from any client and broadcasts it, and <c>BattleDeploymentCoordinator.CatchUpJoiner</c> re-sends it to
+    /// anyone who arrives afterwards - which is exactly the case being detected. Read off the controller rather
+    /// than injected, because this behaviour is built by the launcher before the controller is attached.
+    ///
+    /// A joiner whose activation catch-up has not landed by the time it sizes reads false and takes the
+    /// ordinary opening wave. Sizing is normally reached well after the mesh connect (a scene load, or the
+    /// tick path's hold for a reserve still in flight), so that is the uncommon case rather than the rule.
+    /// </remarks>
+    private static bool IsJoiningBattleAlreadyUnderway()
+        => Mission.Current?.GetMissionBehavior<CoopBattleController>()?.Deployment?.IsActivated == true;
+
+    /// <summary>
+    /// Whether THIS client is arriving at a fight already in progress - as opposed to a round restart, where
+    /// the battle is under way but everyone is re-forming together.
+    /// </summary>
+    /// <remarks>
+    /// Both look identical to <see cref="IsJoiningBattleAlreadyUnderway"/>, because a restart happens while
+    /// deployment is long since activated. But they want opposite things: a late joiner may field only its
+    /// hero, so its arrival is not a spike, whereas a restart is precisely the moment every side is supposed
+    /// to put its full re-derived opening wave back on the field. Without this distinction a restart would
+    /// clamp every side to a single man and empty the battle it was meant to re-balance.
+    /// </remarks>
+    internal static bool IsLateJoin(bool restartingRound, bool deploymentActivated)
+        => !restartingRound && deploymentActivated;
+
+    private bool IsLateJoin() => IsLateJoin(_restartingRound, IsJoiningBattleAlreadyUnderway());
 
     private static int ReachableSpawnNumber(int sideNumber, CoopTroopSupplier supplier)
         => ReachableSpawnNumber(sideNumber, supplier.OwnedShareOf(sideNumber));

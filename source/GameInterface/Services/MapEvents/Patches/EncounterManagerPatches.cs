@@ -80,19 +80,30 @@ internal class EncounterManagerPatches
     private static bool TryRequestServerPlayerConversation(PartyBase attackerParty, PartyBase defenderParty)
     {
         if (attackerParty?.MapEvent != null || defenderParty?.MapEvent != null)
+        {
+            LogSiegeReliefDecision(attackerParty, defenderParty,
+                "left to vanilla: one of the parties is already in a map event");
             return false;
+        }
 
         // A garrison sortieing against the party besieging it is a battle, not a conversation.
         // SallyOutsCampaignBehavior.CheckSallyOut starts the sortie by calling StartPartyEncounter, so
         // diverting it here means StartBattleAction.Apply never runs and the sally-out map event is
         // never created - the AI simply never sallies out against a player-led siege.
         if (IsGarrisonSortie(attackerParty, defenderParty))
+        {
+            LogSiegeReliefDecision(attackerParty, defenderParty,
+                "left to vanilla: garrison sortie against the besieging party");
             return false;
+        }
 
         var attackerIsPlayer = attackerParty?.MobileParty?.IsPlayerParty() == true;
         var defenderIsPlayer = defenderParty?.MobileParty?.IsPlayerParty() == true;
         if (attackerIsPlayer == defenderIsPlayer)
             return false;
+
+        LogSiegeReliefDecision(attackerParty, defenderParty,
+            "DIVERTED to a conversation instead of a battle");
 
         // The dedicated server has no MainParty, so send fresh AI/player encounters to the player's conversation flow.
         MessageBroker.Instance.Publish(null, new ConversationRequested(
@@ -102,6 +113,36 @@ internal class EncounterManagerPatches
             ConversationRestartSource.EncounterManager,
             armyTalkEncounter: true));
         return true;
+    }
+
+    /// <summary>
+    /// Records what happened to an encounter aimed at a party that is BESIEGING something.
+    /// </summary>
+    /// <remarks>
+    /// Reported live: a player besieging with 1000 men, against an 800-strong garrison and 800 more in the
+    /// field, and neither ever attacked. Two different causes produce that, and they need opposite fixes -
+    /// either the encounter reached here and was turned into a conversation (so the relief army needs the same
+    /// carve-out <see cref="IsGarrisonSortie"/> already has), or it never reached here at all and the AI simply
+    /// never chose to engage. Nothing currently distinguishes them, and both look like "nobody attacked me".
+    ///
+    /// Gated on a besieger camp being involved so it stays quiet: ordinary encounters are frequent, sieges
+    /// against a player are not.
+    /// </remarks>
+    private static void LogSiegeReliefDecision(PartyBase attackerParty, PartyBase defenderParty, string outcome)
+    {
+        var attacker = attackerParty?.MobileParty;
+        var defender = defenderParty?.MobileParty;
+        if (attacker?.BesiegerCamp == null && defender?.BesiegerCamp == null) return;
+
+        Logger.Information(
+            "[SiegeRelief] {Attacker} -> {Defender}: {Outcome} (attackerBesieging={AttackerBesieging}, defenderBesieging={DefenderBesieging}, attackerIsPlayer={AttackerIsPlayer}, defenderIsPlayer={DefenderIsPlayer})",
+            attacker?.StringId ?? "<none>",
+            defender?.StringId ?? "<none>",
+            outcome,
+            attacker?.BesiegerCamp != null,
+            defender?.BesiegerCamp != null,
+            attacker?.IsPlayerParty() == true,
+            defender?.IsPlayerParty() == true);
     }
 
     /// <summary>

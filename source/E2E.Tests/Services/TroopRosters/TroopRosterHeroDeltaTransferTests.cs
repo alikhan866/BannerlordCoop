@@ -142,8 +142,21 @@ public class TroopRosterHeroDeltaTransferTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The whole stack still moves when the experience on it changed after the screen was opened.
+    /// </summary>
+    /// <remarks>
+    /// The screen sends the difference between its live rosters and the snapshot it opened with, so it asks to
+    /// take away the 60xp it saw rather than the 65 that is really there. Applying that literally would empty
+    /// the stack and leave 5xp behind on nothing.
+    ///
+    /// This used to refuse the entire batch, which is worse than it sounds: the player's action simply did not
+    /// happen, with the troops still sitting where they were and no way to tell why. Now the stack is emptied
+    /// and the stranded experience goes with it. Losing 5xp is not free, but the alternative was a party screen
+    /// the player could not use.
+    /// </remarks>
     [Fact]
-    public void FullStackTransferAfterConcurrentXpChange_IsRejectedAtomically()
+    public void FullStackTransferAfterConcurrentXpChange_MovesTheStackAndDropsTheStrandedXp()
     {
         string rightPartyId = null;
         string leftPartyId = null;
@@ -177,13 +190,13 @@ public class TroopRosterHeroDeltaTransferTests : IDisposable
             {
                 (leftParty.MemberRoster, Delta(characterId, 3, 60)),
                 (rightParty.MemberRoster, Delta(characterId, -3, -60)),
-            });
+            }, out var adjusted);
 
-            Assert.False(applied);
-            Assert.Equal(3, rightParty.MemberRoster.GetTroopCount(character));
-            Assert.Equal(65, rightParty.MemberRoster.GetElementXp(
-                rightParty.MemberRoster.FindIndexOfTroop(character)));
-            Assert.Equal(0, leftParty.MemberRoster.GetTroopCount(character));
+            Assert.True(applied);
+            // Every troop the player asked to move did move, so there is nothing to correct them about.
+            Assert.False(adjusted);
+            Assert.Equal(0, rightParty.MemberRoster.GetTroopCount(character));
+            Assert.Equal(3, leftParty.MemberRoster.GetTroopCount(character));
         });
         TestEnvironment.FlushCoalescer();
 
@@ -193,9 +206,173 @@ public class TroopRosterHeroDeltaTransferTests : IDisposable
             Assert.True(client.ObjectManager.TryGetObject<MobileParty>(leftPartyId, out var leftParty));
             Assert.True(client.ObjectManager.TryGetObject<CharacterObject>(characterId, out var character));
 
-            Assert.Equal(3, rightParty.MemberRoster.GetTroopCount(character));
-            Assert.Equal(0, leftParty.MemberRoster.GetTroopCount(character));
+            Assert.Equal(0, rightParty.MemberRoster.GetTroopCount(character));
+            Assert.Equal(3, leftParty.MemberRoster.GetTroopCount(character));
         }
+    }
+
+    /// <summary>
+    /// A transfer of more troops than the source has moves what is there, and no more.
+    /// </summary>
+    /// <remarks>
+    /// This is the shape seen in the wild - the server logged a client asking to move 30 of a militia stack it
+    /// held 15 of. The danger in clamping the removal is the matching addition on the other side: applied as
+    /// sent, the destination would receive troops the source never supplied, minting 15 soldiers out of a
+    /// stale screen. The addition has to shrink by exactly the shortfall.
+    /// </remarks>
+    [Fact]
+    public void OverdrawnTransfer_MovesOnlyWhatIsThere_AndCreatesNoTroops()
+    {
+        string rightPartyId = null;
+        string leftPartyId = null;
+        string characterId = null;
+
+        Server.Call(() =>
+        {
+            var rightParty = GameObjectCreator.CreateInitializedObject<MobileParty>();
+            var leftParty = GameObjectCreator.CreateInitializedObject<MobileParty>();
+            var character = GameObjectCreator.CreateInitializedObject<CharacterObject>();
+
+            rightParty.MemberRoster.AddToCounts(character, 15);
+
+            Assert.True(Server.ObjectManager.TryGetId(rightParty, out rightPartyId));
+            Assert.True(Server.ObjectManager.TryGetId(leftParty, out leftPartyId));
+            Assert.True(Server.ObjectManager.TryGetId(character, out characterId));
+        });
+        TestEnvironment.FlushCoalescer();
+
+        Server.Call(() =>
+        {
+            var troopRosterInterface = Server.Resolve<ITroopRosterInterface>();
+            Assert.True(Server.ObjectManager.TryGetObject<MobileParty>(rightPartyId, out var rightParty));
+            Assert.True(Server.ObjectManager.TryGetObject<MobileParty>(leftPartyId, out var leftParty));
+            Assert.True(Server.ObjectManager.TryGetObject<CharacterObject>(characterId, out var character));
+
+            var applied = troopRosterInterface.TryApplyTroopRosterDeltas(new[]
+            {
+                (leftParty.MemberRoster, Delta(characterId, 30)),
+                (rightParty.MemberRoster, Delta(characterId, -30)),
+            }, out var adjusted);
+
+            Assert.True(applied);
+            Assert.True(adjusted);
+            Assert.Equal(0, rightParty.MemberRoster.GetTroopCount(character));
+            Assert.Equal(15, leftParty.MemberRoster.GetTroopCount(character));
+        });
+        TestEnvironment.FlushCoalescer();
+
+        foreach (var client in Clients)
+        {
+            Assert.True(client.ObjectManager.TryGetObject<MobileParty>(rightPartyId, out var rightParty));
+            Assert.True(client.ObjectManager.TryGetObject<MobileParty>(leftPartyId, out var leftParty));
+            Assert.True(client.ObjectManager.TryGetObject<CharacterObject>(characterId, out var character));
+
+            Assert.Equal(0, rightParty.MemberRoster.GetTroopCount(character));
+            Assert.Equal(15, leftParty.MemberRoster.GetTroopCount(character));
+        }
+    }
+
+    /// <summary>
+    /// Discarding more of a stack than the party has empties it rather than failing.
+    /// </summary>
+    /// <remarks>
+    /// The reported symptom: troops selected for discard, Done pressed, and nothing happens. A discard has no
+    /// receiving roster, so there is no addition to shrink - the shortfall is simply dropped.
+    /// </remarks>
+    [Fact]
+    public void OverdrawnDiscard_EmptiesTheStack()
+    {
+        string partyId = null;
+        string characterId = null;
+
+        Server.Call(() =>
+        {
+            var party = GameObjectCreator.CreateInitializedObject<MobileParty>();
+            var character = GameObjectCreator.CreateInitializedObject<CharacterObject>();
+
+            party.MemberRoster.AddToCounts(character, 7, false, 1);
+
+            Assert.True(Server.ObjectManager.TryGetId(party, out partyId));
+            Assert.True(Server.ObjectManager.TryGetId(character, out characterId));
+        });
+        TestEnvironment.FlushCoalescer();
+
+        Server.Call(() =>
+        {
+            var troopRosterInterface = Server.Resolve<ITroopRosterInterface>();
+            Assert.True(Server.ObjectManager.TryGetObject<MobileParty>(partyId, out var party));
+            Assert.True(Server.ObjectManager.TryGetObject<CharacterObject>(characterId, out var character));
+
+            var applied = troopRosterInterface.TryApplyTroopRosterDeltas(new[]
+            {
+                (party.MemberRoster, new TroopRosterData(new[]
+                {
+                    new TroopRosterElementData(characterId, -11, -1, 0),
+                })),
+            }, out var adjusted);
+
+            Assert.True(applied);
+            Assert.True(adjusted);
+            Assert.Equal(0, party.MemberRoster.GetTroopCount(character));
+        });
+        TestEnvironment.FlushCoalescer();
+
+        foreach (var client in Clients)
+        {
+            Assert.True(client.ObjectManager.TryGetObject<MobileParty>(partyId, out var party));
+            Assert.True(client.ObjectManager.TryGetObject<CharacterObject>(characterId, out var character));
+
+            Assert.Equal(0, party.MemberRoster.GetTroopCount(character));
+        }
+    }
+
+    /// <summary>
+    /// A delta that fits is applied exactly, and reports no adjustment.
+    /// </summary>
+    /// <remarks>
+    /// The guard against clamping becoming invisible: if <c>adjusted</c> were set for ordinary traffic, every
+    /// commit would drag a resync and an alarming message behind it.
+    /// </remarks>
+    [Fact]
+    public void TransferWithinTheStack_AppliesExactly_AndReportsNoAdjustment()
+    {
+        string rightPartyId = null;
+        string leftPartyId = null;
+        string characterId = null;
+
+        Server.Call(() =>
+        {
+            var rightParty = GameObjectCreator.CreateInitializedObject<MobileParty>();
+            var leftParty = GameObjectCreator.CreateInitializedObject<MobileParty>();
+            var character = GameObjectCreator.CreateInitializedObject<CharacterObject>();
+
+            int index = rightParty.MemberRoster.AddToCounts(character, 15);
+            rightParty.MemberRoster.data[index].Xp = 100;
+
+            Assert.True(Server.ObjectManager.TryGetId(rightParty, out rightPartyId));
+            Assert.True(Server.ObjectManager.TryGetId(leftParty, out leftPartyId));
+            Assert.True(Server.ObjectManager.TryGetId(character, out characterId));
+        });
+        TestEnvironment.FlushCoalescer();
+
+        Server.Call(() =>
+        {
+            var troopRosterInterface = Server.Resolve<ITroopRosterInterface>();
+            Assert.True(Server.ObjectManager.TryGetObject<MobileParty>(rightPartyId, out var rightParty));
+            Assert.True(Server.ObjectManager.TryGetObject<MobileParty>(leftPartyId, out var leftParty));
+            Assert.True(Server.ObjectManager.TryGetObject<CharacterObject>(characterId, out var character));
+
+            var applied = troopRosterInterface.TryApplyTroopRosterDeltas(new[]
+            {
+                (leftParty.MemberRoster, Delta(characterId, 4, 20)),
+                (rightParty.MemberRoster, Delta(characterId, -4, -20)),
+            }, out var adjusted);
+
+            Assert.True(applied);
+            Assert.False(adjusted);
+            Assert.Equal(11, rightParty.MemberRoster.GetTroopCount(character));
+            Assert.Equal(4, leftParty.MemberRoster.GetTroopCount(character));
+        });
     }
 
     private void CreateFreedCoalescerSlots()

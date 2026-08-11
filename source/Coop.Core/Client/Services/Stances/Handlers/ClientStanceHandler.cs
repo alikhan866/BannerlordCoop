@@ -16,6 +16,7 @@ namespace Coop.Core.Client.Services.Stances.Handlers
             this.messageBroker = messageBroker;
             messageBroker.Subscribe<NetworkDeclareWar>(HandleNetworkDeclareWar);
             messageBroker.Subscribe<NetworkMakePeace>(HandleNetworkMakePeace);
+            messageBroker.Subscribe<NetworkWarStats>(HandleNetworkWarStats);
         }
 
         private void HandleNetworkDeclareWar(MessagePayload<NetworkDeclareWar> obj)
@@ -30,10 +31,21 @@ namespace Coop.Core.Client.Services.Stances.Handlers
             messageBroker.Publish(this, new MakePeaceChanged(payload.Faction1Id, payload.Faction2Id, payload.DailyTribute, payload.DailyTributeDuration, payload.Detail));
         }
 
+        private void HandleNetworkWarStats(MessagePayload<NetworkWarStats> obj)
+        {
+            var payload = obj.What;
+            messageBroker.Publish(this, new WarStatsChanged(payload.Faction1Id, payload.Faction2Id,
+                payload.TroopCasualties1, payload.TroopCasualties2,
+                payload.SuccessfulSieges1, payload.SuccessfulSieges2,
+                payload.SuccessfulTownSieges1, payload.SuccessfulTownSieges2,
+                payload.SuccessfulRaids1, payload.SuccessfulRaids2));
+        }
+
         public void Dispose()
         {
             messageBroker.Unsubscribe<NetworkDeclareWar>(HandleNetworkDeclareWar);
             messageBroker.Unsubscribe<NetworkMakePeace>(HandleNetworkMakePeace);
+            messageBroker.Unsubscribe<NetworkWarStats>(HandleNetworkWarStats);
         }
     }
 }

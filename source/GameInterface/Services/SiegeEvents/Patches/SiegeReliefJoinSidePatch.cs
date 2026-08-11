@@ -1,6 +1,7 @@
 using Common;
 using Common.Logging;
 using GameInterface.Policies;
+using GameInterface.Services.Settlements.Interfaces;
 using HarmonyLib;
 using Serilog;
 using TaleWorlds.CampaignSystem;
@@ -9,6 +10,7 @@ using TaleWorlds.CampaignSystem.Encounters;
 using TaleWorlds.CampaignSystem.GameMenus;
 using TaleWorlds.CampaignSystem.Party;
 using TaleWorlds.CampaignSystem.Settlements;
+using TaleWorlds.Core;
 
 namespace GameInterface.Services.SiegeEvents.Patches;
 
@@ -53,6 +55,13 @@ internal class SiegeReliefJoinSidePatch
         var skip = WhyNotRelieve(settlement, out var besiegerLeader, out var mainParty);
         if (skip != null)
         {
+            // One of those reasons is not a reason to stand down. "besieger leader is already in a battle"
+            // means the walls are already being stormed: there is no camp battle left to start, only an
+            // assault in progress to join. Vanilla cannot join it for us here - the prompts that would have
+            // seated us are one-shot broadcasts fired when the assault BEGAN - so declining leaves the player
+            // watching their own town fall from a menu whose only option is "Leave...".
+            if (TryJoinActiveAssaultAsDefender(settlement, source)) return false;
+
             Logger.Information(
                 "[ReliefDiag] leaving this to vanilla (settlement={Settlement} via {Source}): {Reason}",
                 settlement?.StringId ?? "<none>", source, skip);
@@ -73,6 +82,81 @@ internal class SiegeReliefJoinSidePatch
             PlayerEncounter.Current?._defenderParty?.Id ?? "<none>");
 
         return false;
+    }
+
+    /// <summary>
+    /// Joins an assault that is ALREADY under way, on the defending side, for a relief force outside the walls.
+    /// </summary>
+    /// <remarks>
+    /// Modelled on <c>coop.debug.siege.join_active_assault</c>, which is the only sequence proven to attach a
+    /// client to an in-progress assault: start the settlement encounter, then JoinBattle the side. Two earlier
+    /// attempts at this bug used <c>PlayerEncounter.Init()</c> against <c>MainParty.MapEvent</c> and never even
+    /// executed, because on this client that map event is not what carries the assault - the SETTLEMENT's party
+    /// does, which is also what the battle bar renders from.
+    ///
+    /// Defender, not Attacker: the debug command hardcodes Attacker because it was written for the besieging
+    /// player. Reusing it here verbatim would drop a relieving player into the siege of their own town on the
+    /// enemy's side - the exact inversion the rest of this patch exists to prevent.
+    ///
+    /// Everything is logged, including the local map-event state, because this decision point has now cost
+    /// three test rounds. A failure here must explain itself in the log rather than cost another round trip.
+    /// </remarks>
+    private static bool TryJoinActiveAssaultAsDefender(Settlement settlement, string source)
+    {
+        var mapEvent = settlement?.Party?.MapEvent;
+        var mainParty = MobileParty.MainParty;
+
+        Logger.Information(
+            "[ReliefDiag] active-assault join check (settlement={Settlement} via {Source}): " +
+            "settlementMapEvent={HasEvent} isAssault={IsAssault} mainPartyMapEvent={MainEvent} " +
+            "mainPartySide={Side} inArmy={Army}",
+            settlement?.StringId ?? "<none>", source,
+            mapEvent != null, mapEvent?.IsSiegeAssault,
+            mainParty?.MapEvent != null,
+            PartyBase.MainParty?.MapEventSide != null,
+            mainParty?.Army?.Name?.ToString() ?? "<none>");
+
+        if (mapEvent?.IsSiegeAssault != true) return false;
+        if (mainParty == null) return false;
+
+        // Only ever for a friend's settlement. At war with it we are the besieger, and vanilla is right.
+        var settlementFaction = settlement.MapFaction;
+        var playerFaction = mainParty.MapFaction;
+        if (settlementFaction == null || playerFaction == null) return false;
+        if (settlementFaction.IsAtWarWith(playerFaction)) return false;
+
+        if (!mapEvent.CanPartyJoinBattle(PartyBase.MainParty, BattleSideEnum.Defender))
+        {
+            Logger.Warning(
+                "[ReliefDiag] cannot join the assault at {Settlement} as a defender; leaving it to vanilla",
+                settlement.StringId);
+            return false;
+        }
+
+        if (!ContainerProvider.TryResolve<ISettlementInterface>(out var settlementInterface))
+        {
+            Logger.Warning("[ReliefDiag] no ISettlementInterface; cannot join the assault at {Settlement}",
+                settlement.StringId);
+            return false;
+        }
+
+        settlementInterface.StartSettlementEncounter(mainParty, settlement);
+        if (PlayerEncounter.Current == null)
+        {
+            Logger.Warning("[ReliefDiag] the settlement encounter at {Settlement} did not start", settlement.StringId);
+            return false;
+        }
+
+        PlayerEncounter.JoinBattle(BattleSideEnum.Defender);
+        GameMenu.ActivateGameMenu("encounter");
+
+        Logger.Information(
+            "[ReliefDiag] joined the active assault at {Settlement} as a DEFENDER; encounter attacker={Attacker} defender={Defender}",
+            settlement.StringId,
+            PlayerEncounter.Current?._attackerParty?.Id ?? "<none>",
+            PlayerEncounter.Current?._defenderParty?.Id ?? "<none>");
+
+        return true;
     }
 
     /// <summary>

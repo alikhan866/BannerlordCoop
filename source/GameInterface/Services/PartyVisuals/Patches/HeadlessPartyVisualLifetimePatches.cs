@@ -29,7 +29,12 @@ internal class HeadlessPartyVisualLifetimePatches
     // registered. Weak entries die with their parties.
     private static readonly ConditionalWeakTable<PartyBase, MobilePartyVisual> shells = new();
 
-    private static bool IsHeadlessServer => ModInformation.IsServer && MobilePartyVisualManager.Current == null;
+    // Asked directly, not inferred from the absence of a visual manager. Reaching for
+    // MobilePartyVisualManager.Current on a windowless process does not return null - it throws inside
+    // SandBoxViewSubModule - so the probe that was meant to DETECT headless was itself failing there, and
+    // the exception escaped both postfixes below. RemoveParty is called from DestroyPartyAction through
+    // GameThread, so the whole queued destroy died with it and the party was never fully removed.
+    private static bool IsHeadlessServer => ModInformation.IsServer && ModInformation.IsHeadless;
 
     // The same moment a graphical host builds the visual: the party's registration at the end of
     // the MobileParty constructor — the party is already id-registered (its creation prefix runs

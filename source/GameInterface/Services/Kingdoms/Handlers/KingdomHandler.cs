@@ -2,6 +2,7 @@
 using Common.Extensions;
 using Common.Logging;
 using Common.Messaging;
+using Common.Network.Messages;
 using Common.Util;
 using GameInterface.Registry.Auto;
 using GameInterface.Services.Kingdoms;
@@ -64,6 +65,28 @@ public class KingdomHandler : IHandler
         messageBroker.Subscribe<NetworkDestroyKingdom>(HandleNetworkDestroyKingdom);
         messageBroker.Subscribe<NetworkRulingClanChanged>(HandleNetworkRulingClanChanged);
         messageBroker.Subscribe<ChangeKingdomName>(HandleChangeKingdomName);
+        messageBroker.Subscribe<PlayerDisconnected>(HandlePlayerDisconnected);
+    }
+
+    /// <summary>
+    /// [Server] A player dropped: any decision that was only waiting on them can now resolve.
+    /// </summary>
+    /// <remarks>
+    /// Eligibility is recomputed when a vote arrives or a resolve is attempted, so a decision whose last
+    /// outstanding voter disconnects has nothing left to trigger it — everyone still present has voted and no
+    /// further vote is coming, leaving them on the Done screen with no way forward but reloading.
+    ///
+    /// Queued on the game thread so it runs BEHIND the other disconnect subscribers, matching
+    /// <c>BattleHandler.Handle_PlayerDisconnected</c>: the peer association is cleared during this same publish,
+    /// and the eligibility filter must observe it cleared or it would still count the departed player.
+    /// </remarks>
+    private void HandlePlayerDisconnected(MessagePayload<PlayerDisconnected> obj)
+    {
+        if (!ModInformation.IsServer) return;
+
+        GameThread.RunSafe(
+            () => decisionVoteManager.ResolveDecisionsNoLongerWaitingOnAnyone(),
+            context: nameof(HandlePlayerDisconnected));
     }
 
     private void HandleCreateKingdom(MessagePayload<CreateKingdom> obj)
@@ -571,5 +594,6 @@ public class KingdomHandler : IHandler
         messageBroker.Unsubscribe<NetworkDestroyKingdom>(HandleNetworkDestroyKingdom);
         messageBroker.Unsubscribe<NetworkRulingClanChanged>(HandleNetworkRulingClanChanged);
         messageBroker.Unsubscribe<ChangeKingdomName>(HandleChangeKingdomName);
+        messageBroker.Unsubscribe<PlayerDisconnected>(HandlePlayerDisconnected);
     }
 }

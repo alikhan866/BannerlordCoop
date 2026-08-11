@@ -249,7 +249,21 @@ public class MapEventResultsInterface : IMapEventResultsInterface
             {
                 foreach (var playerParty in winnerPlayerParties)
                 {
-                    playerLootFactors[playerParty] = lootCasualtyChances.Find(x => x.Key == playerParty).Value;
+                    // Find over a list of STRUCTS returns default when nothing matches, and default here is a
+                    // KeyValuePair whose Value is 0f - indistinguishable from a party the model deliberately
+                    // gave a zero share. A player party missing from the chances list therefore received no
+                    // items at all, silently, while still collecting prisoners from the separate capture path.
+                    // That is exactly what one player saw: the enemy lord taken prisoner, and no loot screen.
+                    var index = lootCasualtyChances.FindIndex(x => x.Key == playerParty);
+                    if (index < 0)
+                    {
+                        Logger.Warning("[Loot] Winner party {Party} is absent from the loot chances of defeated {Defeated}; it can receive no items from these casualties",
+                            playerParty.Party?.Name, defeatedPartyBase?.Name);
+                        playerLootFactors[playerParty] = 0f;
+                        continue;
+                    }
+
+                    playerLootFactors[playerParty] = lootCasualtyChances[index].Value;
                 }
             }
 

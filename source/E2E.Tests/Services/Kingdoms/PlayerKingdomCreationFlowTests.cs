@@ -569,6 +569,95 @@ public class PlayerKingdomCreationFlowTests : IDisposable
         });
     }
 
+    /// <summary>
+    /// An NPC kingdom wanting an alliance with a player's kingdom must ask, not decide.
+    /// </summary>
+    /// <remarks>
+    /// <c>StartAllianceDecision</c> is created as <c>(proposerClan, kingdomToStartAllianceWith)</c>, so it
+    /// lives in the PROPOSING kingdom. An offer aimed at a player's realm therefore sits in a council with no
+    /// player clan in it, <c>KingdomInterface.AddDecision</c> finds no eligible player, and the AI election
+    /// concludes it - the alliance forms with the player never asked. One session signed a player kingdom into
+    /// three alliances that way, and since alliance state is not replicated the player's screen still showed
+    /// them after the server had removed them.
+    /// </remarks>
+    // NOT COVERED HERE: the accepted case, where the offer is mirrored into the player's kingdom and
+    // registered for a vote. Driving it reaches vanilla's DefaultAllianceModel, which dereferences
+    // Clan.PlayerClan.Kingdom while scoring support - and this environment has no Hero.MainHero, so it
+    // throws inside TaleWorlds code before any assertion of ours runs. The peace equivalent is testable
+    // only because its model never touches PlayerClan. Asserting around that would mean catching an
+    // exception from the code under test, which proves nothing; it needs a fixture with a real main hero.
+
+    /// <summary>
+    /// Anything that resolves an alliance offer without the player refuses it.
+    /// </summary>
+    /// <remarks>
+    /// THE safety property, and the reason the redirect consumes the decision unconditionally. An alliance is
+    /// not a neutral default: allies are pulled into each other's wars through call-to-war agreements, so
+    /// "nobody answered" must mean no. Covers the NPC choosing to decline, and the same call on a client -
+    /// only the server authors the mirrored offer, but no instance may let the alliance through.
+    /// </remarks>
+    [Fact]
+    public void NpcAllianceOffer_NotAcceptedByTheAi_IsRefusedAndNeverMirrored()
+    {
+        var client = Clients.First();
+        client.Resolve<IControllerIdProvider>().SetControllerId(ControllerId);
+
+        var player = CreateSyncedPlayerContext(ControllerId, client);
+        var playerKingdomId = TestEnvironment.CreateRegisteredObject<Kingdom>();
+        var npcKingdomId = TestEnvironment.CreateRegisteredObject<Kingdom>();
+        var npcClanId = CreateSyncedNpcClan();
+
+        ConfigureClanInKingdom(player.ClanId, playerKingdomId);
+        ConfigureClanInKingdom(npcClanId, npcKingdomId);
+        EnsureKingdomRegisteredEverywhere(playerKingdomId);
+        EnsureKingdomRegisteredEverywhere(npcKingdomId);
+
+        Server.Call(() =>
+        {
+            Assert.True(Server.ObjectManager.TryGetObject<Kingdom>(playerKingdomId, out var playerKingdom));
+            Assert.True(Server.ObjectManager.TryGetObject<Kingdom>(npcKingdomId, out var npcKingdom));
+            Assert.True(Server.ObjectManager.TryGetObject<Clan>(npcClanId, out var npcClan));
+
+            var npcDecision = new StartAllianceDecision(npcClan, playerKingdom);
+            var declineOutcome = npcDecision.DetermineInitialCandidates()
+                .OfType<StartAllianceDecision.StartAllianceDecisionOutcome>()
+                .Single(outcome => !outcome.ShouldAllianceBeStarted);
+
+            Assert.True(CoopKingdomElection.TryRedirectPlayerAllianceOffer(npcDecision, declineOutcome));
+
+            // A refusal is not something to vote on, so nothing is queued and no alliance exists.
+            Assert.Empty(playerKingdom.UnresolvedDecisions);
+            Assert.False(playerKingdom.IsAllyWith(npcKingdom));
+        });
+    }
+
+    /// <summary>An alliance between two NPC kingdoms is none of the player's business and is left alone.</summary>
+    [Fact]
+    public void NpcAllianceOffer_BetweenTwoNpcKingdoms_IsNotRedirected()
+    {
+        var firstKingdomId = TestEnvironment.CreateRegisteredObject<Kingdom>();
+        var secondKingdomId = TestEnvironment.CreateRegisteredObject<Kingdom>();
+        var npcClanId = CreateSyncedNpcClan();
+
+        ConfigureClanInKingdom(npcClanId, firstKingdomId);
+        EnsureKingdomRegisteredEverywhere(firstKingdomId);
+        EnsureKingdomRegisteredEverywhere(secondKingdomId);
+
+        Server.Call(() =>
+        {
+            Assert.True(Server.ObjectManager.TryGetObject<Kingdom>(secondKingdomId, out var secondKingdom));
+            Assert.True(Server.ObjectManager.TryGetObject<Clan>(npcClanId, out var npcClan));
+
+            var npcDecision = new StartAllianceDecision(npcClan, secondKingdom);
+            var acceptOutcome = npcDecision.DetermineInitialCandidates()
+                .OfType<StartAllianceDecision.StartAllianceDecisionOutcome>()
+                .Single(outcome => outcome.ShouldAllianceBeStarted);
+
+            // False: normal AI resolution continues untouched for kingdoms with no player in them.
+            Assert.False(CoopKingdomElection.TryRedirectPlayerAllianceOffer(npcDecision, acceptOutcome));
+        });
+    }
+
     [Fact]
     public void NpcPeaceOffer_TargetingPlayerKingdom_ExpiresAsDeclined()
     {
@@ -1424,6 +1513,12 @@ public class PlayerKingdomCreationFlowTests : IDisposable
                 player2.ClanId,
                 player2.CharacterId);
 
+            // Re-point the peer at the replacement record. IsConnected matches the Player by REFERENCE, so
+            // swapping the object silently orphans the old mapping and the server would read this player as
+            // dropped — which is not what this test is about: they are present, it is only their hero mapping
+            // that is missing.
+            playerManager.SetPeer(SecondControllerId, client2.NetPeer);
+
             kingdom.AddDecision(new DeclareWarDecision(proposerClan, targetKingdom));
         });
 
@@ -2065,7 +2160,13 @@ public class PlayerKingdomCreationFlowTests : IDisposable
 
     private PlayerContext CreateSyncedPlayerContext()
     {
-        return CreateSyncedPlayerContext(ControllerId, _ => true);
+        var context = CreateSyncedPlayerContext(ControllerId, _ => true);
+
+        // As above: a present player has a peer on the server. Without one the server reads them as dropped
+        // and stops waiting for their vote.
+        Server.Call(() => Server.Resolve<IPlayerManager>().SetPeer(ControllerId, Clients.First().NetPeer));
+
+        return context;
     }
 
     private string CreateSyncedNpcClan()
@@ -2094,9 +2195,17 @@ public class PlayerKingdomCreationFlowTests : IDisposable
 
     private PlayerContext CreateSyncedPlayerContext(string controllerId, EnvironmentInstance localPlayerClient)
     {
-        return CreateSyncedPlayerContext(
+        var context = CreateSyncedPlayerContext(
             controllerId,
             instance => ReferenceEquals(instance, localPlayerClient));
+
+        // Give the server this player's peer, as a real connection would. A registered player with no peer is
+        // exactly how the server represents someone who has DROPPED, and it does not wait for a vote from
+        // them — so a fixture that skipped this would be modelling an absent player while asking the test to
+        // prove the decision waits for a present one.
+        Server.Call(() => Server.Resolve<IPlayerManager>().SetPeer(controllerId, localPlayerClient.NetPeer));
+
+        return context;
     }
 
     private PlayerContext CreateSyncedPlayerContext(

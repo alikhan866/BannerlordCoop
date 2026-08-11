@@ -10,7 +10,9 @@ using GameInterface.Services.MapEvents.Messages;
 using GameInterface.Services.MapEvents.Messages.Start;
 using GameInterface.Services.MapEvents.TroopSupply;
 using GameInterface.Services.MapEvents.TroopSupply.Messages;
+using GameInterface.Services.SiegeEvents;
 using GameInterface.Services.ObjectManager;
+using TaleWorlds.CampaignSystem.Settlements;
 using GameInterface.Services.PlayerCaptivityService.Messages;
 using GameInterface.Services.Players;
 using LiteNetLib;
@@ -144,6 +146,9 @@ internal class BattleHostHandler : IHandler
         messageBroker.Subscribe<NetworkBattleSupplyProgress>(Handle_NetworkBattleSupplyProgress);
         messageBroker.Subscribe<BattleResolvedStateRecorded>(Handle_BattleResolvedStateRecorded);
         messageBroker.Subscribe<CampaignTick>(Handle_CampaignTick);
+        messageBroker.Subscribe<BattleRoundRestartRequested>(Handle_BattleRoundRestartRequested);
+        messageBroker.Subscribe<LiveBattleReinforcementTick>(Handle_LiveBattleReinforcementTick);
+        messageBroker.Subscribe<MapEventInvolvedPartiesAdded>(Handle_InvolvedPartiesAdded_RefreshReserves);
     }
 
     public void Dispose()
@@ -158,6 +163,256 @@ internal class BattleHostHandler : IHandler
         messageBroker.Unsubscribe<NetworkBattleSupplyProgress>(Handle_NetworkBattleSupplyProgress);
         messageBroker.Unsubscribe<BattleResolvedStateRecorded>(Handle_BattleResolvedStateRecorded);
         messageBroker.Unsubscribe<CampaignTick>(Handle_CampaignTick);
+        messageBroker.Unsubscribe<BattleRoundRestartRequested>(Handle_BattleRoundRestartRequested);
+        messageBroker.Unsubscribe<LiveBattleReinforcementTick>(Handle_LiveBattleReinforcementTick);
+        messageBroker.Unsubscribe<MapEventInvolvedPartiesAdded>(Handle_InvolvedPartiesAdded_RefreshReserves);
+    }
+
+    /// <summary>
+    /// [Server] Reinforcements have changed a battle enough to re-form it. Drops the battle's reserves so they
+    /// rebuild around everyone now present, then tells every client to restart the round.
+    /// </summary>
+    /// <remarks>
+    /// The reserves are dropped rather than pushed: clients already know how to ask for theirs
+    /// (<c>NetworkRequestBattleReserves</c>), and that path carries the whole ownership/adoption story - absent
+    /// members, host scope, deferred returns. Re-implementing it as a push for this one case would be a second
+    /// way of doing the same thing, and the one that got less testing. The countdown carried in the schedule
+    /// exists partly to cover that round trip, so the rebuilt reserves are in hand before the round re-forms.
+    ///
+    /// <c>ForgetMapEvent</c> is what makes the rebuild fresh: it drops the ledger entry and the flatten cache,
+    /// so every party - including the ones that just arrived - is re-flattened with its supplied pointer at
+    /// zero, which is exactly the state a restarted round needs.
+    /// </remarks>
+    private void Handle_BattleRoundRestartRequested(MessagePayload<BattleRoundRestartRequested> payload)
+    {
+        if (ModInformation.IsClient) return;
+
+        var mapEventId = payload.What.MapEventId;
+
+        GameThread.RunSafe(() =>
+        {
+            if (!objectManager.TryGetObjectWithLogging<MapEvent>(mapEventId, out var mapEvent))
+                return;
+
+            reserveBuilder.ForgetMapEvent(mapEvent);
+
+            var sequence = NextRestartSequence(mapEventId);
+            Logger.Information(
+                "[BattleHost] Battle {MapEventId} restarting round #{Sequence} in {Seconds}s (defender {Defender} / attacker {Attacker})",
+                mapEventId, sequence, RoundRestartCountdownSeconds,
+                payload.What.DefenderTotal, payload.What.AttackerTotal);
+
+            network.SendAll(new NetworkBattleRoundRestartScheduled(
+                mapEventId, RoundRestartCountdownSeconds, sequence));
+        }, context: nameof(Handle_BattleRoundRestartRequested));
+    }
+
+    // [Server] Who is currently inside each battle mission, tracked independently of map events so a battle the
+    // server holds no MapEvent for still counts as "this player is away fighting".
+    private readonly Dictionary<string, HashSet<string>> battleMembers = new Dictionary<string, HashSet<string>>();
+
+    /// <summary>
+    /// [Server] Re-derives the frozen-siege set on the live-battle heartbeat.
+    /// </summary>
+    /// <remarks>
+    /// Computing it only when a player enters a battle is not enough: the election fires within a second of
+    /// mission entry, and at that point the controller-to-party lookup can still be unresolved, so the freeze
+    /// is computed from nothing and never revisited. Recomputing on the heartbeat lets it heal itself a moment
+    /// later instead of silently never engaging - which is exactly how it failed the first time it ran.
+    /// </remarks>
+    private void Handle_LiveBattleReinforcementTick(MessagePayload<LiveBattleReinforcementTick> payload)
+    {
+        if (ModInformation.IsClient) return;
+
+        lock (battleMembers)
+        {
+            if (battleMembers.Count == 0) return;
+        }
+
+        RecomputeSiegeFreezes();
+    }
+
+    /// <summary>
+    /// [Server] A battle gained parties, so re-issue its reserves to everyone in it.
+    /// </summary>
+    /// <remarks>
+    /// Reserves were sent once, when each client entered. Lords that join while players are still on the
+    /// deployment screen therefore existed in the map event but in nobody's reserve, so the engine's opening
+    /// wave was split from stale totals and the battle started over its own size - and clients that entered at
+    /// different moments sized it differently from one another.
+    ///
+    /// Re-issuing is safe at any point: CoopTroopSupplier.SetReserve is monotonic and never rewinds a supplied
+    /// pointer, so a client that has already spawned simply absorbs it. Only a client that has not yet put its
+    /// opening wave out acts on it, which is exactly the window this is for.
+    /// </remarks>
+    private void Handle_InvolvedPartiesAdded_RefreshReserves(MessagePayload<MapEventInvolvedPartiesAdded> payload)
+    {
+        if (ModInformation.IsClient) return;
+        if (payload.Who is not MapEvent mapEvent) return;
+        if (mapEvent.IsFinalized) return;
+        if (!objectManager.TryGetId(mapEvent, out var mapEventId)) return;
+
+        List<string> members;
+        lock (battleMembers)
+        {
+            if (!battleMembers.TryGetValue(mapEventId, out var set) || set.Count == 0) return;
+            members = new List<string>(set);
+        }
+
+        GameThread.RunSafe(() =>
+        {
+            foreach (var controllerId in members)
+            {
+                if (!TryGetMemberPeer(mapEventId, controllerId, out var peer)) continue;
+
+                var reserves = BuildOwnedReserves(mapEventId, mapEvent, controllerId, includeEmptySides: true);
+                SendSideReserves(peer, mapEventId, reserves, flushRequested: false);
+            }
+
+            Logger.Information("[BattleHost] Battle {MapEventId} gained parties; re-issued reserves to {Count} member(s)",
+                mapEventId, members.Count);
+        }, context: nameof(Handle_InvolvedPartiesAdded_RefreshReserves));
+    }
+
+    /// <summary>The live peer for a battle member, if we still hold one.</summary>
+    private bool TryGetMemberPeer(string mapEventId, string controllerId, out NetPeer peer)
+    {
+        peer = null;
+        if (battleRuntimeStates.TryGetValue(mapEventId, out var state)
+            && state.HostEndpoint != null
+            && state.HostEndpoint.ControllerId == controllerId)
+        {
+            peer = state.HostEndpoint.Peer;
+        }
+
+        if (peer == null) playerManager.TryGetPeer(controllerId, out peer);
+
+        return peer != null;
+    }
+
+    private void NoteBattleMember(string mapEventId, string controllerId)
+    {
+        if (string.IsNullOrEmpty(mapEventId) || string.IsNullOrEmpty(controllerId)) return;
+
+        lock (battleMembers)
+        {
+            if (!battleMembers.TryGetValue(mapEventId, out var members))
+                battleMembers[mapEventId] = members = new HashSet<string>();
+            if (!members.Add(controllerId)) return;
+        }
+
+        RecomputeSiegeFreezes();
+    }
+
+    private void ForgetBattleMember(string mapEventId, string controllerId)
+    {
+        if (string.IsNullOrEmpty(mapEventId) || string.IsNullOrEmpty(controllerId)) return;
+
+        lock (battleMembers)
+        {
+            if (!battleMembers.TryGetValue(mapEventId, out var members)) return;
+            if (!members.Remove(controllerId)) return;
+            if (members.Count == 0) battleMembers.Remove(mapEventId);
+        }
+
+        RecomputeSiegeFreezes();
+    }
+
+    /// <summary>
+    /// [Server] Rebuilds the whole frozen-siege set from who is currently in a battle.
+    /// </summary>
+    /// <remarks>
+    /// Recomputed wholesale rather than incremented and decremented per player. Two players besieging the same
+    /// settlement would need reference counting to thaw correctly, and a miscounted freeze is a siege that
+    /// silently never advances again - a far worse failure than the small cost of rebuilding a set that has at
+    /// most a handful of entries.
+    /// </remarks>
+    /// <summary>The settlement whose siege this battle is part of, or null if it is not a siege battle.</summary>
+    /// <remarks>
+    /// Covers the assault, the sally-out and the blockade alike: all of them hang off the map event's own
+    /// settlement, which does not move when the parties do. A field battle unrelated to any siege answers null
+    /// and freezes nothing.
+    /// </remarks>
+    internal static Settlement BesiegedSettlementOf(MapEvent mapEvent)
+    {
+        var settlement = mapEvent?.MapEventSettlement;
+        if (settlement == null) return null;
+
+        return settlement.SiegeEvent != null ? settlement : null;
+    }
+
+    private void RecomputeSiegeFreezes()
+    {
+        List<string> controllers;
+        List<string> liveBattles;
+        lock (battleMembers)
+        {
+            controllers = new List<string>();
+            liveBattles = new List<string>();
+            foreach (var pair in battleMembers)
+            {
+                if (pair.Value.Count == 0) continue;
+                liveBattles.Add(pair.Key);
+                controllers.AddRange(pair.Value);
+            }
+        }
+
+        PlayersInBattleMissions.ReplaceLiveBattles(liveBattles);
+
+        // Publish the same membership the freeze is derived from, so the fast-forward lock stops guessing at it
+        // from MobileParty.MapEvent. Set here rather than in Note/ForgetBattleMember because this is the one
+        // place that sees the WHOLE set, and a wholesale replace cannot leak an entry that would hold the
+        // campaign at normal speed forever.
+        PlayersInBattleMissions.Replace(controllers);
+
+        GameThread.RunSafe(() =>
+        {
+            SiegeBattleFreeze.Clear();
+
+            foreach (var controllerId in controllers)
+            {
+                if (!playerManager.TryGetPlayer(controllerId, out var player)) continue;
+                if (!objectManager.TryGetObject<MobileParty>(player.MobilePartyId, out var party)) continue;
+
+                // A besieger is away from its camp; a garrison sallying out is away from its walls. Either way
+                // the siege it belongs to should not advance while that fight is unresolved.
+                SiegeBattleFreeze.Freeze(party.BesiegedSettlement?.StringId);
+                SiegeBattleFreeze.Freeze(party.CurrentSettlement?.SiegeEvent?.BesiegedSettlement?.StringId);
+            }
+
+            // ...and the settlement the BATTLE is about, which is the only one a sally-out can be found by.
+            //
+            // Both lookups above start from where the player's party is: besieging something, or standing
+            // inside something. Sallying out makes both false at once - you leave the walls, so CurrentSettlement
+            // is null, and you are the defender, so BesiegedSettlement is null. Nothing was frozen, and the
+            // siege ran on underneath the very battle meant to decide it. That is how a player defending
+            // Phycaon lost it mid-fight, to the same army he was fighting.
+            //
+            // The battle knows what it is about even when the party has moved, so ask it.
+            foreach (var mapEventId in liveBattles)
+            {
+                if (!objectManager.TryGetObject<MapEvent>(mapEventId, out var mapEvent)) continue;
+                SiegeBattleFreeze.Freeze(BesiegedSettlementOf(mapEvent)?.StringId);
+            }
+
+            var frozen = SiegeBattleFreeze.FrozenIds;
+            if (frozen.Count > 0)
+                Logger.Information("[BattleHost] Sieges held while their players fight: {@Frozen}", frozen);
+        }, context: nameof(RecomputeSiegeFreezes));
+    }
+
+    /// <summary>How long players are shown the notice before the round re-forms.</summary>
+    internal const float RoundRestartCountdownSeconds = 5f;
+
+    private readonly Dictionary<string, int> restartSequences = new Dictionary<string, int>();
+
+    /// <summary>Per battle and monotonic, so a client can reject a duplicate or reordered schedule.</summary>
+    private int NextRestartSequence(string mapEventId)
+    {
+        restartSequences.TryGetValue(mapEventId, out var current);
+        current++;
+        restartSequences[mapEventId] = current;
+        return current;
     }
 
     /// <summary>[Client] Entering a battle (still loading): request only the reserves we already OWN, so our
@@ -195,6 +450,10 @@ internal class BattleHostHandler : IHandler
     private void Handle_NetworkRequestBattleHost(MessagePayload<NetworkRequestBattleHost> payload)
     {
         if (ModInformation.IsClient) return;
+
+        // This is the server's first reliable word that a controller is INSIDE a battle mission, independent of
+        // whether a map event exists for it - which is exactly the signal vanilla's siege gate lacks.
+        NoteBattleMember(payload.What.MapEventId, payload.What.ControllerId);
 
         var mapEventId = payload.What.MapEventId;
         var requesterId = payload.What.ControllerId;
@@ -645,6 +904,8 @@ internal class BattleHostHandler : IHandler
 
         var controllerId = payload.What.ControllerId;
         var mapEventId = payload.What.InstanceId;
+
+        ForgetBattleMember(mapEventId, controllerId);
 
         // Release before a later battle-start request can be handled on this poll thread. The reliable ordered
         // stream guarantees the departure is published first, but the host/reserve cleanup below runs next frame.

@@ -1,4 +1,4 @@
-using Common.Logging;
+﻿using Common.Logging;
 using Serilog;
 using System.Collections.Generic;
 using TaleWorlds.CampaignSystem;
@@ -20,8 +20,27 @@ public class BattleTeamDiagnostics
     private float timer;
     private bool logged;
 
+    // Separate, RECURRING sampler for the battle-size question. The one-shot dump above fires four seconds in
+    // and is therefore useless for "how big did the field get later" - reading it as if it were current is
+    // exactly the mistake that made an over-populated field look fine twice.
+    private float sizeTimer;
+
     public void Tick(float dt)
     {
+        // Guarded because this is a DIAGNOSTIC and must never be the reason a battle stops. It reads
+        // DefenderActivePhase/AttackerActivePhase, which this codebase already documents as throwing when a
+        // side has no phases, and it walks mission.Agents where an agent mid-removal is not guaranteed to
+        // answer. An exception on the game tick does not skip a log line - it takes Game.OnTick down and
+        // freezes the client, which is exactly how two evenings were lost.
+        try
+        {
+            TickBattleSizeSample(dt);
+        }
+        catch (System.Exception e)
+        {
+            Logger.Error(e, "[BattleSize] sampler failed; diagnostics only, the battle is unaffected");
+        }
+
         if (logged) return;
         timer += dt;
         if (timer < 4f) return;
@@ -63,5 +82,40 @@ public class BattleTeamDiagnostics
             spawnLogic?.IsSideSpawnEnabled(BattleSideEnum.Defender),
             spawnLogic?.IsSideSpawnEnabled(BattleSideEnum.Attacker),
             PartyBase.MainParty?.Side);
+    }
+
+    /// <summary>
+    /// Every few seconds, the three numbers needed to judge whether the battle size is being honoured: what the
+    /// engine thinks the size is, how many agents are actually standing, and what the spawn phases still intend
+    /// to put out. Logged together so they cannot be compared across different moments by mistake.
+    /// </summary>
+    private void TickBattleSizeSample(float dt)
+    {
+        sizeTimer += dt;
+        if (sizeTimer < 5f) return;
+        sizeTimer = 0f;
+
+        var mission = Mission.Current;
+        var spawnLogic = mission?.GetMissionBehavior<DefaultBattleMissionAgentSpawnLogic>();
+        if (spawnLogic == null) return;
+
+        int defenders = 0, attackers = 0;
+        foreach (var agent in mission.Agents)
+        {
+            if (agent == null || !agent.IsActive() || !agent.IsHuman) continue;
+            var side = agent.Team?.Side ?? BattleSideEnum.None;
+            if (side == BattleSideEnum.Defender) defenders++;
+            else if (side == BattleSideEnum.Attacker) attackers++;
+        }
+
+        var defPhase = spawnLogic.DefenderActivePhase;
+        var atkPhase = spawnLogic.AttackerActivePhase;
+
+        Logger.Information(
+            "[BattleSize] battleSize={BattleSize} onField(def={Def},atk={Atk},total={Total}) initialSpawnOver={InitOver} " +
+            "defPhase(total={DT},remaining={DR},initial={DI}) atkPhase(total={AT},remaining={AR},initial={AI})",
+            spawnLogic.BattleSize, defenders, attackers, defenders + attackers, spawnLogic.IsInitialSpawnOver,
+            defPhase?.TotalSpawnNumber, defPhase?.RemainingSpawnNumber, defPhase?.InitialSpawnNumber,
+            atkPhase?.TotalSpawnNumber, atkPhase?.RemainingSpawnNumber, atkPhase?.InitialSpawnNumber);
     }
 }

@@ -46,16 +46,50 @@ internal class BattleMissionEntryPatch
     private static void Prefix()
     {
         if (ModInformation.IsServer) return;
-        if (!BattleSpawnConfig.Enabled) return;
 
-        var mapEvent = PlayerEncounter.Battle ?? MobileParty.MainParty?.MapEvent;
-        if (mapEvent == null) return;
-
-        if (!ContainerProvider.TryResolve(out IObjectManager objectManager)) return;
-        if (!objectManager.TryGetId(mapEvent, out var mapEventId)) return;
+        var mapEventId = ResolveCoopBattleId();
+        if (mapEventId == null)
+        {
+            // This mission is NOT a coop battle we can identify - so the gate must be OFF, not left holding
+            // whatever the last one set.
+            //
+            // The gate is process-global and its only ordinary release is CoopBattleController.OnLeaving, a
+            // mission behaviour. Abandon a battle to the main menu and that never runs, so the previous
+            // battle's id survives the campaign teardown. Loading again rebuilds the object manager, so
+            // TryGetId can fail for the NEW battle - and every early return here used to leave the DEAD id
+            // engaged. The consequences are exactly what a player reported: MapEventPartyPatches suppresses
+            // vanilla troop supply while the gate is active, and BattleTroopSupplierInjectionPatch keys the
+            // coop supplier on the stale id so the real reserve never reaches it, leaving a battle with no
+            // troops on either path; the deployment patches gate on the same flag, so no Ready button either.
+            DisengageStaleGate();
+            return;
+        }
 
         BattleSpawnGate.BeginBattle(mapEventId);
         Logger.Information("[BattleSync] Engaged spawn gate before mission load: mapEvent={MapEventId}", mapEventId);
+    }
+
+    /// <summary>The id of the coop battle this mission belongs to, or null if there is not one.</summary>
+    private static string ResolveCoopBattleId()
+    {
+        if (!BattleSpawnConfig.Enabled) return null;
+
+        var mapEvent = PlayerEncounter.Battle ?? MobileParty.MainParty?.MapEvent;
+        if (mapEvent == null) return null;
+
+        if (!ContainerProvider.TryResolve(out IObjectManager objectManager)) return null;
+        return objectManager.TryGetId(mapEvent, out var mapEventId) ? mapEventId : null;
+    }
+
+    /// <summary>Turns the gate off, reporting it only when it was actually holding a battle.</summary>
+    private static void DisengageStaleGate()
+    {
+        if (!BattleSpawnGate.IsCoopBattleActive) return;
+
+        Logger.Warning(
+            "[BattleSync] Opening a battle mission that is not an identifiable coop battle while the spawn gate still holds {MapEventId}; releasing it so vanilla troop supply and deployment are not suppressed",
+            BattleSpawnGate.ActiveMapEventId);
+        BattleSpawnGate.EndBattle();
     }
 
     [HarmonyPostfix]

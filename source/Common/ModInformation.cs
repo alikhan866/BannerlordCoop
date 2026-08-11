@@ -9,6 +9,13 @@ public static class ModInformation
     public static bool IsClient => !IsServer;
 
     /// <summary>
+    /// True when this process runs the game with no renderer - a console dedicated server, started with
+    /// /coopheadless. Anything that reaches for a window, a loading screen or a rendered map scene has to
+    /// take a different path here, because the engine has none of them to give.
+    /// </summary>
+    public static bool IsHeadless { get; set; } = false;
+
+    /// <summary>
     /// The mod build stamped on this assembly. Its semantic version comes from the same build
     /// property as the deployed module manifest.
     /// </summary>

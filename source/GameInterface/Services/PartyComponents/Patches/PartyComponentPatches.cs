@@ -5,6 +5,7 @@ using GameInterface.Policies;
 using GameInterface.Services.PartyComponents.Messages;
 using HarmonyLib;
 using Serilog;
+using System;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Reflection.Emit;
@@ -69,6 +70,22 @@ public class PartyComponentTranspilers
 
     public static void OnChangePartyLeaderIntercept(PartyComponent instance, Hero newLeader)
     {
+        // A lord party that loses its leader and never gets one back is invisible trouble: the size limit
+        // collapses to the base value, Army Management cannot build a row for it so it vanishes from the list,
+        // and ChangePartyLeader parks it on Hold. Vanilla always follows the removal with a destroy, a disband
+        // or a replacement leader; when one of those does not land here the party just rots.
+        //
+        // Seven vanilla paths call RemovePartyLeader, so guessing which one fired from the wreckage afterwards
+        // is hopeless. Record the caller at the moment it happens instead.
+        if (newLeader == null && instance is LordPartyComponent lordParty && lordParty.Owner != null)
+        {
+            Logger.Warning(
+                "Lord party {Party} (owner {Owner}) lost its leader. Caller:\n{Stack}",
+                instance.MobileParty?.StringId ?? "<no party>",
+                lordParty.Owner.Name?.ToString() ?? "<unnamed>",
+                Environment.StackTrace);
+        }
+
         if (CallOriginalPolicy.IsOriginalAllowed())
         {
             instance.OnChangePartyLeader(newLeader);

@@ -481,8 +481,19 @@ public class PuppetSpawner : IPuppetSpawner
 
         // Our OWN troop replicated back to us (e.g. our own-party deployment broadcast echoed over the mesh) belongs
         // on our own team — it is the one puppet we DO control.
+        //
+        // PlayerTeam, explicitly, not the side's main team. On the client that STARTED the battle those are the
+        // same object, which is why returning the main team looked correct and passed every test. They come
+        // apart for a client that JOINS one: it is not the side's leader, so vanilla gives it a subordinate
+        // team and the side's main team belongs to whoever is leading. Every own troop then landed on a team
+        // that client cannot command.
+        //
+        // Reported exactly as it behaves: the joining player could walk and fight, but the order UI had nothing
+        // in it. Measured at the same instant on both clients - the host's player team held 131 agents and its
+        // ally team none, while the joiner's player team held ONE (his own hero) against 216 on the ally team.
+        // His army was on the field the whole time and none of it was his to order.
         if (session.IsOwn(data.OwnerControllerId))
-            return mainTeam;
+            return BattleTeams.OwnTeam(data.Side, Mission.Current.PlayerTeam, mainTeam);
 
         var playerTeam = Mission.Current.PlayerTeam;
         if (mainTeam != playerTeam) return mainTeam;          // main team isn't ours (we're an ally) — safe to use

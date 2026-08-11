@@ -534,13 +534,53 @@ internal sealed partial class LordBarterHandler : IHandler
         if (!TryValidateConversation(peer, request, mobileParty, playerParty, targetParty, targetHero, out reason))
             return false;
 
-        if (targetHero.IsPrisoner || targetHero.Clan == null)
+        if (!IsTargetAvailableForBarter(
+                targetIsPrisoner: targetHero.IsPrisoner,
+                targetIsHeldByRequester: IsHeldByRequester(targetHero, playerHero, playerParty),
+                targetHasClan: targetHero.Clan != null))
         {
             reason = "That lord is no longer available for barter.";
             return false;
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Whether the server will let this lord be bartered with.
+    /// </summary>
+    /// <remarks>
+    /// This used to refuse every prisoner outright, which also refused the one barter a prisoner is FOR:
+    /// recruiting a captured lord into your own clan. The player takes the lord out of the dungeon, opens
+    /// "Join &lt;clan&gt;", and the server answered "That lord is no longer available for barter."
+    ///
+    /// A prisoner still cannot be bartered with in general - a lord rotting in someone else's dungeon is
+    /// not the player's to negotiate with - so the test is who holds them, not whether they are held. Note
+    /// the blanket check was not protecting against a null <c>targetParty</c> either: that is only
+    /// dereferenced on the safe-passage path, which already rejects a null party of its own, and a join
+    /// offer never touches it.
+    /// </remarks>
+    internal static bool IsTargetAvailableForBarter(bool targetIsPrisoner, bool targetIsHeldByRequester, bool targetHasClan)
+    {
+        if (!targetHasClan) return false;
+
+        return !targetIsPrisoner || targetIsHeldByRequester;
+    }
+
+    /// <summary>Whether this prisoner is the requesting player's own captive.</summary>
+    /// <remarks>
+    /// Two ways to hold one: in the party itself, or in the dungeon of a settlement the player's clan owns.
+    /// Both are the player's captive and both reach this barter through the same conversation.
+    /// </remarks>
+    private static bool IsHeldByRequester(Hero targetHero, Hero playerHero, PartyBase playerParty)
+    {
+        var captor = targetHero.PartyBelongedToAsPrisoner;
+        if (captor == null) return false;
+
+        if (ReferenceEquals(captor, playerParty)) return true;
+
+        var settlement = captor.Settlement;
+        return settlement?.OwnerClan != null && ReferenceEquals(settlement.OwnerClan, playerHero?.Clan);
     }
 
     /// <summary>

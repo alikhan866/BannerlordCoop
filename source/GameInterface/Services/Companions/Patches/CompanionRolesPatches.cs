@@ -1,4 +1,5 @@
-﻿using Common.Logging;
+﻿using Common;
+using Common.Logging;
 using Common.Messaging;
 using GameInterface.Policies;
 using GameInterface.Services.Companions.Messages;
@@ -146,10 +147,27 @@ internal class CompanionRolesPatches
     }
     // Patch for server to use passed down ClientHero instead of server's MainHero
     // which leads to a different hero
+    /// <summary>
+    /// Spawns the two lords a new companion-to-lord clan starts with. SERVER ONLY.
+    /// </summary>
+    /// <remarks>
+    /// This method invents heroes from unsynchronised randomness — a random lord template, then random skill
+    /// values and relations. The companion-to-lord flow is replayed on EVERY machine (DoClanNameSelection), so
+    /// letting it run on a client made that client mint its OWN pair of heroes from its own random draws, in
+    /// addition to the pair the server minted and replicated to it. The new clan then held four heroes on the
+    /// client and two on the server, two of them known to nobody else — and opening the clan screen, which
+    /// enumerates exactly those members, is where that came apart.
+    ///
+    /// Heroes are replicated on construction (HeroRegistry hooks the Hero constructor), so a client does not
+    /// need to create them: it receives the server's, with their clan, state and relations arriving as ordinary
+    /// sync. This is the same reasoning that already makes creation server-authoritative everywhere else.
+    /// </remarks>
     [HarmonyPatch(nameof(CompanionRolesCampaignBehavior.SpawnNewHeroesForNewCompanionClan))]
     [HarmonyPrefix]
     public static bool SpawnNewHeroesForNewCompanionClanPrefix(CompanionRolesCampaignBehavior __instance, Hero companionHero, Clan clan, Settlement settlement)
     {
+        if (ModInformation.IsClient) return false;
+
         MBReadOnlyList<CharacterObject> lordTemplates = companionHero.Culture.LordTemplates;
         List<Hero> list = new List<Hero>();
         list.Add(__instance.CreateNewHeroForNewCompanionClan(lordTemplates.GetRandomElement<CharacterObject>(), settlement, new Dictionary<SkillObject, int>

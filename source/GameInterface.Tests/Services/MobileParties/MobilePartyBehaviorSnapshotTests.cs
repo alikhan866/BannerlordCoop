@@ -59,7 +59,7 @@ public class MobilePartyBehaviorSnapshotTests
     }
 
     [Fact]
-    public void TryCreate_UnregisteredInteractable_DoesNotMutateParty()
+    public void TryCreate_UnregisteredInteractable_DropsTheReferenceAndKeepsTheBehavior()
     {
         var party = CreateParty();
         var removedTarget = CreatePartyWithPartyBase();
@@ -75,7 +75,15 @@ public class MobilePartyBehaviorSnapshotTests
 
         var snapshot = new MobilePartyBehaviorSnapshot(objectManager.Object);
 
-        Assert.False(snapshot.TryCreate(party, out _));
+        // The snapshot drops the reference it cannot resolve and sends the behaviour anyway, rather than
+        // failing the whole update. Failing it silently stranded ~850 parties pointing at destroyed ones and
+        // froze the map on every client; a party that arrives with a dropped target still moves, and the AI
+        // re-targets on its next decision. Matches the MoveTargetParty branch above.
+        Assert.True(snapshot.TryCreate(party, out PartyBehaviorUpdateData data));
+        Assert.Null(data.InteractablePointId);
+        Assert.False(data.IsInteractableAnchor);
+
+        // Taking the snapshot must still not touch the party it is reading.
         Assert.Same(removedTarget.Party, party.Ai.AiBehaviorInteractable);
         Assert.Equal(AiBehavior.EngageParty, party.DefaultBehavior);
         Assert.Equal(AiBehavior.EngageParty, party.ShortTermBehavior);
@@ -292,6 +300,26 @@ public class MobilePartyBehaviorSnapshotTests
         Assert.Equal("party AI is unavailable", failure);
     }
 
+    private static PartyBehaviorUpdateData BehaviorFor(string partyId) =>
+        new PartyBehaviorUpdateData(
+            partyId,
+            AiBehavior.Hold,
+            null,
+            default,
+            default,
+            AiBehavior.Hold,
+            default,
+            default);
+
+    /// <summary>
+    /// A party-count disagreement is refused, and the message names what diverged.
+    /// </summary>
+    /// <remarks>
+    /// The strict check is deliberate. Tolerating the mismatch was tried and is worse: the joiner enters with a
+    /// world missing its own party state and cannot move, which looks like a fix while being a harder bug. The
+    /// real cause is a party sitting at IsActive=false on the client while active on the server, and the
+    /// divergence detail appended here is what identifies it.
+    /// </remarks>
     [Fact]
     public void TryApplyJoinBaseline_MismatchedPartyCount_ReportsCounts()
     {
@@ -311,9 +339,68 @@ public class MobilePartyBehaviorSnapshotTests
                 () => { });
 
             Assert.False(applied);
-            Assert.Equal(
+            Assert.StartsWith(
                 "party count mismatch (baseline=1, client=0)",
                 snapshot.LastJoinBaselineFailure);
+        }
+        finally
+        {
+            Campaign.Current = previousCampaign;
+        }
+    }
+
+    /// <summary>
+    /// A baseline party the server reports as inactive stays in the client's collection.
+    /// </summary>
+    /// <remarks>
+    /// IsActive is a bare field write, so the server keeps an inactive party in its own
+    /// CampaignObjectManager.MobileParties and the baseline - built by walking that collection - still lists
+    /// it. Removing it on the client to mirror the flag makes the client one party short of a baseline that
+    /// counts it, and the join can never converge. Seen live as baseline=1546 / client=1545 while the other
+    /// player was disconnected, which livelocked both joins.
+    /// </remarks>
+    [Fact]
+    public void TryApplyJoinBaseline_InactiveServerParty_StaysInTheClientCollection()
+    {
+        Campaign previousCampaign = Campaign.Current;
+        try
+        {
+            var party = CreateParty();
+            party.IsActive = true;
+
+            var campaign = ObjectHelper.SkipConstructor<Campaign>();
+            var campaignObjectManager = new CampaignObjectManager
+            {
+                Settlements = new MBReadOnlyList<Settlement>(new List<Settlement>()),
+            };
+            campaignObjectManager._mobileParties.Add(party);
+            campaign.CampaignObjectManager = campaignObjectManager;
+            Campaign.Current = campaign;
+
+            var objectManager = new Mock<IObjectManager>();
+            MobileParty resolvedParty = party;
+            objectManager
+                .Setup(m => m.TryGetObject("Created_1", out resolvedParty))
+                .Returns(true);
+            var snapshot = new MobilePartyBehaviorSnapshot(objectManager.Object);
+
+            snapshot.TryApplyJoinBaseline(
+                new[]
+                {
+                    new MobilePartyJoinState
+                    {
+                        Behavior = BehaviorFor("Created_1"),
+                        IsActive = false,
+                    },
+                },
+                () => { });
+
+            // The flag follows the server; membership does not. Losing either half is the bug.
+            Assert.False(party.IsActive);
+            Assert.Contains(party, campaignObjectManager.MobileParties);
+            Assert.DoesNotContain(
+                "party count mismatch",
+                snapshot.LastJoinBaselineFailure ?? string.Empty);
         }
         finally
         {
@@ -383,9 +470,12 @@ public class MobilePartyBehaviorSnapshotTests
                 default);
 
             bool applied = snapshot.TryApplyJoinBaseline(
-                new[] { new MobilePartyJoinState { Behavior = behavior } },
+                new[] { new MobilePartyJoinState { Behavior = behavior, IsActive = true } },
                 () => { });
 
+            // A party whose behaviour cannot be resolved fails the whole baseline, and the message says which
+            // party and which dependency - applying a partially-resolved world is what the strict check exists
+            // to prevent.
             Assert.False(applied);
             Assert.Equal(
                 "state 0 party 'Created_1' failed validation: " +
@@ -437,14 +527,30 @@ public class MobilePartyBehaviorSnapshotTests
             {
                 Settlements = new MBReadOnlyList<Settlement>(new List<Settlement>()),
             };
-            campaignObjectManager._mobileParties.Add(CreateParty());
+            var party = CreateParty();
+            campaignObjectManager._mobileParties.Add(party);
             campaign.CampaignObjectManager = campaignObjectManager;
             Campaign.Current = campaign;
-            var snapshot = new MobilePartyBehaviorSnapshot(Mock.Of<IObjectManager>());
+
+            var objectManager = new Mock<IObjectManager>();
+            MobileParty resolvedParty = party;
+            objectManager
+                .Setup(m => m.TryGetObject("Created_1", out resolvedParty))
+                .Returns(true);
+            var snapshot = new MobilePartyBehaviorSnapshot(objectManager.Object);
+
             var missingIdBaseline = new[] { new MobilePartyJoinState() };
+            // A second, DIFFERENT rejection: two states against one client party fails the count check, where
+            // the first baseline fails on a missing id. Two distinct reasons are needed, because a repeat of
+            // the SAME reason is deliberately not logged twice - which is the behaviour under test.
+            var duplicateBaseline = new[]
+            {
+                new MobilePartyJoinState { Behavior = BehaviorFor("Created_1"), IsActive = true },
+                new MobilePartyJoinState { Behavior = BehaviorFor("Created_1"), IsActive = true },
+            };
 
             Assert.False(snapshot.TryApplyJoinBaseline(missingIdBaseline, () => { }));
-            Assert.False(snapshot.TryApplyJoinBaseline(Array.Empty<MobilePartyJoinState>(), () => { }));
+            Assert.False(snapshot.TryApplyJoinBaseline(duplicateBaseline, () => { }));
             Assert.False(snapshot.TryApplyJoinBaseline(missingIdBaseline, () => { }));
 
             Assert.Equal("state 0 has no mobile-party id", snapshot.LastJoinBaselineFailure);

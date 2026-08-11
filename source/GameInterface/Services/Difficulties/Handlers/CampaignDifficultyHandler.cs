@@ -1,4 +1,4 @@
-using Common;
+﻿using Common;
 using Common.Logging;
 using Common.Messaging;
 using GameInterface.Configuration;
@@ -89,6 +89,19 @@ internal class CampaignDifficultyHandler : IHandler
 
         Logger.Information("difficulty (effective): {Effective}", string.Join(" ", effective));
     }
+
+    /// <summary>
+    /// A console dedicated server, which has no difficulty profile of its own to read.
+    /// </summary>
+    /// <remarks>
+    /// Container hosts are recognised by BANNERLORD_USER_DIR, the marker CoopSaveManager keys its data
+    /// root on. A /coopheadless server does not set it - doing so would split its saves across two folders
+    /// - so it is recognised directly instead. Without this, such a server silently takes the profile
+    /// default of VeryEasy for everyone connected to it.
+    /// </remarks>
+    private static bool IsHeadlessHost =>
+        ModInformation.IsHeadless ||
+        string.IsNullOrEmpty(Environment.GetEnvironmentVariable("BANNERLORD_USER_DIR")) == false;
 
     /// <summary>By name, not ordinal — the game enum's numbering is not ours to rely on.</summary>
     private static CampaignOptions.Difficulty ToCampaign(DifficultyLevel level)

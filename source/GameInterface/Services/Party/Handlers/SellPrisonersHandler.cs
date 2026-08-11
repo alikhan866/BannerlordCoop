@@ -72,6 +72,28 @@ internal class SellPrisonersHandler : IHandler
 
             sendCoalescer?.FlushInstance(compactId, network);
 
+            // Hand back what the prison roster actually holds now.
+            //
+            // A ransom is the one party-screen action that never gets the delta check: PartyDoneLogicHandler
+            // skips TryApplyTroopRosterDeltas entirely in Ransom mode, because SellPrisonersAction moves the
+            // troops itself. So a ransom cannot be REFUSED - and it is refusal that triggers the resync which
+            // repairs a diverged roster everywhere else.
+            //
+            // It can still come up short, and silently. PrisonerSaleProcessor validates the requested sale
+            // against the SERVER's prison roster, so a client asking to ransom prisoners the server does not
+            // have simply sells fewer, with nothing sent back to say so. The client keeps showing them, the
+            // next ransom is short by the same amount, and the gap never closes on its own - which is exactly
+            // how a player ended up unable to ransom or discard anything at all.
+            //
+            // Sending the authority's roster after every sale means a ransom cannot leave the two disagreeing,
+            // whatever they disagreed about beforehand.
+            if (obj.Who is NetPeer requester && rosterId != null)
+            {
+                network.Send(requester, new NetworkPartyRosterResync(
+                    rosterId,
+                    troopRosterInterface.PackTroopRosterData(sellingParty.PrisonRoster)));
+            }
+
             // Refresh the menu to show updated menu items
             if (!objectManager.TryGetIdWithLogging(sellingParty.LeaderHero, out var heroId)) return;
             network.Send(obj.Who as NetPeer, new RefreshGameMenu(heroId, "town_backstreet"));

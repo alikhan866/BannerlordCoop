@@ -223,9 +223,34 @@ internal class BattleHandler : IHandler
 
     private void Handle_MapEventFinalized(MessagePayload<MapEventFinalized> payload)
     {
+        WarnIfFinalizedUnderALiveMission(payload.What.MapEvent);
+
         // A map event ended; its parties have left it, so re-evaluate whether
         // fast-forward should become available again.
         RefreshFastForwardState(finalizedMapEvent: payload.What.MapEvent);
+    }
+
+    /// <summary>
+    /// Says so loudly when a map event is destroyed while players are still fighting in its mission.
+    /// </summary>
+    /// <remarks>
+    /// This is the condition behind the original fault, and it is worth naming rather than merely surviving.
+    /// Measured live: the server destroyed a battle's map event at 13:39:39 while a player was still fighting
+    /// it at 13:40:49. The fast-forward lock now reads mission membership and holds through it, but a battle
+    /// whose campaign event no longer exists has nothing left to commit its result to, so the underlying cause
+    /// still matters - and without a line in the log there is nothing to trace it by. Only logged, never acted
+    /// on: guessing at a recovery here would be worse than reporting it.
+    /// </remarks>
+    private void WarnIfFinalizedUnderALiveMission(MapEvent mapEvent)
+    {
+        if (ModInformation.IsClient || mapEvent == null) return;
+        if (!objectManager.TryGetId(mapEvent, out var mapEventId)) return;
+        if (!PlayersInBattleMissions.HasFightingMembers(mapEventId)) return;
+
+        Logger.Warning(
+            "[MapEvent] {MapEventId} was FINALIZED while players are still in its battle mission. " +
+            "Their fight continues with no campaign event behind it, so its result has nowhere to commit",
+            mapEventId);
     }
 
     private void Handle_TimeSpeedChangedAttempted(MessagePayload<TimeSpeedChangedAttempted> payload)
@@ -315,6 +340,18 @@ internal class BattleHandler : IHandler
         // the log when a party is momentarily unresolved.
         return CountConnectedPlayersInMapEvents(playerRegistry.Players, playerRegistry.IsConnected, player =>
         {
+            // Mission membership first, because it is the fact and the map event is only a proxy for it. The
+            // proxy fails in one direction and it is the dangerous one: a map event torn down under a live
+            // mission reads as "this player has left the battle" while they are still fighting it. Measured
+            // live at more than a minute of divergence, during which the campaign was told it could
+            // fast-forward and announced "No more players are in map events" to a player mid-battle.
+            //
+            // A battle being finalized is deliberately NOT excluded here: `excluding` exists so that the event
+            // currently being torn down does not keep the lock held after everyone has genuinely left, and a
+            // player still inside the mission has not left.
+            if (PlayersInBattleMissions.Contains(player.ControllerId))
+                return true;
+
             if (!objectManager.TryGetObject<MobileParty>(player.MobilePartyId, out var playerParty))
                 return false;
 

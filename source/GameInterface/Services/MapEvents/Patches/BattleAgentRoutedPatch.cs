@@ -22,6 +22,17 @@ internal class BattleAgentRoutedPatch
         if (!BattleSpawnGate.IsCoopBattleActive) return;
         if (agentState != AgentState.Routed || affectedAgent == null) return;
 
+        // NOT suppressed during a withdrawal, deliberately. This looks like a "the man fled" report, but it is
+        // the channel that tells every peer to DROP ITS PUPPET - AgentRoutReporter answers it by broadcasting
+        // NetworkBattleAgentRouted, forgetting the casualty and de-registering the agent. Silencing it left
+        // peers holding puppets for troops that had been taken off the field here: nothing owned them so they
+        // never moved, and damage routed to an owner that no longer had them, so they could not be killed.
+        // That is the "stuck and immortal troops" a second client saw.
+        //
+        // The scoreboard attribution - the actual retreat/rout counter - is handled separately by
+        // BattleObserverRoundRestartPatch, which issues a plain decrement with no cause. Two different jobs
+        // that happen to be triggered by the same agent state.
+
         MessageBroker.Instance.Publish(affectedAgent, new BattleAgentRouted(affectedAgent));
     }
 }

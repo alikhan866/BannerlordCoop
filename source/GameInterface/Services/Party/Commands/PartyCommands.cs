@@ -605,6 +605,55 @@ internal class PartyCommands
     /// check only fires when the defenders out-ratio the besiegers 2:1, so a buffed besieger silently
     /// suppresses the very behaviour under test.
     /// </summary>
+    /// <summary>
+    /// Removes a specific number of one troop (or one hero) from a party's member roster.
+    /// </summary>
+    /// <remarks>
+    /// The missing counterpart to <c>addtroops</c>. Until now the only way to take members out of a roster was
+    /// <c>set_troops</c>, which deletes EVERY non-hero troop before adding its one type back - fine as a test
+    /// fixture, useless when a real army has to survive the operation.
+    ///
+    /// Two live cases needed it. Nearly a thousand debug troops had to be handed back out of a player's party
+    /// without touching the men he actually recruited; and a companion who had been given his own party was
+    /// still listed in the player's roster as well, so his CharacterObject sat in two rosters at once - visible
+    /// in the party screen while leading a party on the map.
+    ///
+    /// Removal goes through <c>AddToCounts</c> with a negative count and <c>removeDepleted</c>, which is the
+    /// same path the game uses and so replicates to clients like any other roster change. Counts are clamped to
+    /// what is actually there, because asking for more than exists would otherwise drive the roster negative.
+    /// </remarks>
+    [CommandLineArgumentFunction("removetroops", "coop.debug.mobileparty")]
+    public static string RemoveTroopsCommand(List<string> strings)
+    {
+        if (ModInformation.IsClient) return "Command can only be run on the server.";
+        if (strings.Count != 3)
+            return "Usage: coop.debug.mobileparty.removetroops <partyId> <characterId> <count>";
+        if (TryGetObjectManager(out var objectManager) == false) return "Unable to resolve ObjectManager.";
+        if (!objectManager.TryGetObject(strings[0], out MobileParty party)) return $"Party with id {strings[0]} not found";
+        if (!objectManager.TryGetObject(strings[1], out CharacterObject troop)) return $"Troop with id {strings[1]} not found";
+        if (!int.TryParse(strings[2], out var requested) || requested <= 0) return $"'{strings[2]}' is not a positive troop count";
+
+        // Heroes are refused outright. Removing a hero from a roster is not a subtraction - vanilla treats it
+        // as DETACHING that hero, so it clears Hero.PartyBelongedTo. Pointing this command at a companion who
+        // led his own party removed the stale entry AND orphaned his party, leaving him belonging to nothing.
+        // A general-purpose troop tool must not be able to do that; hero roster entries have their own repair.
+        if (troop.IsHero)
+            return $"{troop.Name} is a hero. Removing a hero from a roster detaches them from their party " +
+                   "entirely; use the hero-aware repair instead of removetroops.";
+
+        var roster = party.MemberRoster;
+        int present = roster.GetTroopCount(troop);
+        if (present <= 0) return $"{party.Name} has no {troop.Name} to remove.";
+
+        // Clamp rather than refuse: asking to remove "all of them" should not fail because the number drifted.
+        int toRemove = System.Math.Min(requested, present);
+        roster.AddToCounts(troop, -toRemove, false, 0, 0, true);
+
+        int remaining = roster.GetTroopCount(troop);
+        return $"Removed {toRemove}x {troop.Name} from {party.Name} ({party.StringId}); " +
+               $"{remaining} left, {roster.TotalManCount} men total.";
+    }
+
     [CommandLineArgumentFunction("set_troops", "coop.debug.mobileparty")]
     public static string SetTroopsCommand(List<string> strings)
     {

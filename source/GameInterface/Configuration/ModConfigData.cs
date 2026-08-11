@@ -110,6 +110,19 @@ public sealed class ModOptionsData
     /// </summary>
     public bool? ResumeSiegeWhenEnemyRetreats { get; set; }
 
+    public bool? TrimFieldToBattleSize { get; set; }
+
+    /// <summary>
+    /// Whether troops are stopped from breaking and fleeing when their morale gives out.
+    /// </summary>
+    public bool? DisableBattleMorale { get; set; }
+
+    /// <summary>
+    /// Whether a kingdom led by a player is spared the AI's war and peace proposals, leaving those calls to
+    /// its ruler.
+    /// </summary>
+    public bool? PlayerLedKingdomsControlTheirOwnDiplomacy { get; set; }
+
     /// <summary>
     /// Whether a besieged settlement's garrison sorties to join a relief force attacking the besiegers.
     /// </summary>

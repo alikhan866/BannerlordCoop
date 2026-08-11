@@ -45,12 +45,24 @@ public interface ITroopRosterInterface : IGameAbstraction
     TroopRosterData PackTroopRosterDelta(TroopRoster current, TroopRoster initial);
 
     /// <summary>
-    /// Validates and applies a set of packed deltas (produced by <see cref="PackTroopRosterDelta"/>).
-    /// Nothing is applied when any resulting roster element would be invalid. All count reductions are
-    /// applied before any additions across every roster so transferred heroes retain their party linkage.
+    /// Applies a set of packed deltas (produced by <see cref="PackTroopRosterDelta"/>). A delta that asks for
+    /// more than the roster holds is clamped to what is actually there rather than refused, with any matching
+    /// addition reduced by the same amount so no troops are created. Only a malformed request - an unresolvable
+    /// character or a roster element listed twice - fails. All count reductions are applied before any
+    /// additions across every roster so transferred heroes retain their party linkage.
     /// </summary>
     bool TryApplyTroopRosterDeltas(
         IReadOnlyList<(TroopRoster roster, TroopRosterData delta)> deltas);
+
+    /// <summary>
+    /// As <see cref="TryApplyTroopRosterDeltas(IReadOnlyList{ValueTuple{TroopRoster, TroopRosterData}})"/>,
+    /// additionally reporting through <paramref name="adjusted"/> whether anything had to be clamped. A caller
+    /// serving a client request uses that to push the authoritative rosters back, since the requester's screen
+    /// is now showing a result it did not get.
+    /// </summary>
+    bool TryApplyTroopRosterDeltas(
+        IReadOnlyList<(TroopRoster roster, TroopRosterData delta)> deltas,
+        out bool adjusted);
 
     /// <summary>
     /// Runs troop recruitment logic for client requests.
@@ -183,14 +195,23 @@ internal class TroopRosterInterface : ITroopRosterInterface
 
     public bool TryApplyTroopRosterDeltas(
         IReadOnlyList<(TroopRoster roster, TroopRosterData delta)> deltas)
+        => TryApplyTroopRosterDeltas(deltas, out _);
+
+    public bool TryApplyTroopRosterDeltas(
+        IReadOnlyList<(TroopRoster roster, TroopRosterData delta)> deltas,
+        out bool adjusted)
     {
+        adjusted = false;
         if (deltas == null) return false;
 
         var elements = new List<(
             TroopRoster roster,
             CharacterObject character,
             TroopRosterElementData delta)>();
+        var currentStates = new List<(int number, int wounded, int xp)>();
         var uniqueElements = new HashSet<(TroopRoster roster, CharacterObject character)>();
+        var shortfallByCharacter = new Dictionary<CharacterObject, int>();
+
         foreach (var (roster, delta) in deltas)
         {
             if (roster == null) return false;
@@ -200,35 +221,73 @@ internal class TroopRosterInterface : ITroopRosterInterface
 
             foreach (var elementData in delta.Data)
             {
+                // A character the server cannot resolve, or the same roster element listed twice, is a
+                // malformed request rather than a stale one - there is no sane state to clamp it towards.
                 if (!objectManager.TryGetObjectWithLogging<CharacterObject>(elementData.CharacterId, out var character))
                     return false;
                 if (!uniqueElements.Add((roster, character))) return false;
 
                 currentByCharacter.TryGetValue(character, out var current);
-                long finalNumber = current.number + elementData.Number;
-                long finalWounded = current.wounded + elementData.WoundedNumber;
-                long finalXp = current.xp + elementData.Xp;
-                if (finalNumber < 0 ||
-                    finalNumber > int.MaxValue ||
-                    finalWounded < 0 ||
-                    finalWounded > finalNumber ||
-                    finalXp < 0 ||
-                    finalXp > int.MaxValue ||
-                    (elementData.Xp != 0 && finalNumber == 0 && finalXp != 0))
+                var clamped = ClampToHoldableState(elementData, current);
+                if (clamped.Number != elementData.Number ||
+                    clamped.WoundedNumber != elementData.WoundedNumber ||
+                    clamped.Xp != elementData.Xp)
                 {
+                    // Only a count that could not be honoured is worth telling the player about: that is the
+                    // one they can see, as troops still sitting where they tried to move them from. Experience
+                    // settling differently is invisible on the screen, and reporting it would fire a resync and
+                    // an alarming message during ordinary play.
+                    if (clamped.Number != elementData.Number) adjusted = true;
+
                     Logger.Warning(
-                        "Rejected troop roster delta for {CharacterId}: current=({CurrentNumber},{CurrentWounded},{CurrentXp}) delta=({NumberDelta},{WoundedDelta},{XpDelta})",
+                        "Clamped troop roster delta for {CharacterId}: current=({CurrentNumber},{CurrentWounded},{CurrentXp}) requested=({NumberDelta},{WoundedDelta},{XpDelta}) applied=({ClampedNumber},{ClampedWounded},{ClampedXp})",
                         elementData.CharacterId,
                         current.number,
                         current.wounded,
                         current.xp,
                         elementData.Number,
                         elementData.WoundedNumber,
-                        elementData.Xp);
-                    return false;
+                        elementData.Xp,
+                        clamped.Number,
+                        clamped.WoundedNumber,
+                        clamped.Xp);
                 }
 
-                elements.Add((roster, character, elementData));
+                // Removing fewer troops than asked leaves a debt: whatever the source could not supply must
+                // not be handed to the destination, or the shortfall is minted as new troops.
+                int shortfall = clamped.Number - elementData.Number;
+                if (shortfall > 0)
+                {
+                    shortfallByCharacter.TryGetValue(character, out var pending);
+                    shortfallByCharacter[character] = pending + shortfall;
+                }
+
+                elements.Add((roster, character, clamped));
+                currentStates.Add(current);
+            }
+        }
+
+        if (shortfallByCharacter.Count > 0)
+        {
+            for (int i = 0; i < elements.Count; i++)
+            {
+                var (roster, character, delta) = elements[i];
+                if (delta.Number <= 0) continue;
+                if (!shortfallByCharacter.TryGetValue(character, out var shortfall)) continue;
+
+                int consumed = ConsumeShortfall(delta.Number, shortfall);
+                if (consumed == 0) continue;
+
+                shortfallByCharacter[character] = shortfall - consumed;
+                var reduced = new TroopRosterElementData(
+                    delta.CharacterId,
+                    delta.Number - consumed,
+                    delta.WoundedNumber,
+                    delta.Xp);
+
+                // The smaller count can strand wounded or experience, so re-settle the element against it.
+                elements[i] = (roster, character, ClampToHoldableState(reduced, currentStates[i]));
+                adjusted = true;
             }
         }
 
@@ -236,6 +295,56 @@ internal class TroopRosterInterface : ITroopRosterInterface
         ApplyDeltaElements(elements, applyAdditions: false);
         ApplyDeltaElements(elements, applyAdditions: true);
         return true;
+    }
+
+    /// <summary>
+    /// Bends one requested delta onto the nearest state the roster can actually hold: no negative counts, no
+    /// more wounded than troops, and no experience stranded on an empty stack.
+    /// </summary>
+    /// <remarks>
+    /// These deltas are the difference between a party screen's live rosters and the snapshot it opened with,
+    /// so they are stale by construction - the world keeps moving while the screen is up, and the screen is
+    /// only modal for the player holding it. Refusing the whole commit on a stale element made the player's
+    /// action silently do nothing, which is what a discard that "does not work" looks like from the outside.
+    /// Observed repeatedly against garrisons, where the client asked to remove 30 of a militia stack the
+    /// server held 15 of.
+    ///
+    /// Clamping grants no capability a well-formed request lacked: it only ever shrinks a change towards what
+    /// the roster already contains, and the caller pairs any shortfall against matching additions so troops
+    /// are never conjured. The player's intent - empty this stack - still lands, and both sides converge.
+    /// </remarks>
+    internal static TroopRosterElementData ClampToHoldableState(
+        TroopRosterElementData delta,
+        (int number, int wounded, int xp) current)
+    {
+        long finalNumber = current.number + (long)delta.Number;
+        if (finalNumber < 0) finalNumber = 0;
+        if (finalNumber > int.MaxValue) finalNumber = int.MaxValue;
+
+        long finalWounded = current.wounded + (long)delta.WoundedNumber;
+        if (finalWounded < 0) finalWounded = 0;
+        if (finalWounded > finalNumber) finalWounded = finalNumber;
+
+        long finalXp = current.xp + (long)delta.Xp;
+        if (finalXp < 0) finalXp = 0;
+        if (finalXp > int.MaxValue) finalXp = int.MaxValue;
+        // An emptied stack is dropped from the roster, so any experience left on it would simply vanish.
+        if (finalNumber == 0) finalXp = 0;
+
+        return new TroopRosterElementData(
+            delta.CharacterId,
+            (int)(finalNumber - current.number),
+            (int)(finalWounded - current.wounded),
+            (int)(finalXp - current.xp));
+    }
+
+    /// <summary>
+    /// How much of an outstanding removal shortfall a paired addition has to give back.
+    /// </summary>
+    internal static int ConsumeShortfall(int additionNumber, int shortfall)
+    {
+        if (additionNumber <= 0 || shortfall <= 0) return 0;
+        return shortfall < additionNumber ? shortfall : additionNumber;
     }
 
     private void ApplyDeltaElements(

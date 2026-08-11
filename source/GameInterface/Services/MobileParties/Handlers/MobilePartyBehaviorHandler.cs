@@ -66,8 +66,33 @@ internal class MobilePartyBehaviorHandler : IHandler
     {
         var party = obj.What.Party;
 
+        // TEMP INSTRUMENTATION for the "cannot move for the first N seconds after joining" bug.
+        // This is the gate every player order passes through, and when it drops one it does so silently -
+        // no send, no error, nothing in any log - which is why polling party STATE never explained it.
+        // Logs both that an order arrived and whether it survived, so a dead window can be told apart from
+        // a window where the order never reached here at all.
+        if (ModInformation.IsClient && party != null && party.IsPlayerParty())
+        {
+            Logger.Warning(
+                "[MoveProbe] order for {Party}: controlled={Controlled} mainParty={IsMain} settlement={Settlement} active={Active}",
+                party.StringId,
+                party.IsControlledByThisInstance(),
+                ReferenceEquals(party, MobileParty.MainParty),
+                party.CurrentSettlement?.Name?.ToString() ?? "<none>",
+                party.IsActive);
+        }
+
         if (ModInformation.IsClient && !party.IsControlledByThisInstance())
+        {
+            if (party != null && party.IsPlayerParty())
+            {
+                Logger.Warning(
+                    "[MoveProbe] DROPPED order for {Party}: this client does not (yet) hold control",
+                    party.StringId);
+            }
+
             return;
+        }
 
         if (!mobilePartyBehaviorSnapshot.TryCreate(
                 party,

@@ -170,6 +170,17 @@ namespace GameInterface.Services.Kingdoms.Patches
                                 continue;
                             }
 
+                            // Same for an alliance the player never answered. Forced resolution below would
+                            // let the AI accept on their behalf, and an alliance is not a neutral default:
+                            // it drags the kingdom into its ally's wars through call-to-war agreements.
+                            // Silence means no.
+                            if (CoopKingdomElection.IsPendingPlayerAllianceOffer(decision))
+                            {
+                                kingdom.RemoveDecision(decision);
+                                CampaignEventDispatcher.Instance.OnKingdomDecisionCancelled(decision, true);
+                                continue;
+                            }
+
                             if (ContainerProvider.TryResolve<IKingdomDecisionVoteManager>(out var voteManager) &&
                                 voteManager.TryResolveDecision(decision, force: true))
                             {

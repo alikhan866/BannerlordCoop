@@ -288,11 +288,13 @@ internal class BattleFinalizeHandler : IHandler
     /// unfinished fight rather than a decision.
     /// </summary>
     /// <remarks>
-    /// Vanilla scores a retreat as a decisive result, and for a siege that is expensive: KingdomManager's
-    /// SiegeCompleted hands the settlement over outright for a won SallyOut, and FinalizeEventAux's teardown
-    /// lifts the camp for a SiegeOutside battle. So a garrison that turns and runs back through its own gate
-    /// loses the town on the spot, and a relief force that breaks off ends the siege it failed to break -
-    /// with its troops left standing in the open rather than back behind the walls they came from.
+    /// Vanilla scores a retreat as a decisive result, and for a siege that is expensive: FinalizeEventAux's
+    /// teardown lifts the camp for a SiegeOutside battle, so a relief force that breaks off ends the siege it
+    /// failed to break - with its troops left standing in the open rather than back behind the walls they came
+    /// from.
+    ///
+    /// A sally-out is the same shape but must be resumed WITHOUT the _keepSiegeEvent flag; see
+    /// <see cref="KeepSiegeEventSuppressesTeardown"/> for why setting it there loses the town outright.
     /// </remarks>
     private static bool ShouldResumeSiegeAfterEnemyRetreat(MapEvent mapEvent)
     {
@@ -309,7 +311,9 @@ internal class BattleFinalizeHandler : IHandler
         var retreatingSide = mapEvent.GetMapEventSide(mapEvent.RetreatingSide);
         if (retreatingSide == null) return false;
 
-        // If the besieging side is what retreated, the siege really is over and vanilla's lift is correct.
+        // If the besieging side is what retreated, leave the outcome to vanilla: it lifts the camp for a
+        // SiegeOutside, and leaves a sally-out untouched. Either way that is the result the besiegers earned
+        // by running, and nothing here should soften it.
         return !SideContainsBesieger(retreatingSide, camp);
     }
 
@@ -327,9 +331,10 @@ internal class BattleFinalizeHandler : IHandler
     /// Keeps the siege standing and sends the routed parties home. Server-only, like the rest of finalize -
     /// clients receive the surviving SiegeEvent and the movement orders through normal replication.
     /// </summary>
-    private void ResumeSiegeAfterEnemyRetreat(MapEvent mapEvent)
+    internal static void ResumeSiegeAfterEnemyRetreat(MapEvent mapEvent)
     {
-        mapEvent._keepSiegeEvent = true;
+        if (KeepSiegeEventSuppressesTeardown(mapEvent.EventType))
+            mapEvent._keepSiegeEvent = true;
 
         var settlement = mapEvent.MapEventSettlement;
         var retreatingSide = mapEvent.GetMapEventSide(mapEvent.RetreatingSide);
@@ -360,6 +365,35 @@ internal class BattleFinalizeHandler : IHandler
             "Siege of {SettlementId} resumes: the {RetreatingSide} side retreated, so the camp stands",
             settlement?.StringId ?? "<none>", mapEvent.RetreatingSide);
     }
+
+    /// <summary>
+    /// Whether setting <c>_keepSiegeEvent</c> on a battle of this type actually holds the siege open, or instead
+    /// hands the settlement over.
+    /// </summary>
+    /// <remarks>
+    /// The flag does not mean the same thing for every battle type, because <c>MapEvent.FinalizeEventAux</c>
+    /// branches on it rather than merely consulting it:
+    ///
+    ///   _keepSiegeEvent == false -> the teardown branch, which runs only for SiegeAssault / SiegeOutside.
+    ///   _keepSiegeEvent == true  -> a SECOND branch, which runs only for SallyOut / BlockadeSallyOut / Blockade.
+    ///
+    /// So for a SiegeOutside the flag suppresses the lift, which is what we want. For a sally-out it is the
+    /// entry condition to the other branch, and that branch calls
+    /// <c>SiegeCompleted(settlement, DefenderSide.Leader, isWin: true, ...)</c> on a defender victory — and
+    /// <c>KingdomManager.SiegeCompleted</c> answers that with <c>ChangeOwnerOfSettlementAction.ApplyBySiege</c>.
+    /// A sally-out is fought with the sallying garrison as the ATTACKER and the besieger as the DEFENDER, so a
+    /// garrison that turns and runs scores as a defender victory: setting the flag there would hand the town to
+    /// the besieger on the spot, which is the exact loss this resume path exists to prevent.
+    ///
+    /// Leaving the flag clear on those types is already correct: neither branch matches, finalize touches no
+    /// siege state, and the camp stands. Vanilla only ever sets the flag itself from
+    /// <c>PlayerEncounter.ContinueBattle</c>, and only for a siege assault whose attackers retreated, so the
+    /// sally-out branch is unreachable in single player. Reaching it is a coop-only hazard.
+    /// </remarks>
+    internal static bool KeepSiegeEventSuppressesTeardown(MapEvent.BattleTypes battleType)
+        => battleType != MapEvent.BattleTypes.SallyOut
+        && battleType != MapEvent.BattleTypes.BlockadeSallyOutBattle
+        && battleType != MapEvent.BattleTypes.BlockadeBattle;
 
     /// <summary>A garrison or militia belongs to the settlement it defends; anyone else was only visiting.</summary>
     private static bool BelongsToBesiegedSettlement(MobileParty party, Settlement settlement)
@@ -595,6 +629,20 @@ internal class BattleFinalizeHandler : IHandler
 
             var mainParty = MobileParty.MainParty;
             MoveLocalRaidPartyToSettlementGate(mainParty, GetLocalRaidFinalizationSettlement(mainParty));
+
+            // Loot still staged means this player has not been shown their spoils yet. Vanilla hands them
+            // over by WALKING the encounter to PlayerEncounterState.LootInventory - capture the enemy,
+            // choose which prisoners to keep, then the loot screen - and force-finishing here cuts that walk
+            // short, which is the whole reason battle loot had to be auto-credited behind the player's back.
+            // Leave the encounter alone and let it reach those screens; BattleLootRescuePatch still covers
+            // the case where it ends without ever getting there, so nothing can be silently lost.
+            if (PendingBattleLoot.HasPending)
+            {
+                Logger.Information(
+                    "[Loot] Battle finalized with loot still staged; leaving the encounter open so the " +
+                    "prisoner and loot screens can run");
+                return;
+            }
 
             if (PlayerEncounter.Current != null)
             {

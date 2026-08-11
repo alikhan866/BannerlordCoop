@@ -1,6 +1,7 @@
 ﻿// Ignore Spelling: Finalizer
 
 using Common;
+using Common.Logging;
 using Common.Messaging;
 using Common.Network;
 using Coop.Core.Client.Messages;
@@ -10,6 +11,7 @@ using GameInterface.Services.GameState.Interfaces;
 using GameInterface.Services.GameState.Messages;
 using GameInterface.Services.Time.Interfaces;
 using GameInterface.Services.UI.Interfaces;
+using Serilog;
 using GameInterface.Services.UI.Messages;
 using System.Globalization;
 
@@ -20,6 +22,8 @@ namespace Coop.Core.Client.States;
 /// </summary>
 public class CampaignState : ClientStateBase
 {
+    private static readonly ILogger Logger = LogManager.GetLogger<CampaignState>();
+
     private readonly IMessageBroker messageBroker;
     private readonly ILoadingInterface loadingInterface;
     private readonly IGameStateInterface gameStateInterface;
@@ -243,6 +247,13 @@ public class CampaignState : ClientStateBase
 
     private void CompleteCampaignEntry()
     {
+        // TEMP INSTRUMENTATION: MapState is entered well before this runs, so the map is visible while the
+        // loading overlay is still up - and an overlay swallows map clicks, which matches the reported
+        // symptom exactly (map visible, clicking produces no destination marker at all). If this timestamp
+        // lines up with the moment movement starts working, the join is showing an interactive-looking map
+        // it has not actually handed input to yet.
+        Logger.Warning("[JoinGate] CompleteCampaignEntry: hiding the loading screen and releasing input now");
+
         messageBroker.Publish(this, new PlayerKillFeedColorResendRequested());
         loadingInterface.HideLoadingScreen();
     }

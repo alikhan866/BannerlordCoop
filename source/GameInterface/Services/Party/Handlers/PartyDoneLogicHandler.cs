@@ -33,6 +33,9 @@ internal class PartyDoneLogicHandler : IHandler
     private const string PartyChangedMessage =
         "The party changed before these edits were applied. Reopen the party screen and try again.";
 
+    private const string PartyPartiallyAppliedMessage =
+        "The party changed while you were editing it, so some troops were no longer there. Your changes were applied to what remained.";
+
     private static readonly ILogger logger = LogManager.GetLogger<PartyDoneLogicHandler>();
 
     private readonly IMessageBroker messageBroker;
@@ -53,12 +56,14 @@ internal class PartyDoneLogicHandler : IHandler
 
         messageBroker.Subscribe<PartyDoneLogicAttempted>(Handle_PartyDoneLogicAttempted);
         messageBroker.Subscribe<NetworkCompleteDoneLogic>(Handle_CompletePartyDoneLogic);
+        messageBroker.Subscribe<NetworkPartyRosterResync>(Handle_PartyRosterResync);
     }
 
     public void Dispose()
     {
         messageBroker.Unsubscribe<PartyDoneLogicAttempted>(Handle_PartyDoneLogicAttempted);
         messageBroker.Unsubscribe<NetworkCompleteDoneLogic>(Handle_CompletePartyDoneLogic);
+        messageBroker.Unsubscribe<NetworkPartyRosterResync>(Handle_PartyRosterResync);
     }
 
     // Client
@@ -190,6 +195,7 @@ internal class PartyDoneLogicHandler : IHandler
                     takenHeroCharacterIds);
             }
 
+            bool clampedToActualContents = false;
             var rosterDeltas = CreateRosterDeltas(
                 mainHero,
                 leftParty,
@@ -201,7 +207,7 @@ internal class PartyDoneLogicHandler : IHandler
             // Only apply deltas if not ransoming. SellPrisonersAction already changes troop rosters
             if (message.PartyScreenMode != Helpers.PartyScreenHelper.PartyScreenMode.Ransom)
             {
-                if (!troopRosterInterface.TryApplyTroopRosterDeltas(rosterDeltas))
+                if (!troopRosterInterface.TryApplyTroopRosterDeltas(rosterDeltas, out var rosterDeltasAdjusted))
                 {
                     logger.Warning(
                         "Rejected party changes for {MainHeroId}: {Reason}",
@@ -210,9 +216,12 @@ internal class PartyDoneLogicHandler : IHandler
                     if (requester != null)
                     {
                         network.Send(requester, new SendInformationMessage(PartyChangedMessage));
+                        ResyncRostersWithRequester(requester, rosterDeltas);
                     }
                     return;
                 }
+
+                clampedToActualContents = rosterDeltasAdjusted;
             }
             PublishPlayerCaptivityReleaseEvents(releasedPlayerCaptivityEvents);
             ApplyRightOwnerPartyItemRoster(mainHero, message);
@@ -224,6 +233,74 @@ internal class PartyDoneLogicHandler : IHandler
             ApplyPrisonerRecruitmentEffects(mainHero, message, recruitedPrisonersRoster);
 
             ApplyRosterOrder(mainHero.PartyBelongedTo.MemberRoster, message.RightMemberOrderData);
+
+            // The commit went through, but not as the client drew it - their screen is showing troops that were
+            // never moved. Put them back in step rather than leave them editing a fiction. Sent last, because
+            // the steps above move troops between these same rosters.
+            if (clampedToActualContents && requester != null)
+            {
+                logger.Warning(
+                    "Party changes for {MainHeroId} were clamped to the rosters' actual contents",
+                    message.MainHeroId);
+                network.Send(requester, new SendInformationMessage(PartyPartiallyAppliedMessage));
+                ResyncRostersWithRequester(requester, rosterDeltas);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Sends the server's version of every roster this batch touched back to the client it just refused.
+    /// </summary>
+    /// <remarks>
+    /// Without this a refusal is a dead end. The advice the client is given - reopen the party screen and try
+    /// again - cannot work on its own: the screen rebuilds its delta from the same client-side roster that
+    /// disagreed, so the same batch is sent and refused again. One stale troop stack is enough to block every
+    /// discard, ransom and transfer permanently, which is exactly what a player hit.
+    ///
+    /// Every roster in the batch is sent, not only the one that failed to apply.
+    /// <c>TryApplyTroopRosterDeltas</c> is all-or-nothing and stops at the first mismatch, so it does not know
+    /// which of the others would also have been wrong - and a resync that fixed only the reported roster could
+    /// be refused again on the next one.
+    ///
+    /// This corrects the SYMPTOM, deliberately. A divergence should not happen, and where one is understood it
+    /// is fixed at the source; but the party screen must not become unusable when one does, and a client that
+    /// can be put back in step with the server is a far smaller failure than a player locked out of their own
+    /// party with no way back.
+    /// </remarks>
+    private void ResyncRostersWithRequester(
+        NetPeer requester,
+        List<(TroopRoster roster, TroopRosterData delta)> rosterDeltas)
+    {
+        foreach (var (roster, _) in rosterDeltas)
+        {
+            if (roster == null) continue;
+            if (!objectManager.TryGetId(roster, out var rosterId))
+            {
+                // Nothing can be sent for a roster with no id, so the client keeps whatever it had. Say so:
+                // silence here looks identical to a successful resync from the client's side.
+                logger.Warning(
+                    "No id for a roster in this batch, so it cannot be resynced; the client stays out of step with it");
+                continue;
+            }
+
+            network.Send(requester, new NetworkPartyRosterResync(rosterId, troopRosterInterface.PackTroopRosterData(roster)));
+        }
+    }
+
+    // Client
+    private void Handle_PartyRosterResync(MessagePayload<NetworkPartyRosterResync> obj)
+    {
+        var message = obj.What;
+
+        GameThread.RunSafe(() =>
+        {
+            if (!objectManager.TryGetObjectWithLogging<TroopRoster>(message.RosterId, out var roster)) return;
+
+            troopRosterInterface.UpdateWithData(roster, message.RosterData, Hero.MainHero);
+
+            logger.Information(
+                "Resynced roster {RosterId} from the server after a refused party edit; it now holds {Count} entries",
+                message.RosterId, roster.Count);
         });
     }
 

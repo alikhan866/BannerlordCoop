@@ -1,4 +1,4 @@
-using Common;
+﻿using Common;
 using Common.Logging;
 using Serilog;
 using Steamworks;
@@ -26,6 +26,9 @@ public static class SteamGameServerBoot
     private const string ModDir = "bannerlordcoop";
 
     private static bool started;
+
+    /// <summary>Whether this process initialised the Steam CLIENT API, which only a headless server does.</summary>
+    private static bool clientApiStarted;
     private static int shutDown;
 
     // Strong roots: the game-server callback dispatcher holds these weakly.
@@ -66,6 +69,37 @@ public static class SteamGameServerBoot
         }
     }
 
+    /// <summary>
+    /// Initialises the Steam client API for a headless server, which nothing else in the process does.
+    /// </summary>
+    /// <remarks>
+    /// Only attempted headless: a graphical host is a Steam app already and the engine has initialised it,
+    /// where calling this again is at best redundant. Failure is not fatal - the server still listens, it
+    /// just cannot advertise a lobby - so it is logged rather than thrown.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void TryInitializeClientApi()
+    {
+        if (!ModInformation.IsHeadless) return;
+
+        try
+        {
+            if (SteamAPI.Init())
+            {
+                clientApiStarted = true;
+                Logger.Information("Steam client API initialised for the headless server");
+                return;
+            }
+
+            Logger.Warning(
+                "SteamAPI.Init returned false; the server will listen but cannot advertise a Steam lobby");
+        }
+        catch (Exception ex)
+        {
+            Logger.Warning(ex, "Steam client API unavailable; the server cannot advertise a Steam lobby");
+        }
+    }
+
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static bool Boot()
     {
@@ -75,6 +109,12 @@ public static class SteamGameServerBoot
             Logger.Warning("Steam game-server unavailable: SteamAPI.IsSteamRunning returned false");
             return false;
         }
+
+        // A windowless server is not a Steam "game" from Steam's point of view: the engine never calls
+        // SteamAPI_Init, so the CLIENT API stays uninitialised. The game-server API below works without it,
+        // but lobbies do not - SteamMatchmaking.CreateLobby is a client call, and without this the server
+        // logs "Could not request a Steam lobby" forever and can only be reached by direct address.
+        TryInitializeClientApi();
 
         string runtimeAppId = GetClientRuntimeAppId();
         string version = ModInformation.Version.ToString();
@@ -140,10 +180,20 @@ public static class SteamGameServerBoot
         }
     }
 
-    /// <summary>Dispatches the game-server callbacks; called every tick by the pump.</summary>
+    /// <summary>Dispatches the Steam callbacks; called every tick by the pump.</summary>
+    /// <remarks>
+    /// Both flavours, because a headless server is the only process that has both and no engine frame to
+    /// dispatch either. Skipping the CLIENT pump is what stopped this server appearing in Steam: creating a
+    /// lobby is asynchronous, and SteamMatchmaking.CreateLobby only reports back through
+    /// SteamAPI.RunCallbacks. Without it the advertiser sets createInFlight, waits for a reply that can
+    /// never arrive, and never retries - so the server logs neither a created lobby nor a failure, and is
+    /// simply invisible.
+    /// </remarks>
     public static void RunCallbacks()
     {
         if (started) GameServer.RunCallbacks();
+
+        if (clientApiStarted) SteamAPI.RunCallbacks();
     }
 
     private static void OnLoggedOn(SteamServersConnected_t _)
@@ -192,6 +242,21 @@ public static class SteamGameServerBoot
         catch (Exception ex)
         {
             Logger.Error(ex, "Game-server shutdown failed");
+        }
+
+        // The client API too, when this process started it. Steam keeps a lobby alive while it believes
+        // its owner is still running, so skipping this is how a killed server leaves a lobby behind that
+        // players can still see and try to join.
+        if (!clientApiStarted) return;
+
+        try
+        {
+            SteamAPI.Shutdown();
+            Logger.Information("Steam client API shut down");
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex, "Steam client API shutdown failed");
         }
     }
 }

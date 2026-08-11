@@ -70,6 +70,24 @@ public static class CoopTroopSupplierRegistry
         }
     }
 
+    /// <summary>
+    /// Drop everything for every battle. For campaign teardown, where nothing held here can still be valid.
+    /// </summary>
+    /// <remarks>
+    /// Entries are keyed by map event id, and those ids are per-campaign counters that restart when a new
+    /// campaign is loaded. A battle abandoned to the main menu never reaches <see cref="ClearBattle"/>, so its
+    /// buffered reserve outlives it - and after a reload a brand new, unrelated battle can be handed that dead
+    /// reserve simply because the counter produced the same id again.
+    /// </remarks>
+    public static void ClearAll()
+    {
+        lock (Gate)
+        {
+            Suppliers.Clear();
+            Pending.Clear();
+        }
+    }
+
     /// <summary>Drop everything for a battle (on mission end).</summary>
     public static void ClearBattle(string mapEventId)
     {

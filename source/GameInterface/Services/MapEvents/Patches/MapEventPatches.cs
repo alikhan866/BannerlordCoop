@@ -71,6 +71,19 @@ internal class MapEventPatches
         // not controlled by the server are player parties. The window is only ever populated on the server, so
         // an AI join broadcast stays server-driven; AI joins after the window simply aren't propagated.
         bool isPlayerJoin = mapEventParty.Party.MobileParty?.IsPlayerParty() == true;
+
+        // A player who walks into a fight that started between two AI parties opens the join window here.
+        // Initialize only opens one when a player is among the two ORIGINAL parties, so without this a battle
+        // joined late stayed shut to reinforcements for its whole life - the same "nobody came" symptom as a
+        // scan that looks in the wrong place, from a different cause.
+        //
+        // Not while the event is still initializing, though: Initialize adds its two original parties through
+        // this very method, so opening the window here would announce the battle from inside Initialize, before
+        // it is fully built. Postfix_Initialize is what opens it for those parties, in the right order.
+        if (isPlayerJoin && ModInformation.IsServer
+            && !InteractionPatches.IsInitializingPlayerBattle(__instance))
+            InteractionPatches.OpenAiJoinWindowIfNeeded(__instance);
+
         if (!isPlayerJoin && !InteractionPatches.IsWithinAiJoinWindow(__instance))
             return;
 
@@ -405,11 +418,63 @@ internal class InteractionPatches
     /// <summary>True while a player's battle is still within its post-start window for AI parties to join as
     /// reinforcements (<see cref="ModConfigProvider.ModOptions.PlayerBattleAiJoinWindowHours"/>). The window is opened after
     /// initialization; only the server ever populates it, so this is a server-side query.</summary>
+    /// <remarks>
+    /// The configured window is measured in CAMPAIGN hours, and campaign time does not stand still while a
+    /// co-op battle is fought - another player can be running the map at speed. Twenty-four campaign hours can
+    /// therefore burn away inside a single real-time battle, and the moment they do, every party that would
+    /// have ridden in to join instead goes off and does something else.
+    ///
+    /// That is how a besieged player lost his town while defending it: he sallied out, the map ran on at
+    /// speed, the join window expired mid-fight, and the besiegers he was fighting stopped being able to join
+    /// the battle at all - so the siege they were part of finished around it.
+    ///
+    /// A battle that is still being fought therefore keeps its window open regardless of the clock. The
+    /// configured hours still govern a battle nobody is in, which is what they were for: bounding how long a
+    /// concluded or abandoned event stays open to joiners.
+    /// </remarks>
     public static bool IsWithinAiJoinWindow(MapEvent mapEvent)
-        => playerBattleWindows.TryGetValue(mapEvent, out var window) && !window.AiJoinWindowExpired;
+    {
+        if (!playerBattleWindows.TryGetValue(mapEvent, out var window)) return false;
+        if (!window.AiJoinWindowExpired) return true;
+
+        return IsStillBeingFoughtByAPlayer(mapEvent);
+    }
+
+    /// <summary>Whether this battle is live and still has a player in it.</summary>
+    /// <remarks>
+    /// Deliberately asks the map event rather than mission membership: this runs on the server for every live
+    /// event on the map, and the question here is only "is this fight still happening with a player in it",
+    /// which the event itself answers.
+    /// </remarks>
+    private static bool IsStillBeingFoughtByAPlayer(MapEvent mapEvent)
+    {
+        if (mapEvent == null || mapEvent.IsFinalized) return false;
+
+        foreach (var party in mapEvent.InvolvedParties)
+            if (party.IsMobile && party.MobileParty?.IsPlayerParty() == true)
+                return true;
+
+        return false;
+    }
 
     internal static bool IsInitializingPlayerBattle(MapEvent mapEvent)
         => initializingPlayerBattles.TryGetValue(mapEvent, out _);
+
+    /// <summary>
+    /// Opens this battle's AI-join window if it has none yet, and announces the battle so the reinforcement
+    /// scan runs immediately. A no-op once a window exists, so it never extends one that is already ticking.
+    /// </summary>
+    internal static void OpenAiJoinWindowIfNeeded(MapEvent mapEvent)
+    {
+        if (mapEvent == null) return;
+        if (playerBattleWindows.TryGetValue(mapEvent, out _)) return;
+
+        playerBattleWindows.GetValue(
+            mapEvent,
+            _ => new PlayerBattleWindows(ModConfigProvider.ModOptions.PlayerBattleAiJoinWindowHours));
+
+        MessageBroker.Instance.Publish(mapEvent, new PlayerJoinedBattle());
+    }
 
     public static bool IsWithinGoldFoodConsumptionWindow(MapEvent mapEvent)
         => playerBattleWindows.TryGetValue(mapEvent, out var window) && !window.GoldFoodConsumptionExpired;

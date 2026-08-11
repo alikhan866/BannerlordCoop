@@ -851,7 +851,10 @@ public class BattleReserveReconnectScopeTests : MissionTestEnvironment
             var supplier = new CoopTroopSupplier(mapEventId, BattleSideEnum.Defender, null, new BattleAgentBudget());
             CoopTroopSupplierRegistry.Register(supplier);
             supplier.SetReserve(BothParties());
-            supplier.SupplyTroops(2); // advance "returned-party" locally to 2
+            // Advance "returned-party" locally to 2. Named explicitly rather than relying on which party a
+            // wave happens to draw from - a wave is apportioned across every party, so it would advance both.
+            supplier.SupplyOneTroopFromParty(returnedParty);
+            supplier.SupplyOneTroopFromParty(returnedParty);
 
             int AckCount() => client.NetworkSentMessages.GetMessages<NetworkBattleSupplyProgress>()
                 .Count(message => message.MapEventId == mapEventId);
@@ -867,7 +870,8 @@ public class BattleReserveReconnectScopeTests : MissionTestEnvironment
             // FLAGGED: re-seed and advance again, then shrink with FlushRequested — exactly ONE ack, with
             // IsFlush set, carrying the dropped party's FINAL local pointer.
             supplier.SetReserve(BothParties());
-            supplier.SupplyTroops(2);
+            supplier.SupplyOneTroopFromParty(returnedParty);
+            supplier.SupplyOneTroopFromParty(returnedParty);
             client.SimulateMessage(Server.NetPeer,
                 new NetworkBattleTroopReserve(mapEventId, (int)BattleSideEnum.Defender, ShrunkToKept(), flushRequested: true));
 

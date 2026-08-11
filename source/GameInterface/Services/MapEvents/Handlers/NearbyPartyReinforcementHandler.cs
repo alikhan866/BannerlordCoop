@@ -2,12 +2,14 @@
 using Common.Logging;
 using Common.Messaging;
 using GameInterface.Configuration;
+using GameInterface.Services.MapEvents.Messages;
 using GameInterface.Services.MapEvents.Patches;
 using GameInterface.Services.MobileParties.Extensions;
 using GameInterface.Services.MapEvents.Messages.Start;
 using GameInterface.Services.PlayerCaptivityService.Messages;
 using Serilog;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using TaleWorlds.CampaignSystem;
 using TaleWorlds.CampaignSystem.MapEvents;
@@ -46,13 +48,26 @@ internal class NearbyPartyReinforcementHandler : IHandler
         this.messageBroker = messageBroker;
         messageBroker.Subscribe<PlayerJoinedBattle>(Handle_PlayerJoinedBattle);
         messageBroker.Subscribe<CampaignTick>(Handle_CampaignTick);
+        messageBroker.Subscribe<LiveBattleReinforcementTick>(Handle_LiveBattleReinforcementTick);
     }
 
     public void Dispose()
     {
         messageBroker.Unsubscribe<PlayerJoinedBattle>(Handle_PlayerJoinedBattle);
         messageBroker.Unsubscribe<CampaignTick>(Handle_CampaignTick);
+        messageBroker.Unsubscribe<LiveBattleReinforcementTick>(Handle_LiveBattleReinforcementTick);
     }
+
+    /// <summary>
+    /// The same sweep as <see cref="Handle_CampaignTick"/>, driven by real time instead of campaign time.
+    /// </summary>
+    /// <remarks>
+    /// Campaign time stops for the duration of a co-op battle (see <see cref="LiveBattleReinforcementTick"/>),
+    /// so without this the battle-start scan is the only one that ever runs and a lord who was slightly too far
+    /// away at the opening bell can never join.
+    /// </remarks>
+    private void Handle_LiveBattleReinforcementTick(MessagePayload<LiveBattleReinforcementTick> payload)
+        => SweepBattlesForReinforcements();
 
     /// <summary>
     /// The moment a player's battle opens its AI-join window is the one moment reinforcement is guaranteed to
@@ -86,9 +101,27 @@ internal class NearbyPartyReinforcementHandler : IHandler
         }
     }
 
-    private void Handle_CampaignTick(MessagePayload<CampaignTick> payload)
+    private void Handle_CampaignTick(MessagePayload<CampaignTick> payload) => SweepBattlesForReinforcements();
+
+    /// <summary>
+    /// How often the sweep may actually scan, in real seconds.
+    /// </summary>
+    /// <remarks>
+    /// The campaign tick fires far faster than it is worth re-answering this question - measured at ~95 sweeps
+    /// a second live. That was harmless while every sweep bailed at the join-window check, but each one now
+    /// walks the map's locatable index for every live battle, so it has to be paced. Real time rather than
+    /// campaign time, because the campaign clock stops for the duration of a co-op battle, which is precisely
+    /// when the sweep needs to keep running.
+    /// </remarks>
+    internal const double SweepIntervalSeconds = 1.0;
+
+    private readonly Stopwatch sinceLastSweep = Stopwatch.StartNew();
+
+    private void SweepBattlesForReinforcements()
     {
         if (!ModInformation.IsServer) return;
+        if (!IsSweepDue(sinceLastSweep.Elapsed.TotalSeconds)) return;
+        sinceLastSweep.Restart();
 
         var events = Campaign.Current?.MapEventManager?.MapEvents;
         if (events == null) return;
@@ -96,6 +129,8 @@ internal class NearbyPartyReinforcementHandler : IHandler
         // ToArray: adding a party mutates the event graph while we walk it.
         foreach (var mapEvent in events.ToArray())
         {
+            EnsureJoinWindowForPlayerBattle(mapEvent);
+
             var skip = WhyNotReinforce(mapEvent);
             if (skip != null)
             {
@@ -108,6 +143,34 @@ internal class NearbyPartyReinforcementHandler : IHandler
 
             Reinforce(mapEvent);
         }
+    }
+
+    /// <summary>
+    /// Gives a player's battle an AI-join window if it has never had one.
+    /// </summary>
+    /// <remarks>
+    /// The window is normally opened by <c>MapEvent.Initialize</c>'s postfix, which is fine for a battle that
+    /// starts while the server is running. A battle that arrives with a LOADED SAVE never runs Initialize: the
+    /// event is deserialised with its parties already attached, so no window is ever opened and the battle is
+    /// skipped for its entire life. Measured on a save taken mid-siege: 18,033 consecutive scans, every one
+    /// refused with "none opened", so no lord ever joined however many were stood around the walls.
+    ///
+    /// The same silence also stopped the mid-battle round restart, which keys off parties being ADDED - a
+    /// battle nothing can join never publishes that either.
+    ///
+    /// Opening one here is safe because <see cref="InteractionPatches.OpenAiJoinWindowIfNeeded"/> is a no-op
+    /// once a window exists, including an EXPIRED one: a battle whose window ran out stays closed, which is
+    /// the intended behaviour. Only a battle that never had one at all is given one.
+    /// </remarks>
+    /// <summary>Pure so the pacing rule is testable without a clock.</summary>
+    internal static bool IsSweepDue(double elapsedSeconds) => elapsedSeconds >= SweepIntervalSeconds;
+
+    private static void EnsureJoinWindowForPlayerBattle(MapEvent mapEvent)
+    {
+        if (mapEvent == null || mapEvent.IsFinalized) return;
+        if (!mapEvent.InvolvedParties.Any(p => p.IsMobile && p.MobileParty?.IsPlayerParty() == true)) return;
+
+        InteractionPatches.OpenAiJoinWindowIfNeeded(mapEvent);
     }
 
     /// <summary>
@@ -140,64 +203,45 @@ internal class NearbyPartyReinforcementHandler : IHandler
         return null;
     }
 
+    /// <summary>
+    /// Pulls in every nearby party that would join, using <see cref="BattleJoinCandidates"/> rather than
+    /// vanilla's encounter model.
+    /// </summary>
+    /// <remarks>
+    /// The model was asked directly until it was found to be unusable from a server: it searches around
+    /// <c>MobileParty.MainParty</c>, decides sides from <c>PlayerEncounter</c>, and takes its two lists as
+    /// (player side, enemy side) rather than (attacker, defender). See <see cref="BattleJoinCandidates"/>.
+    /// </remarks>
     private static void Reinforce(MapEvent mapEvent)
     {
-        var attackers = CollectMobileParties(mapEvent, BattleSideEnum.Attacker);
-        var defenders = CollectMobileParties(mapEvent, BattleSideEnum.Defender);
+        var unresolvedBefore = BattleJoinCandidates.UnresolvedSideDecisions;
+        var candidates = BattleJoinCandidates.Find(mapEvent);
+        var unresolved = BattleJoinCandidates.UnresolvedSideDecisions - unresolvedBefore;
 
-        var attackerCount = attackers.Count;
-        var defenderCount = defenders.Count;
+        Logger.Debug("[Reinforce] {MapEventId}: {Count} nearby parties would join",
+            mapEvent.StringId ?? "<no id>", candidates.Count);
 
-        var model = Campaign.Current?.Models?.EncounterModel;
-        if (model == null) return;
-
-        // Vanilla appends the parties that would join to each list in place.
-        model.FindNonAttachedNpcPartiesWhoWillJoinPlayerEncounter(attackers, defenders);
-
-        Logger.Debug("[Reinforce] {MapEventId}: model offered {Att} attacker / {Def} defender joiners",
-            mapEvent.StringId ?? "<no id>",
-            attackers.Count - attackerCount,
-            defenders.Count - defenderCount);
-
-        AddJoiners(mapEvent, BattleSideEnum.Attacker, attackers, attackerCount);
-        AddJoiners(mapEvent, BattleSideEnum.Defender, defenders, defenderCount);
-    }
-
-    private static List<MobileParty> CollectMobileParties(MapEvent mapEvent, BattleSideEnum side)
-    {
-        var parties = new List<MobileParty>();
-
-        var onSide = mapEvent.PartiesOnSide(side);
-        if (onSide == null) return parties;
-
-        foreach (var mapEventParty in onSide)
+        // "Nobody was nearby" and "everybody nearby was refused because the battle could not be evaluated"
+        // are the same empty list, and only one of them is a problem. Say which at Warning, because the
+        // second means a battle is reinforcing with nobody for a reason unrelated to who is around it.
+        if (unresolved > 0)
         {
-            if (mapEventParty?.Party?.IsMobile != true) continue;
-            parties.Add(mapEventParty.Party.MobileParty);
+            Logger.Warning(
+                "[Reinforce] {MapEventId}: {Unresolved} nearby part(ies) could not be assigned a side because the battle's parties are not all resolved; they were skipped",
+                mapEvent.StringId ?? "<no id>", unresolved);
         }
 
-        return parties;
-    }
+        if (candidates.Count == 0) return;
 
-    /// <summary>Adds only the entries the model appended, leaving the parties already in the battle alone.</summary>
-    private static void AddJoiners(MapEvent mapEvent, BattleSideEnum side, List<MobileParty> parties, int alreadyPresent)
-    {
-        if (parties.Count <= alreadyPresent) return;
-
-        var mapEventSide = mapEvent.GetMapEventSide(side);
-        if (mapEventSide == null) return;
-
-        for (var i = alreadyPresent; i < parties.Count; i++)
+        foreach (var candidate in candidates)
         {
-            var party = parties[i];
-            if (party == null) continue;
+            var mapEventSide = mapEvent.GetMapEventSide(candidate.Side);
+            if (mapEventSide == null) continue;
 
-            // A player party never joins by proximity - it chooses through its own encounter menu.
-            if (party.IsPlayerParty()) continue;
+            Logger.Debug("Nearby party {PartyId} joins battle {MapEventId} on the {Side} side",
+                candidate.Party.StringId, mapEvent.StringId ?? "<no id>", candidate.Side);
 
-            Logger.Debug("Nearby party {PartyId} joins the player battle on the {Side} side",
-                party.StringId, side);
-            mapEventSide.AddNearbyPartyToPlayerMapEvent(party);
+            mapEventSide.AddNearbyPartyToPlayerMapEvent(candidate.Party);
         }
     }
 }

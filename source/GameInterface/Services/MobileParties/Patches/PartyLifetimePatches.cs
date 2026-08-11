@@ -64,8 +64,35 @@ internal class DestroyPartyActionPatch
             // removal and leave a half-dead party (null CurrentSettlement, IsGarrison still set)
             // that crashes anything walking it, like the siege spawn's morale checks. A party the
             // server never registered (e.g. quest-spawned) still destroys locally as before.
-            if (ContainerProvider.TryResolve<IObjectManager>(out var objectManager)
-                && objectManager.TryGetId(destroyedParty, out _))
+            //
+            // The client only destroys locally when it can PROVE the server does not own the party.
+            // "Not registered" used to be taken as that proof, but it is indistinguishable from
+            // "not registered yet": during a join the object manager may be unresolvable or still
+            // filling, so vanilla cleanup silently deleted parties the server still had. The joiner
+            // then held fewer parties than the baseline and the join could never converge - measured
+            // live as baseline=1538 / client=1537, the missing party being the garrison of the very
+            // castle the joining player was sitting in, because that client is the only one that
+            // runs that settlement's menu-init.
+            //
+            // Denying wrongly costs a party that lingers until the next sync corrects it.
+            // Allowing wrongly costs a party the server still has, and a join that never completes.
+            if (!ContainerProvider.TryResolve<IObjectManager>(out var objectManager))
+            {
+                Logger.Warning(
+                    "Blocked a local destroy of {StringId}: the object manager is unavailable, so server ownership cannot be ruled out",
+                    destroyedParty?.StringId);
+                return false;
+            }
+
+            if (IsSettlementOwnedParty(destroyedParty))
+            {
+                Logger.Warning(
+                    "Blocked a local destroy of settlement-owned party {StringId}; only the server may destroy it",
+                    destroyedParty?.StringId);
+                return false;
+            }
+
+            if (objectManager.TryGetId(destroyedParty, out _))
             {
                 return false;
             }
@@ -86,6 +113,18 @@ internal class DestroyPartyActionPatch
     /// empty/unregistered menu -> null GameMenu NRE in MenuContext.HandleStates.
     /// Blocking here also prevents publishing DestroyPartyApplied, so clients keep the party too.
     /// </summary>
+    /// <summary>
+    /// A party that belongs to a settlement - a garrison or a militia - and is therefore created and
+    /// owned by the server, never locally by a client.
+    /// </summary>
+    /// <remarks>
+    /// These are the parties vanilla cleans up on menu init, and the ones a joining client is most
+    /// likely to hold in a half-registered state, so they need to be safe even when registration
+    /// cannot answer the question. Quest-spawned client-local parties are neither.
+    /// </remarks>
+    private static bool IsSettlementOwnedParty(MobileParty party)
+        => party != null && (party.IsGarrison || party.IsMilitia);
+
     private static bool IsProtectedPlayerParty(MobileParty destroyedParty)
     {
         if (destroyedParty == null || !destroyedParty.IsPlayerParty()) return false;

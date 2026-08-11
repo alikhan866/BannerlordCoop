@@ -201,6 +201,8 @@ internal class MapEventSideDataHandler : IHandler
                         "[SideDiag][client] LOCAL PLAYER {Party} attached to side {SideId} (MissionSide={MissionSide}, leader={Leader}); MainParty.Side now {Resolved}",
                         addedParty.Id, data.MapEventSideId, mapEventSide.MissionSide,
                         mapEventSide.LeaderParty?.Id ?? "<none>", PartyBase.MainParty.Side);
+
+                    RefreshEncounterMenuForNewSeat();
                 }
             }
             catch (Exception e)
@@ -208,6 +210,36 @@ internal class MapEventSideDataHandler : IHandler
                 Logger.Error(e, "Failed to apply NetworkAddBattleParty");
             }
         });
+    }
+
+    /// <summary>
+    /// Re-evaluates an open encounter menu once the local player's seat finally arrives.
+    /// </summary>
+    /// <remarks>
+    /// A client cannot seat itself - MapEventSidePatches routes a player's join through the server - so
+    /// between asking and being seated there is a window where MainParty.MapEvent is still null. A game menu
+    /// evaluates its options ONCE, when it is activated, and never again. Anything that opens the encounter
+    /// menu inside that window therefore renders it with every real option's condition false, because they
+    /// all test MapEvent.PlayerMapEvent - leaving "Leave..." as the only entry, permanently, even though the
+    /// seat lands a fraction of a second later.
+    ///
+    /// Measured at Syronea: the join succeeded, the server logged the Defender seat, and the client logged
+    /// LOCAL PLAYER ... attached one line after the menu had already been built. It also explains why leaving
+    /// to the main menu and loading again "fixed" it - on reload the seat is already there when the menu is
+    /// first built - and why re-attacking broke it again every time.
+    ///
+    /// Re-activating rebuilds the option list against the state that now exists. Scoped to the local player's
+    /// own seat and to the menus that gate on it, so an unrelated menu is never disturbed.
+    /// </remarks>
+    private static void RefreshEncounterMenuForNewSeat()
+    {
+        var menuId = Campaign.Current?.CurrentMenuContext?.GameMenu?.StringId;
+        if (menuId != "encounter" && menuId != "menu_siege_strategies") return;
+
+        Logger.Information(
+            "[SideDiag][client] refreshing menu '{Menu}' now that the local seat exists", menuId);
+
+        GameMenu.ActivateGameMenu(menuId);
     }
 
     private void AfterClientPartyAttached(MapEvent mapEvent)

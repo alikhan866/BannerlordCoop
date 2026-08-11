@@ -1,4 +1,5 @@
 ﻿using Common;
+using GameInterface.Services.SiegeEvents.Interfaces;
 using HarmonyLib;
 using TaleWorlds.CampaignSystem.CampaignBehaviors;
 using TaleWorlds.CampaignSystem.Encounters;
@@ -27,6 +28,19 @@ internal class EncounterAssaultInitGuardPatch
 
         if (MobileParty.MainParty?.MapEvent?.IsSiegeAssault == true)
         {
+            // Bouncing only ever covered the frame or two before the assault prompt lands. That prompt is a
+            // ONE-SHOT broadcast sent when the assault begins, so a party seated after it - a relief force
+            // that arrives mid-assault, or any client whose server restarted while one was in progress -
+            // never receives one and bounces here forever: seated in the battle, counted in its side's
+            // strength, with "Leave..." as the only option on the menu. If the server has already seated us,
+            // adopt the replicated event and let vanilla render the menu properly. With no seat this is
+            // still the original race, and bouncing is still the right answer.
+            if (ContainerProvider.TryResolve<ISiegeEventInterface>(out var siegeEventInterface) &&
+                siegeEventInterface.TryAdoptReplicatedAssaultEncounter())
+            {
+                return true;
+            }
+
             GameMenu.ExitToLast();
             return false;
         }

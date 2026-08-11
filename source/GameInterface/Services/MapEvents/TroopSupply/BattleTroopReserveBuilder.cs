@@ -242,6 +242,7 @@ public class BattleTroopReserveBuilder : IBattleTroopReserveBuilder
 
                 bool hadRoster = party._roster != null;
                 var entries = FlattenParty(party);
+                DropDuplicateHeroes(mapEventId, partyId, party, entries);
                 ledger.SetReserve(mapEventId, partyId, entries);
                 Logger.Information("[TroopSupply] Built reserve: party {PartyId} side {Side} -> {Count} troops (roster was {Roster})",
                     partyId, party.Party?.Side, entries.Count, hadRoster ? "present" : "null");
@@ -249,11 +250,146 @@ public class BattleTroopReserveBuilder : IBattleTroopReserveBuilder
         }
     }
 
+    // heroId -> the party that already contributed it, per battle. A hero belongs to exactly one party, so a
+    // second sighting is a duplicate however it arose.
+    private readonly Dictionary<string, Dictionary<string, string>> heroOwnerByBattle =
+        new Dictionary<string, Dictionary<string, string>>();
+
+    /// <summary>
+    /// Drops - and reports - a hero that appears in more than one party's reserve, or twice within one party.
+    /// </summary>
+    /// <remarks>
+    /// A duplicated hero is not cosmetic. The supplier hands the same hero out as an origin twice, and the
+    /// engine ends up without a controllable player agent - Mission.InitialPlayerAgent stays null and
+    /// vanilla's DeploymentMissionController.SetupTeams throws on it every tick, so deployment never
+    /// finishes and every player in that battle is stuck on the screen with no error shown.
+    ///
+    /// Observed live in an army assaulting a besieger camp, and measured since at 41 occurrences with one hero
+    /// present in THREE parties of a single battle. This names the parties involved so the cause can be
+    /// identified rather than inferred from which batch the origin came out of.
+    ///
+    /// Nothing is lost by dropping one. Both entries carry the SAME character id - this is one hero listed
+    /// twice, not two heroes - so what is removed is a duplicate LISTING, and the hero still takes the field
+    /// from whichever party keeps it. The only real question is which party that should be, and the hero's own
+    /// <c>PartyBelongedTo</c> answers it: an entry in a party the hero does not belong to is the wrong copy,
+    /// whichever order the parties happened to be flattened in. Only when that cannot be resolved does the
+    /// first sighting win, because arbitrary is still better than a battle nobody can deploy in.
+    /// </remarks>
+    private void DropDuplicateHeroes(string mapEventId, string partyId, MapEventParty party,
+        List<TroopReserveEntry> entries)
+    {
+        if (!heroOwnerByBattle.TryGetValue(mapEventId, out var heroOwners))
+        {
+            heroOwners = new Dictionary<string, string>();
+            heroOwnerByBattle[mapEventId] = heroOwners;
+        }
+
+        // A party's reserve is rebuilt during a battle (reinforcement waves, rebalancing) while the ownership
+        // map lives for the whole battle. Unless this party's previous claims are dropped first, the rebuild
+        // reports every one of its own heroes as a duplicate of ITSELF - which is exactly what 20 of these
+        // errors were: "in BOTH party X and party X", naming the same party twice and proving nothing. Only a
+        // hero found under a DIFFERENT party is a real duplicate, and those must stay loud.
+        var reclaimed = new List<string>();
+        foreach (var pair in heroOwners)
+        {
+            if (pair.Value == partyId) reclaimed.Add(pair.Key);
+        }
+        foreach (var hero in reclaimed) heroOwners.Remove(hero);
+
+        var seenHere = new HashSet<string>();
+        var duplicateIndexes = new List<int>();
+        for (int i = 0; i < entries.Count; i++)
+        {
+            var entry = entries[i];
+            if (!objectManager.TryGetObject<CharacterObject>(entry.CharacterId, out var character)) continue;
+            if (!character.IsHero) continue;
+
+            if (!seenHere.Add(entry.CharacterId))
+            {
+                Logger.Error("[TroopSupply] DUPLICATE HERO {Hero} appears TWICE in party {PartyId} (battle {MapEvent}); dropping the second copy",
+                    entry.CharacterId, partyId, mapEventId);
+                duplicateIndexes.Add(i);
+                continue;
+            }
+
+            if (heroOwners.TryGetValue(entry.CharacterId, out var firstParty))
+            {
+                // Which of the two is the hero's real home? Answered by the hero, not by flatten order.
+                var belongsHere = HeroBelongsToParty(character, party);
+
+                if (belongsHere)
+                {
+                    // The copy already committed to the ledger is the wrong one, and it cannot be retracted
+                    // from here - that party's reserve was written on an earlier pass. Dropping this entry is
+                    // still the only way to keep the battle deployable, so it is dropped and the mistake is
+                    // named: the hero fights on with {First} instead of the party it belongs to.
+                    Logger.Error("[TroopSupply] DUPLICATE HERO {Hero} belongs to party {Second} but party {First} already claimed it (battle {MapEvent}); dropping the entry from its OWN party so deployment can finish - it will fight with {First}",
+                        entry.CharacterId, firstParty, partyId, mapEventId);
+                }
+                else
+                {
+                    Logger.Error("[TroopSupply] DUPLICATE HERO {Hero} is in BOTH party {First} and party {Second} (battle {MapEvent}); dropping it from {Second}, which it does not belong to, and leaving it with {First}",
+                        entry.CharacterId, firstParty, partyId, mapEventId);
+                }
+
+                duplicateIndexes.Add(i);
+                continue;
+            }
+
+            heroOwners[entry.CharacterId] = partyId;
+        }
+
+        // Removing them is the point, not the report. A hero handed out as an origin twice leaves the engine
+        // without a controllable player agent - Mission.InitialPlayerAgent stays null and vanilla's
+        // DeploymentMissionController.SetupTeams throws on it every tick - so the battle never finishes
+        // deploying. Observed live: the same hero present in THREE map event parties of one battle.
+        //
+        // This does not lose anybody. The hero still spawns from the party that claimed it first; only the
+        // extra copies go. The duplication itself is upstream, in a hero sitting in more than one roster, and
+        // the errors above stay loud so it can still be traced - but a battle must not be unplayable while
+        // that is outstanding.
+        //
+        // Back to front, so each removal cannot shift the indexes still to be removed. Entry ORDER is load
+        // bearing (the supplied pointer is a monotonic index into this list) and removal preserves it; this
+        // runs before SetReserve, so no pointer exists yet to invalidate.
+        for (int i = duplicateIndexes.Count - 1; i >= 0; i--)
+        {
+            entries.RemoveAt(duplicateIndexes[i]);
+        }
+    }
+
+    /// <summary>
+    /// Whether this map event party is the one the hero actually belongs to - as a member or as a prisoner.
+    /// </summary>
+    /// <remarks>
+    /// The tie-break for a duplicated hero. Deliberately conservative: it is only ever consulted once a
+    /// duplicate has already been found, so a hero the campaign cannot place (null on both, or a party that
+    /// resolves to neither candidate) changes nothing and the first sighting still wins.
+    /// </remarks>
+    internal static bool HeroBelongsToParty(CharacterObject character, MapEventParty party)
+    {
+        var hero = character?.HeroObject;
+        var mobileParty = party?.Party?.MobileParty;
+        if (hero == null || mobileParty == null) return false;
+
+        return ReferenceEquals(hero.PartyBelongedTo, mobileParty)
+               || ReferenceEquals(hero.PartyBelongedToAsPrisoner, party.Party);
+    }
+
     // Hand out the server's current flattened descriptors so every client spawns the same agent identities.
     // Setup may re-flatten the server roster later, so authoritative applies match by CharacterId instead.
+    //
+    // Heroes are emitted FIRST, keeping the relative order of everyone else. A party is supplied strictly in
+    // this order (the supplied pointer is a monotonic index into it — resume, dedup and the flush contract all
+    // depend on that, so a wave cannot pick troops out of the middle), and a wave now hands each party only
+    // its proportional share rather than draining one party at a time. Without this a hero sitting late in a
+    // big roster would miss the opening wave, and for the local player that means no agent to control at all.
+    // It matches what vanilla is reaching for anyway: DefaultTroopSupplierProbabilityModel prioritises by
+    // troop level, which puts heroes at the front of the queue.
     private List<TroopReserveEntry> FlattenParty(MapEventParty party)
     {
         var entries = new List<TroopReserveEntry>();
+        var regulars = new List<TroopReserveEntry>();
 
         if (party._roster == null)
             party.Update();
@@ -279,9 +415,14 @@ public class BattleTroopReserveBuilder : IBattleTroopReserveBuilder
                 continue;
             }
 
-            entries.Add(new TroopReserveEntry(
-                element.Descriptor.UniqueSeed, characterId, (int)character.GetFormationClass()));
+            var entry = new TroopReserveEntry(
+                element.Descriptor.UniqueSeed, characterId, (int)character.GetFormationClass());
+
+            if (character.IsHero) entries.Add(entry);
+            else regulars.Add(entry);
         }
+
+        entries.AddRange(regulars);
         return entries;
     }
 

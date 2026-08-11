@@ -127,8 +127,12 @@ namespace GameInterface.Services.ItemRosters.Commands
             if (MBObjectManager.Instance.ContainsObject<Settlement>(id))
             {
                 var obj = MBObjectManager.Instance.GetObject<Settlement>(id);
-                
-                name = obj.Town.Name.ToString();
+
+                // Settlement.Name, not Town.Name: a village or hideout has no Town, so reading it
+                // unconditionally made every non-town settlement throw an NRE rather than report its
+                // roster - and villages are where a "where has the food gone" question has to look.
+                // For a town the two names are the same, so nothing changes for the ids this already served.
+                name = obj.Name?.ToString() ?? id;
                 return obj.ItemRoster;
             }
 
