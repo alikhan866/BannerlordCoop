@@ -453,6 +453,20 @@ public class MapEventResultsInterface : IMapEventResultsInterface
         }
     }
 
+    /// <remarks>
+    /// Everything here comes out of the DEFEATED party's prison roster - people it was holding captive - and
+    /// for a player winner all of it goes into the MEMBER roster, heroes included. That looks wrong and is not:
+    /// the two rosters are queues for two different conversations. RosterToReceiveLootMembers is what
+    /// <c>PlayerEncounter.DoFreeOrCapturePrisonerHeroes</c> reads, which is the "somebody else was holding this
+    /// man, and now you are" conversation; RosterToReceiveLootPrisoners is what <c>DoCaptureHeroes</c> reads,
+    /// which is "you are my prisoner now" and belongs to heroes taken from the defeated party's own ranks.
+    /// Native splits it the same way, on the captor: MapEvent.LootDefeatedPartyPrisoners IL_0127 branches to
+    /// the member roster for the player and the prisoner roster for an NPC.
+    ///
+    /// Moving heroes to the prisoner roster here was tried and reverted. It reads as the tidier arrangement
+    /// right up until you rescue one of your own allies from an enemy dungeon and are made to tell him he is
+    /// your prisoner and can pay a ransom.
+    /// </remarks>
     private void LootDefeatedPartyPrisoners(
         MBReadOnlyList<MapEventParty> winnerParties,
         MBReadOnlyList<MapEventParty> defeatedParties,
@@ -501,7 +515,8 @@ public class MapEventResultsInterface : IMapEventResultsInterface
                         // Handle hero prisoners
                         if (prisonerCharacter.IsHero)
                         {
-                            bool shouldRelease = prisonerCharacter.HeroObject.IsPlayerHero();
+                            bool shouldRelease = prisonerCharacter.HeroObject.IsPlayerHero()
+                                || PostBattleHeroOwnership.MustGoFree(prisonerCharacter.HeroObject, winnerParty.Party);
 
                             if (!shouldRelease && winnerParty.Party.MobileParty != null && !winnerParty.Party.MobileParty.IsPlayerParty())
                             {
@@ -518,6 +533,8 @@ public class MapEventResultsInterface : IMapEventResultsInterface
                             // Remove hero from defeated prison roster
                             defeatedPrisonRoster.RemoveTroop(prisonerCharacter, prisonerCount, default(UniqueTroopDescriptor), 0);
 
+                            // The member roster on purpose - see the remarks on this method. This is the queue
+                            // for the rescue conversation, not for "you are my prisoner now".
                             if (playerLootMemberRosters.ContainsKey(winnerParty))
                             {
                                 playerLootMemberRosters[winnerParty].AddToCounts(prisonerCharacter, 1, false, 0, 0, true, -1);
@@ -614,7 +631,23 @@ public class MapEventResultsInterface : IMapEventResultsInterface
                         {
                             MapEventParty captorParty = MapEvent.FindWinnerPartyToGetCurrentLootObjectBasedOnChances(captureChances);
 
-                            if (captorParty != null &&
+                            // Another player's companion, riding with the army that just lost, about to be
+                            // taken by a DIFFERENT player. Nobody gets a conversation about a companion, so
+                            // capturing one means quietly absorbing a hero another client commands, and the
+                            // two then disagree over who has them. Take nothing: the escape branch below sees
+                            // the hero still standing in the defeated roster and makes them a fugitive, which
+                            // is already what happens to a hero nobody managed to catch.
+                            //
+                            // Deliberately narrow. An AI captor is left alone - a companion taken by a lord is
+                            // ordinary campaign life, and the server owns both sides of it. Lords are left
+                            // alone too: capturing them is the point, and the winner speaks to them first.
+                            if (captorParty != null && PostBattleHeroOwnership.MustGoFree(hero, captorParty.Party))
+                            {
+                                Logger.Information(
+                                    "[Loot] {Hero} answers to another player's clan and is no lord; left free rather than captured by {Captor}",
+                                    hero.Name, captorParty.Party?.Name);
+                            }
+                            else if (captorParty != null &&
                                 playerLootPrisonerRosters.TryGetValue(captorParty, out TroopRoster playerLootPrisonerRoster))
                             {
                                 playerLootPrisonerRoster.AddToCounts(character, 1, false, 0, 0, true, -1);

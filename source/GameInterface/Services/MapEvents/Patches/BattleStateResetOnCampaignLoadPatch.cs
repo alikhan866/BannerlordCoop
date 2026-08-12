@@ -1,4 +1,4 @@
-using Common.Logging;
+﻿using Common.Logging;
 using GameInterface.Services.MapEvents.TroopSupply;
 using HarmonyLib;
 using SandBox.View.Map;
@@ -53,6 +53,11 @@ internal class BattleStateResetOnCampaignLoadPatch
 
         BattleSpawnGate.EndBattle();
         CoopTroopSupplierRegistry.ClearAll();
-        PendingBattleLoot.Clear();
+
+        // An offer belongs to a battle in the world that was just replaced. Answering it after a load would
+        // aim line indices at spoils from a campaign that no longer exists - and on the server side the
+        // offer is gone with the reload anyway, so the answer could only ever be refused.
+        Loot.ClientBattleLootOffer.Clear();
+        Loot.BattleLootOfferRegistry.Shared.Clear();
     }
 }

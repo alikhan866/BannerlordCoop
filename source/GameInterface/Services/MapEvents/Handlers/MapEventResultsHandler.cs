@@ -5,7 +5,13 @@ using Common.Network;
 using Common.Util;
 using GameInterface.Services.MapEvents.Data;
 using GameInterface.Services.MapEvents.Interfaces;
+using GameInterface.Services.MapEvents.Loot;
 using GameInterface.Services.MapEvents.Messages.Leave;
+using GameInterface.Services.MapEvents.Messages.Loot;
+using GameInterface.Services.TroopRosters.Data;
+using LiteNetLib;
+using System.Collections.Generic;
+using TaleWorlds.CampaignSystem;
 using GameInterface.Services.MapEventParties;
 using GameInterface.Services.MapEventParties.Messages;
 using GameInterface.Services.ObjectManager;
@@ -103,22 +109,122 @@ internal class MapEventResultsHandler : IHandler
                 Logger.Information("[Loot] Sent results of {MapEvent} to {Controller} (winner={Winner}, playerSide={Side}, party={Party})",
                     mapEventId, player.ControllerId, mapEvent.WinningSide, playerSide, playerMapEventPartyId);
 
-                // Never let mirroring one player's loot stop another player being sent theirs. The send above
-                // has already happened for this player; everything below is bookkeeping on our own copy, and a
-                // failure in it must not abandon the loop over the remaining players.
-                try
-                {
-                    MirrorAwardOnServer(player.MobilePartyId, mapEventId, mapEvent.WinningSide, playerSide,
-                        playerMapEventPartyId, networkPlayerLootData);
-                }
-                catch (Exception e)
-                {
-                    Logger.Error(e, "[Loot] Could not mirror {MapEvent} onto the server's copy of {Party}; the client was still sent its results",
-                        mapEventId, player.MobilePartyId);
-                }
+                OfferLootToPlayer(peer, mapEventId, player.MobilePartyId, playerMapEventPartyId, networkPlayerLootData);
+
             }
         });
     }
+
+    /// <summary>
+    /// Registers what this player won as an OFFER and tells them about it.
+    /// </summary>
+    /// <remarks>
+    /// Sent alongside the existing results packet rather than instead of it. The offer is the server's own
+    /// record of what it is willing to hand over, which is the thing a client's answer is later checked
+    /// against - without it the client's claim would be the only description of the loot, and a claim that
+    /// describes itself can describe itself generously.
+    ///
+    /// This is now the ONLY way a player's battle spoils reach them. The server used to mirror the loot onto
+    /// its own copy of the party here and the client used to rescue it locally; both are gone, because between
+    /// them they credited the same spoils twice and moved heroes by roster copy - which left a hero owned by
+    /// nobody and, in one live save, a doubled hero that broke battle reserve building outright.
+    ///
+    /// A failure here must never cost a player their results: the packet above has already gone, and this is
+    /// bookkeeping on top of it.
+    /// </remarks>
+    private void OfferLootToPlayer(
+        NetPeer peer,
+        string mapEventId,
+        string partyId,
+        string mapEventPartyId,
+        NetworkPlayerLootData loot)
+    {
+        try
+        {
+            var offer = BattleLootOfferBuilder.Build(
+                Guid.NewGuid().ToString("N"),
+                mapEventId,
+                partyId,
+                PackItems(loot, mapEventPartyId),
+                PackTroops(loot.LootedMembers, mapEventPartyId),
+                PackTroops(loot.LootedPrisoners, mapEventPartyId),
+                IsHeroId);
+
+            // An offer from an earlier wave of the same siege must not still be answerable once this one
+            // exists, or a late reply to the old one would be honoured against the new battle.
+            BattleLootOfferRegistry.Shared.ForgetMapEvent(mapEventId);
+            BattleLootOfferRegistry.Shared.Register(offer, BattleLootTransactionHandler.NowSeconds());
+
+            network.Send(peer, new NetworkBattleLootOffer(offer));
+
+            // Counts, not just line counts. A line is one KIND of thing, so "21 lines" says nothing about
+            // whether a haul is plausible for the army that produced it - a stack of forty arrows and a
+            // single sword are both one line. These totals are what you compare against the battle.
+            int items = 0, members = 0, prisoners = 0, heroes = 0;
+            foreach (var line in offer.Lines)
+            {
+                switch (line.Kind)
+                {
+                    case BattleLootLineKind.Item: items += line.Count; break;
+                    case BattleLootLineKind.Member: members += line.Count; break;
+                    case BattleLootLineKind.Prisoner: prisoners += line.Count; break;
+                }
+
+                if (line.IsHero) heroes++;
+            }
+
+            Logger.Information(
+                "[Loot] Offered {Lines} line(s) of {MapEvent} to party {Party} as offer {Offer}: " +
+                "{Items} item(s), {Members} member(s), {Prisoners} prisoner(s), {Heroes} hero(es)",
+                offer.Lines.Length, mapEventId, partyId, offer.OfferId, items, members, prisoners, heroes);
+        }
+        catch (Exception e)
+        {
+            Logger.Error(e, "[Loot] Could not offer the results of {MapEvent} to party {Party}", mapEventId, partyId);
+        }
+    }
+
+    private IEnumerable<BattleLootItemStack> PackItems(NetworkPlayerLootData loot, string mapEventPartyId)
+    {
+        var stacks = new List<BattleLootItemStack>();
+        if (loot.LootedItems == null ||
+            !loot.LootedItems.TryGetValue(mapEventPartyId, out var elements) ||
+            elements == null)
+        {
+            return stacks;
+        }
+
+        foreach (var element in elements)
+        {
+            var item = element.EquipmentElement.Item;
+            if (item == null || element.Amount <= 0) continue;
+            if (!objectManager.TryGetId(item, out var itemId)) continue;
+
+            string modifierId = null;
+            var modifier = element.EquipmentElement.ItemModifier;
+            if (modifier != null) objectManager.TryGetId(modifier, out modifierId);
+
+            stacks.Add(new BattleLootItemStack(itemId, modifierId, element.Amount));
+        }
+
+        return stacks;
+    }
+
+    private static IEnumerable<TroopRosterElementData> PackTroops(
+        Dictionary<string, TroopRosterData> byParty,
+        string mapEventPartyId)
+    {
+        if (byParty == null || !byParty.TryGetValue(mapEventPartyId, out var roster) || roster.Data == null)
+            return new TroopRosterElementData[0];
+
+        return roster.Data;
+    }
+
+    /// <summary>Whether a character id names a hero, which decides how its line may be claimed and applied.</summary>
+    private bool IsHeroId(string characterId)
+        => objectManager.TryGetObject<CharacterObject>(characterId, out var character)
+           && character != null
+           && character.IsHero;
 
     private void Handle_NetworkCommitMapEventResults(MessagePayload<NetworkCommitMapEventResults> obj)
     {
@@ -212,10 +318,6 @@ internal class MapEventResultsHandler : IHandler
             playerEncounter.RosterToReceiveLootPrisoners.Add(lootedPrisoners);
         }
 
-        // Staging is not the same as awarding. The encounter grants these when it reaches LootInventory, and
-        // concluding a coop battle closes every involved player's encounter - which can happen first, taking
-        // the loot with it. Keep a copy so BattleLootRescuePatch can hand it over if the screen never comes.
-        PendingBattleLoot.Remember(data.MapEventId, lootedItems, lootedMembers, lootedPrisoners);
 
         return true;
     }
@@ -254,65 +356,6 @@ internal class MapEventResultsHandler : IHandler
         => playerSide == winningSide &&
            (playerSide == BattleSideEnum.Attacker || playerSide == BattleSideEnum.Defender);
 
-    /// <summary>
-    /// Applies a player's loot to the SERVER's copy of their party, without replicating it.
-    /// </summary>
-    /// <remarks>
-    /// The server computed this loot, packed it and sent it - and then never gave it to its own copy of the
-    /// party. Only the client applied it, so every battle left the two disagreeing about what that player owned:
-    /// the client showed items, recovered troops and prisoners the server had no record of.
-    ///
-    /// Prisoners are where that surfaces, because prisoners are the one part of the loot the server is later
-    /// asked to act on. <c>PrisonerSaleProcessor.Sell</c> validates a ransom against the SERVER's prison roster,
-    /// so a player with a screen full of prisoners the server did not have could not ransom them, could not
-    /// discard them, and got no feedback explaining why. Items and recovered members diverged just as silently;
-    /// they simply had nothing that asked the server about them.
-    ///
-    /// Suppressed from replication on purpose. The client applies its own copy from the message it has just been
-    /// sent, so broadcasting this write as well would hand it to them twice. <see cref="AllowedThread"/> is the
-    /// existing way to say "apply this without telling anyone" - the same mechanism the client uses when it
-    /// applies an authoritative change it received.
-    ///
-    /// Known gap: loot staged into a surviving encounter can still be declined at the loot screen, and a decline
-    /// leaves the server holding what the player turned down. That screen rarely survives a co-op battle - it is
-    /// why the direct-award and rescue paths exist at all - and the failure it leaves behind is far milder than
-    /// the one being fixed here.
-    /// </remarks>
-    private void MirrorAwardOnServer(
-        string playerMobilePartyId,
-        string mapEventId,
-        BattleSideEnum winningSide,
-        BattleSideEnum playerSide,
-        string playerMapEventPartyId,
-        NetworkPlayerLootData networkPlayerLootData)
-    {
-        if (!WonTheBattle(winningSide, playerSide)) return;
-
-        if (!objectManager.TryGetObject<MobileParty>(playerMobilePartyId, out var party) || party == null)
-        {
-            Logger.Warning("[Loot] No server-side party {Party} to mirror the results of {MapEvent} into",
-                playerMobilePartyId, mapEventId);
-            return;
-        }
-
-        mapEventResultsInterface.UnpackPlayerLootDataForParty(
-            networkPlayerLootData,
-            playerMapEventPartyId,
-            out var lootedItems,
-            out var lootedMembers,
-            out var lootedPrisoners);
-
-        using (new AllowedThread())
-        {
-            if (lootedItems != null) party.ItemRoster.Add(lootedItems);
-            if (lootedMembers != null) party.MemberRoster.Add(lootedMembers);
-            if (lootedPrisoners != null) party.PrisonRoster.Add(lootedPrisoners);
-        }
-
-        Logger.Information(
-            "[Loot] Mirrored {MapEvent} onto the server's {Party}: {Items} item stack(s), {Members} recovered member(s), {Prisoners} prisoner(s)",
-            mapEventId, SafePartyName(party), lootedItems?.Count ?? 0, lootedMembers?.Count ?? 0, lootedPrisoners?.Count ?? 0);
-    }
 
     /// <summary>
     /// A party's name for a log line, or a placeholder when reading it would throw.

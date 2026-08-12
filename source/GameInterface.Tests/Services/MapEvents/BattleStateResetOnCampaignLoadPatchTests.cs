@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using GameInterface.Services.MapEvents;
 using GameInterface.Services.MapEvents.Patches;
 using GameInterface.Services.MapEvents.TroopSupply;
@@ -25,7 +25,6 @@ public class BattleStateResetOnCampaignLoadPatchTests : IDisposable
     {
         BattleSpawnGate.EndBattle();
         CoopTroopSupplierRegistry.ClearAll();
-        PendingBattleLoot.Clear();
     }
 
     [Fact]
@@ -58,15 +57,4 @@ public class BattleStateResetOnCampaignLoadPatchTests : IDisposable
         Assert.Empty(CoopTroopSupplierRegistry.GetSuppliers(AbandonedBattle));
     }
 
-    [Fact]
-    public void CampaignLoad_DropsLootStagedByAnAbandonedBattle()
-    {
-        PendingBattleLoot.Remember(AbandonedBattle, null, null, null);
-        Assert.True(PendingBattleLoot.HasPending);
-
-        BattleStateResetOnCampaignLoadPatch.ResetBattleState();
-
-        // Otherwise the next encounter to finish would rescue a previous campaign's loot into this one.
-        Assert.False(PendingBattleLoot.HasPending);
-    }
 }

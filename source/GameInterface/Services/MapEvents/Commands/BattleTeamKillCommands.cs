@@ -371,7 +371,7 @@ Kills one live enemy-team agent in the current battle (battle-authority side).";
 
         try
         {
-            Kill(agent);
+            Kill(agent, Agent.Main);
         }
         catch (Exception ex)
         {
@@ -458,7 +458,7 @@ coop battle LOSS.";
                 continue;
             try
             {
-                Kill(agent);
+                Kill(agent, Agent.Main);
                 killed++;
             }
             catch (Exception ex)
@@ -470,9 +470,23 @@ coop battle LOSS.";
         return killed;
     }
 
-    private static void Kill(Agent agent)
+    /// <summary>
+    /// Kills an agent, crediting the blow to <paramref name="attacker"/>.
+    /// </summary>
+    /// <remarks>
+    /// The attribution is the whole point and it used to be wrong: the blow was built as
+    /// <c>new Blow(agent.Index)</c>, and that constructor takes the ATTACKER's index - so every kill was
+    /// recorded as self-inflicted. Nobody was credited, which matters well beyond tidiness: a battle's
+    /// contribution is what decides each victorious party's share of the spoils, so a player who wiped the
+    /// enemy out with this command was scored as having done nothing and received a fraction of the loot.
+    /// Measured against a real battle - 21 item stacks for destroying an army of a thousand.
+    ///
+    /// Falls back to the victim when there is no main agent, which is only the case with no player on the
+    /// field; killing is still better than throwing there.
+    /// </remarks>
+    private static void Kill(Agent agent, Agent attacker)
     {
-        var blow = new Blow(agent.Index)
+        var blow = new Blow(attacker != null && attacker.IsActive() ? attacker.Index : agent.Index)
         {
             DamageType = DamageTypes.Pierce,
             BaseMagnitude = 100000f,

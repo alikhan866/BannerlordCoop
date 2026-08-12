@@ -6,6 +6,7 @@ using Common.Util;
 using GameInterface.Configuration;
 using GameInterface.Services.MapEvents;
 using GameInterface.Services.MapEvents.Logging;
+using GameInterface.Services.MapEvents.Loot;
 using GameInterface.Services.MapEvents.Messages;
 using GameInterface.Services.MapEvents.Messages.Leave;
 using GameInterface.Services.MapEvents.TroopSupply;
@@ -630,16 +631,27 @@ internal class BattleFinalizeHandler : IHandler
             var mainParty = MobileParty.MainParty;
             MoveLocalRaidPartyToSettlementGate(mainParty, GetLocalRaidFinalizationSettlement(mainParty));
 
-            // Loot still staged means this player has not been shown their spoils yet. Vanilla hands them
+            // An unanswered offer means this player has not been shown their spoils yet. Vanilla hands them
             // over by WALKING the encounter to PlayerEncounterState.LootInventory - capture the enemy,
             // choose which prisoners to keep, then the loot screen - and force-finishing here cuts that walk
             // short, which is the whole reason battle loot had to be auto-credited behind the player's back.
-            // Leave the encounter alone and let it reach those screens; BattleLootRescuePatch still covers
-            // the case where it ends without ever getting there, so nothing can be silently lost.
-            if (PendingBattleLoot.HasPending)
+            //
+            // NOT keyed to a specific battle, and that is a known limitation rather than an oversight:
+            // NetworkMapEventFinalized carries no payload at all, so this handler cannot tell WHICH event
+            // finalized. Keying the wait to the battle that produced the offer needs a map event id on that
+            // message - a small protocol change, deliberately not made in the middle of this one.
+            //
+            // The exposure is bounded. An offer is answered at PlayerEncounter.Finish, which is the same
+            // moment this teardown would have run, so the window in which one is outstanding is short; and
+            // the server expires offers regardless. If a siege's next assault ever does arrive inside that
+            // window, the symptom is a delayed teardown, not a lost battle.
+            //
+            // An earlier revision asked PendingBattleLoot.HasPending instead and never fired once, because
+            // the staging it asked about had already been cleared by the time this ran.
+            if (ClientBattleLootOffer.HasPending)
             {
                 Logger.Information(
-                    "[Loot] Battle finalized with loot still staged; leaving the encounter open so the " +
+                    "[Loot] Battle finalized with an unanswered offer; leaving the encounter open so the " +
                     "prisoner and loot screens can run");
                 return;
             }
