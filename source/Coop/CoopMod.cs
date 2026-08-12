@@ -13,6 +13,7 @@ using GameInterface;
 using GameInterface.Services.Modules;
 using GameInterface.Services.Modules.Handlers;
 using GameInterface.Services.Chat;
+using GameInterface.Services.Locations;
 using GameInterface.Services.MapEvents.PlayerPartyInteractions;
 using GameInterface.Services.Tournaments.UI;
 using GameInterface.Services.UI;
@@ -450,7 +451,7 @@ namespace Coop
             Updateables.Add(GameThread.Instance);
 
 #if DEBUG
-            if (isAutoConnect)
+            if (isAutoConnect && LiveTestControlServer.IsEnabled(Environment.GetCommandLineArgs()))
             {
                 liveTestControlServer = new LiveTestControlServer(isServer, activeLogFilePath);
                 liveTestControlServer.Start();
@@ -479,9 +480,10 @@ namespace Coop
                         {
                             Coop.StartAsServer(null, ManagedServerConfig.Password, ManagedServerConfig.Visibility);
                         }
-                        else
+                        else if (!Coop.StartAsClient())
                         {
-                            Coop.StartAsClient();
+                            InformationManager.DisplayMessage(new InformationMessage(
+                                CoopartiveMultiplayerExperience.StartRefusedNotice));
                         }
                     },
                     () => { return (false, new TextObject("")); }
@@ -530,6 +532,7 @@ namespace Coop
 
             if (gameStarterObject is CampaignGameStarter campaignGameStarter)
             {
+                campaignGameStarter.AddBehavior(new FixedTownNpcConversationBehavior());
                 campaignGameStarter.AddBehavior(new PlayerPartyInteractionCampaignBehavior());
                 campaignGameStarter.AddBehavior(new CoopTournamentCampaignBehavior());
             }
@@ -698,8 +701,8 @@ namespace Coop
                     else
                     {
                         Logger.Information("[AutoConnect] InitialState active — auto-starting as client...");
-                        Coop.StartAsClient();
-                        Logger.Information("[AutoConnect] StartAsClient() completed");
+                        bool started = Coop.StartAsClient();
+                        Logger.Information("[AutoConnect] StartAsClient() returned {Started}", started);
                     }
                 }
                 catch (Exception ex)
