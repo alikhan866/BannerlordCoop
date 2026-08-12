@@ -43,7 +43,8 @@ public class SettlementOwnershipHandlerThreadingTests
         using var handler = new SettlementOwnershipHandler(
             messageBroker.Object,
             new Mock<IObjectManager>().Object,
-            network.Object);
+            network.Object,
+            new Mock<IPlayerManager>().Object);
         Assert.NotNull(subscriber);
 
         subscriber(new MessagePayload<SettlementOwnershipChanged>(
