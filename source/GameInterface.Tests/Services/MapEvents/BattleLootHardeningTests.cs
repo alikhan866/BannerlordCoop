@@ -1,4 +1,5 @@
 using GameInterface.Services.MapEvents.Loot;
+using System.Linq;
 using Xunit;
 
 namespace GameInterface.Tests.Services.MapEvents;
@@ -138,6 +139,27 @@ public class BattleLootHardeningTests
         Assert.Equal(2, registry.OutstandingFor(Alice, 1).Count + registry.OutstandingFor(Bob, 1).Count);
         Assert.Single(registry.OutstandingFor(Alice, 1));
         Assert.Single(registry.OutstandingFor(Bob, 1));
+    }
+
+    [Fact]
+    public void ClearedStagedRostersWouldClaimEverythingTheePlayerRefused()
+    {
+        // Why the declined troops are snapshotted before the party screen's callback runs, rather than read
+        // afterwards like items are. Vanilla's OnPlayerLootMembersAndPrisonerEnd CLEARS both staged rosters
+        // as the screen closes, so a later read reports nothing remaining - and nothing remaining is claimed
+        // in full. This is that mistake written down: prisoners the player deliberately left, delivered anyway.
+        var offer = Offer("o", "MapEvent_1", Alice,
+            new BattleLootOfferLine(BattleLootLineKind.Prisoner, "looter", null, 9),
+            HeroPrisoner("lord_1_68"));
+
+        var asIfReadAfterTheClear = BattleLootSelection.FromRemaining(offer, new[] { 0, 0 });
+        Assert.True(BattleLootValidator.TryValidate(offer, asIfReadAfterTheClear, out var claimedAll, out _));
+        Assert.Equal(9, claimedAll.Single(c => c.Line.ObjectId == "looter").Count);
+
+        // Read at the right moment - the player kept none of them - and nothing is claimed.
+        var asSnapshottedBeforeTheClear = BattleLootSelection.FromRemaining(offer, new[] { 9, 1 });
+        Assert.True(BattleLootValidator.TryValidate(offer, asSnapshottedBeforeTheClear, out var claimedNone, out _));
+        Assert.Empty(claimedNone);
     }
 
     [Fact]

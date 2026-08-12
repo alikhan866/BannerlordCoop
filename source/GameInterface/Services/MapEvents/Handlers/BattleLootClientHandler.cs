@@ -31,6 +31,9 @@ internal class BattleLootClientHandler : IHandler
     private readonly INetwork network;
     private readonly IObjectManager objectManager;
 
+    private List<TroopRosters.Data.TroopRosterElementData> declinedMembers;
+    private List<TroopRosters.Data.TroopRosterElementData> declinedPrisoners;
+
     public BattleLootClientHandler(IMessageBroker messageBroker, INetwork network, IObjectManager objectManager)
     {
         this.messageBroker = messageBroker;
@@ -119,11 +122,19 @@ internal class BattleLootClientHandler : IHandler
         var mainParty = MobileParty.MainParty;
         if (mainParty != null) objectManager.TryGetId(mainParty, out partyId);
 
+        // Troops and prisoners come from the snapshot taken as the party screen closed, because the rosters
+        // themselves are cleared at that moment and would otherwise read as "all taken". Items come from the
+        // live roster, which nothing clears, so it still holds exactly what was left behind.
+        var members = declinedMembers ?? PackTroops(encounter?.RosterToReceiveLootMembers);
+        var prisoners = declinedPrisoners ?? PackTroops(encounter?.RosterToReceiveLootPrisoners);
+        declinedMembers = null;
+        declinedPrisoners = null;
+
         var remaining = BattleLootLineMatcher.CountRemaining(
             offer,
             PackItems(encounter?.RosterToReceiveLootItems),
-            PackTroops(encounter?.RosterToReceiveLootMembers),
-            PackTroops(encounter?.RosterToReceiveLootPrisoners));
+            members,
+            prisoners);
 
         var result = BattleLootSelection.FromRemaining(offer, remaining);
 
@@ -132,6 +143,64 @@ internal class BattleLootClientHandler : IHandler
         Logger.Information(
             "[Loot] Answered offer {Offer} for {MapEvent} with {Claims} claim(s)",
             offer.OfferId, offer.MapEventId, result.Claims?.Length ?? 0);
+    }
+
+    /// <summary>
+    /// Records which troops and prisoners the player left behind, at the one instant that is knowable.
+    /// </summary>
+    /// <remarks>
+    /// Called just before <c>PlayerEncounter.OnPlayerLootMembersAndPrisonerEnd</c>, which CLEARS both staged
+    /// rosters as the party screen closes - whatever the player did or did not take. Read any later, the
+    /// rosters are empty, and empty is what the answer reads as "the player took all of it". That is why
+    /// prisoners the player deliberately left were still turning up in their dungeon: the choice was made and
+    /// then erased a frame afterwards, and nothing downstream could tell.
+    ///
+    /// Items need no equivalent. Nothing clears <c>RosterToReceiveLootItems</c>, so what is left on it at the
+    /// end really is what was declined.
+    /// </remarks>
+    public void CaptureDeclinedTroops(PlayerEncounter encounter)
+    {
+        if (ModInformation.IsServer) return;
+        if (!ClientBattleLootOffer.HasPending) return;
+
+        declinedMembers = PackTroops(encounter?.RosterToReceiveLootMembers);
+        declinedPrisoners = PackTroops(encounter?.RosterToReceiveLootPrisoners);
+
+        Logger.Information(
+            "[Loot] The player left {Members} member(s) and {Prisoners} prisoner(s) on the loot screen",
+            declinedMembers.Count, declinedPrisoners.Count);
+    }
+
+    /// <summary>
+    /// Settles an offer the player was never shown, paying it out rather than forfeiting it.
+    /// </summary>
+    /// <remarks>
+    /// Reached when the encounter closes before any step of the walk opened a screen or a conversation. The
+    /// ordinary answer cannot be used: it reads what is left on the staged rosters, and nothing having been
+    /// taken from them means "never asked", not "declined".
+    ///
+    /// This still goes through the offer as a normal answer, so the server validates, plans and applies it the
+    /// same way as a real one - there is no second route by which loot can move. It is deliberately loud: a
+    /// payout nobody chose is a symptom, and the line below is what says which battle it happened in.
+    /// </remarks>
+    public void SettleUnshownOffer()
+    {
+        if (ModInformation.IsServer) return;
+        if (!ClientBattleLootOffer.TryTake(out var offer)) return;
+
+        var partyId = string.Empty;
+        var mainParty = MobileParty.MainParty;
+        if (mainParty != null) objectManager.TryGetId(mainParty, out partyId);
+
+        var result = BattleLootAbandonPolicy.AnswerFor(offer, BattleLootAbandonReason.NeverShown);
+
+        network.SendAll(new NetworkBattleLootResult(partyId, result));
+
+        Logger.Warning(
+            "[Loot] The encounter for {MapEvent} closed before the player was shown anything, so offer {Offer} " +
+            "({Lines} line(s)) is being paid out in full rather than forfeited. The loot screens did not run - " +
+            "that is the bug; this only stops it costing the battle's spoils",
+            offer.MapEventId, offer.OfferId, offer.Lines?.Length ?? 0);
     }
 
     private List<BattleLootItemStack> PackItems(ItemRoster roster)

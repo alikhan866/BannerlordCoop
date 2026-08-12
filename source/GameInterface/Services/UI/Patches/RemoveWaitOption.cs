@@ -17,6 +17,16 @@ internal class RemoveWaitOption
     static bool Prefix(string menuId)
     {
         MenuContext currentMenuContext = Campaign.Current.CurrentMenuContext;
+        if (currentMenuContext == null)
+        {
+            // This replaces vanilla wholesale, so with no menu context the switch is simply DROPPED - the
+            // caller believes it moved the player and nothing happened. Vanilla at least asserts here. Said
+            // out loud because a silently dropped menu switch is indistinguishable, from the player's side,
+            // from a menu option that does nothing.
+            Logger.Warning("Menu switch to '{MenuId}' was dropped: there is no current menu context", menuId);
+            return false;
+        }
+
         if (currentMenuContext != null)
         {
             try

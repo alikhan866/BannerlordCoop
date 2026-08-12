@@ -13,6 +13,17 @@ public enum BattleLootAbandonReason
 
     /// <summary>Nobody answered before the offer expired.</summary>
     TimedOut = 2,
+
+    /// <summary>
+    /// The encounter closed before the player was ever shown the spoils.
+    /// </summary>
+    /// <remarks>
+    /// Distinct from <see cref="LeftDeliberately"/> on purpose, and the distinction is the whole point: both
+    /// end with an unanswered offer and full staged rosters, and treating them alike is what silently cost a
+    /// won siege its entire spoils - 191 item stacks, 47 members and 52 prisoners, reported to the server as
+    /// "claimed none of it".
+    /// </remarks>
+    NeverShown = 3,
 }
 
 /// <summary>What to do with spoils nobody answered for.</summary>
@@ -52,6 +63,12 @@ public static class BattleLootAbandonPolicy
         switch (reason)
         {
             case BattleLootAbandonReason.Disconnected:
+
+            // Same reasoning as a disconnect: a player who was never asked has not declined anything, and
+            // charging them a whole battle's spoils for a screen that failed to open is a punishment for our
+            // bug. It pays out through the ordinary transaction, so there is still exactly one authority for
+            // moving loot - and it is loud in the log, so it can never be mistaken for the screens working.
+            case BattleLootAbandonReason.NeverShown:
                 return BattleLootAbandonOutcome.TakeAll;
 
             case BattleLootAbandonReason.LeftDeliberately:

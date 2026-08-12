@@ -163,7 +163,7 @@ internal class SiegeReliefJoinSidePatch
     /// EncounterSettlement is populated here, but was not in an earlier revision's assumptions, so the
     /// other sources stay as fallbacks and the log records which one answered.
     /// </summary>
-    private static Settlement ResolveBesiegedSettlement(out string source)
+    internal static Settlement ResolveBesiegedSettlement(out string source)
     {
         var encounterSettlement = PlayerEncounter.EncounterSettlement;
         if (encounterSettlement?.SiegeEvent != null) { source = "EncounterSettlement"; return encounterSettlement; }

@@ -29,6 +29,41 @@ public class BattleLootAbandonPolicyTests
     }
 
     [Fact]
+    public void BeingClosedOutBeforeTheScreensOpenPaysOutInFull()
+    {
+        // The case that cost a won siege everything: the encounter closed before any step of the walk put a
+        // screen in front of the player, the staged rosters were therefore untouched, and reading them as a
+        // decline reported "claimed none of it" to the server.
+        Assert.Equal(
+            BattleLootAbandonOutcome.TakeAll,
+            BattleLootAbandonPolicy.Decide(BattleLootAbandonReason.NeverShown));
+    }
+
+    [Fact]
+    public void NeverShownAndWalkingAwayAreNotTheSameThing()
+    {
+        // They leave IDENTICAL evidence - an unanswered offer and full staged rosters - so the only thing
+        // keeping them apart is that they are different reasons. If these two ever agree, the distinction has
+        // collapsed and a player who was never asked is being treated as one who refused.
+        Assert.NotEqual(
+            BattleLootAbandonPolicy.Decide(BattleLootAbandonReason.NeverShown),
+            BattleLootAbandonPolicy.Decide(BattleLootAbandonReason.LeftDeliberately));
+    }
+
+    [Fact]
+    public void AnUnshownOfferIsAnsweredWithEveryLine()
+    {
+        var offer = Offer(Item("grain", 10), HeroPrisoner("lord_1_68"));
+
+        var answer = BattleLootAbandonPolicy.AnswerFor(offer, BattleLootAbandonReason.NeverShown);
+
+        Assert.True(BattleLootValidator.TryValidate(offer, answer, out var resolved, out var rejection));
+        Assert.Equal(BattleLootRejection.None, rejection);
+        Assert.Equal(10, resolved.Single(claim => claim.Line.ObjectId == "grain").Count);
+        Assert.Equal(1, resolved.Single(claim => claim.Line.ObjectId == "lord_1_68").Count);
+    }
+
+    [Fact]
     public void WalkingAwayDiscards()
     {
         // Vanilla discards loot left on the screen. Paying it out would leave no way to decline anything.

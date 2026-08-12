@@ -35,10 +35,26 @@ internal class BattleLootAnswerPatch
         if (ModInformation.IsServer) return;
         if (!Loot.ClientBattleLootOffer.HasPending) return;
 
+        // An encounter closing on top of unanswered spoils is worth a name and a stack trace. It is rare - it
+        // needs an open offer - and it is the difference between "the player declined" and "something closed
+        // the encounter before the player was asked", which no other line in the log distinguishes.
+        var wasShown = Loot.ClientBattleLootOffer.WasShown;
+        Logger.Information(
+            "[Loot] PlayerEncounter.Finish with an offer still open (shownToPlayer={Shown}):{NewLine}{Stack}",
+            wasShown, Environment.NewLine, Environment.StackTrace);
+
         try
         {
             if (ContainerProvider.TryResolve<BattleLootClientHandler>(out var handler))
             {
+                // Nothing was ever put in front of the player, so the staged rosters say "never asked" and
+                // reading them as a decline would forfeit the lot.
+                if (!wasShown)
+                {
+                    handler.SettleUnshownOffer();
+                    return;
+                }
+
                 handler.AnswerOutstandingOffer(PlayerEncounter.Current);
                 return;
             }

@@ -20,10 +20,30 @@ public static class ClientBattleLootOffer
 
     private static BattleLootOffer offer;
     private static bool present;
+    private static bool shown;
 
     public static bool HasPending
     {
         get { lock (Gate) return present; }
+    }
+
+    /// <summary>
+    /// Whether the player has actually been shown any of these spoils yet.
+    /// </summary>
+    /// <remarks>
+    /// The answer to an offer is read from what is LEFT on the staged rosters, which says "declined" and
+    /// "never asked" in exactly the same words. Without this flag the two are indistinguishable, and a battle
+    /// whose screens never opened is reported to the server as a player who wanted none of it.
+    /// </remarks>
+    public static bool WasShown
+    {
+        get { lock (Gate) return shown; }
+    }
+
+    /// <summary>Called when a step of the post-battle walk actually puts something in front of the player.</summary>
+    public static void MarkShown()
+    {
+        lock (Gate) shown = true;
     }
 
     /// <summary>Records the offer the server just sent. Replaces any earlier unanswered one.</summary>
@@ -33,6 +53,7 @@ public static class ClientBattleLootOffer
         {
             offer = value;
             present = true;
+            shown = false;
         }
     }
 
@@ -63,6 +84,7 @@ public static class ClientBattleLootOffer
             bool had = present;
             offer = default;
             present = false;
+            shown = false;
             return had;
         }
     }
