@@ -33,6 +33,20 @@ namespace GameInterface.Services.Headless.Patches
         /// </summary>
         private static readonly (Type Type, string Method)[] TracedMethods =
         {
+            // Game-manager startup, which runs BEFORE anything below and is where a render-free CLIENT dies -
+            // earlier than any Campaign step, so the original list was silent for it and the log tail was the
+            // only evidence. The tail is not a locator here: this phase runs with a parallelism of ten, and
+            // the last line printed wandered between runs while the actual failure did not.
+            //
+            // One-shot methods only. DoLoadingForGameManager is deliberately absent: it is called once per
+            // frame, and burying the answer in thousands of lines is its own kind of blindness.
+            (typeof(TaleWorlds.MountAndBlade.MBGameManager), "OnLoadFinished"),
+            (typeof(SandBox.SandBoxGameManager), "OnLoadFinished"),
+            (typeof(SandBox.SandBoxGameManager), "OnGameStart"),
+            (typeof(SandBox.SandBoxGameManager), "InitializeGameStarter"),
+            (typeof(SandBox.SandBoxGameManager), "OnNewCampaignStart"),
+            (typeof(Campaign), "DoLoadingForGameType"),
+
             (typeof(Campaign), "LoadMapScene"),
             (typeof(Campaign), "CheckMapUpdate"),
             (typeof(Campaign), "OnDataLoadFinished"),
@@ -78,6 +92,31 @@ namespace GameInterface.Services.Headless.Patches
             if (!ModInformation.IsHeadless) return;
 
             Logger.Information("[Headless] load step: {Type}.{Step} done", __originalMethod.DeclaringType?.Name, __originalMethod.Name);
+        }
+
+        /// <summary>
+        /// Logs the exception that ends a load step, then lets it carry on.
+        /// </summary>
+        /// <remarks>
+        /// An exception thrown out of one of these steps kills the process before any of our own handlers see
+        /// it: the engine has no top-level handler on the load path, so the only trace left is the exit code
+        /// (0xE0434352, "a managed exception happened"), which names neither the type nor the frame. The
+        /// missing "done" line above tells us which step died; this tells us why.
+        ///
+        /// Not headless-gated, unlike the trace lines - the same crash takes the game-window server down too,
+        /// and there the log is the only thing anyone can read afterwards. Returning the exception rethrows
+        /// it, so behaviour is unchanged; swallowing it here would trade a hard crash for a half-built world.
+        /// </remarks>
+        [HarmonyFinalizer]
+        private static Exception Finalizer(MethodBase __originalMethod, Exception __exception)
+        {
+            if (__exception != null)
+            {
+                Logger.Error("[Headless] load step: {Type}.{Step} THREW {Exception}",
+                    __originalMethod.DeclaringType?.Name, __originalMethod.Name, __exception.ToString());
+            }
+
+            return __exception;
         }
     }
 }

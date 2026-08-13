@@ -180,6 +180,13 @@ namespace Coop.LiveTesting
                     false);
             }
 
+            // C24 - refused before the command is dispatched, and refused HERE rather than in the rig, so a
+            // misbehaving driver cannot decline to check. Off unless this process was armed.
+            if (GameInterface.Services.Headless.IrreversibleActionGuard.TryRefuse(command, out var refusal))
+            {
+                return Failure(request.Id, "action_refused", refusal, false);
+            }
+
             return ExecuteOnGameThread(request, () =>
             {
                 if (!ContainerProvider.TryResolve<ILiveTestCommandDispatcher>(out var dispatcher))
@@ -201,11 +208,13 @@ namespace Coop.LiveTesting
                         });
                     }
 
-                    return Failure(
-                        request.Id,
-                        "session_not_ready",
-                        "The co-op session command dispatcher is not available yet.",
-                        false);
+                    // Before a session there is no container to resolve a dispatcher from, but the dispatcher
+                    // needs no session state to find and call a console command - which is why the catalog
+                    // handler already builds one this way. Refusing here left a process that has not joined
+                    // unable to run ANY command, including the ones whose whole purpose is to be run before a
+                    // session exists. Commands that genuinely need container services still fail, but they
+                    // fail individually with their own message instead of taking the whole channel down.
+                    dispatcher = new LiveTestCommandDispatcher();
                 }
 
                 LiveTestCommandResult result = dispatcher.Execute(command, arguments);
@@ -432,12 +441,16 @@ namespace Coop.LiveTesting
                         false);
                 }
 
-                if (!(GameStateManager.Current?.ActiveState is InitialState) || Campaign.Current != null)
+                // Not "is the main menu up": a headless client never reaches InitialState, because there is no
+                // UI to build one with. Campaign.Current is still checked - joining twice over a live campaign
+                // is wrong in either role.
+                if (!SessionStartReadiness.CanStartSession() || Campaign.Current != null)
                 {
                     return Failure(
                         request.Id,
-                        "client_not_at_main_menu",
-                        "The client must be at the main menu with no campaign loaded before joining.",
+                        "client_not_ready_to_join",
+                        $"The client is not ready to join: state={SessionStartReadiness.DescribeState()}, " +
+                        $"campaignLoaded={Campaign.Current != null}.",
                         false);
                 }
 
@@ -518,6 +531,32 @@ namespace Coop.LiveTesting
             string activeState = GameStateManager.Current?.ActiveState?.GetType().FullName;
             string topScreen = ScreenManager.TopScreen?.GetType().FullName;
             string activeMenu = Campaign.Current?.CurrentMenuContext?.GameMenu?.StringId;
+            // Campaign time, as both a readable date and raw ticks. The ticks are what a watchdog compares:
+            // a formatted date only changes on the hour, so two samples minutes apart can look identical on a
+            // running clock and be mistaken for a stall. Needed by the liveness and failure-bundle
+            // capabilities, and the only way to tell a paused campaign from a stuck one without a UI.
+            // ToDays rather than NumTicks: the tick accessor is internal, and this project references the
+            // stock TaleWorlds assemblies rather than the publicised ones GameInterface uses.
+            string campaignTime = Campaign.Current != null ? CampaignTime.Now.ToString() : null;
+            double campaignTimeDays = Campaign.Current != null ? CampaignTime.Now.ToDays : 0d;
+            string timeControlMode = Campaign.Current?.TimeControlMode.ToString();
+
+            // C30 - published so a watchdog can tell a paused campaign from a stuck one without grepping.
+            //
+            // Only reported while the campaign is ACTUALLY paused. The reason is recorded when a policy
+            // refuses an unpause, and cleared when a later request succeeds - so with no request in between
+            // it outlives its cause. That is not theoretical: it produced a report claiming a joined client
+            // was being blocked by the "no players connected" policy, which was false, and it took a live
+            // check to disprove. A stale explanation is worse than none, because it gets believed.
+            bool campaignPaused = Campaign.Current != null &&
+                Campaign.Current.TimeControlMode == CampaignTimeControlMode.Stop;
+            string pauseReason = campaignPaused
+                ? GameInterface.Services.Headless.CampaignPauseReason.Current
+                : null;
+            double pauseHeldForSeconds = campaignPaused
+                ? GameInterface.Services.Headless.CampaignPauseReason.HeldForSeconds
+                : 0d;
+
             bool readyForCampaignTests = campaignLoaded && coopRunning && commandRegistryReady;
             string[] modAssemblyNames =
             {
@@ -549,6 +588,11 @@ namespace Coop.LiveTesting
                 role = processInfo.Role,
                 platformId = processInfo.PlatformId,
                 runToken = processInfo.RunToken,
+                // Published so the rig can DETECT whether this process has a renderer instead of being told.
+                // A runner that is merely told it is driving a rendered client will happily run screenshot
+                // scenarios against a headless one and report the failures as faults, when the truth is that
+                // this process was never going to draw anything.
+                isHeadless = ModInformation.IsHeadless,
                 buildVersion = ModInformation.BuildVersion,
                 assemblyMvid = typeof(CoopMod).Assembly.ManifestModule.ModuleVersionId,
                 loadedAssemblies,
@@ -561,6 +605,11 @@ namespace Coop.LiveTesting
                 topScreen,
                 activeMenu,
                 campaignLoaded,
+                campaignTime,
+                campaignTimeDays,
+                timeControlMode,
+                pauseReason,
+                pauseHeldForSeconds,
                 missionActive,
                 coopRunning,
                 coopState,

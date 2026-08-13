@@ -37,6 +37,13 @@ namespace Coop
 
         internal const string HeadlessArgument = "/coopheadless";
 
+        /// <summary>Render-free, but a client to be driven rather than a server to be joined.</summary>
+        /// <remarks>
+        /// Checked with an exact match, like the server argument, so "/coopheadlessclient" cannot be mistaken
+        /// for "/coopheadless" by a prefix comparison - they differ only by a suffix.
+        /// </remarks>
+        internal const string HeadlessClientArgument = "/coopheadlessclient";
+
         /// <summary>How often the tick counter reports in.</summary>
         private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(30);
 
@@ -46,8 +53,28 @@ namespace Coop
 
         internal static bool IsRequested()
         {
+            return HasArgument(HeadlessArgument);
+        }
+
+        /// <summary>Whether this process was asked to run as a render-free CLIENT.</summary>
+        internal static bool IsHeadlessClientRequested()
+        {
+            return HasArgument(HeadlessClientArgument);
+        }
+
+        /// <summary>Whether the process should run without a renderer at all, in either role.</summary>
+        internal static bool IsRenderFreeRequested()
+        {
+            return IsRequested() || IsHeadlessClientRequested();
+        }
+
+        // Exact match per token, so the two arguments cannot shadow one another: "/coopheadlessclient"
+        // starts with "/coopheadless", and a StartsWith comparison would make every headless client also
+        // look like a dedicated server.
+        private static bool HasArgument(string argument)
+        {
             var args = Utilities.GetFullCommandLineString().Split(' ');
-            return args.Any(a => a.Equals(HeadlessArgument, StringComparison.OrdinalIgnoreCase));
+            return args.Any(a => a.Equals(argument, StringComparison.OrdinalIgnoreCase));
         }
 
         /// <summary>
@@ -115,7 +142,7 @@ namespace Coop
         /// </remarks>
         internal static void StartConsole()
         {
-            if (!ModInformation.IsHeadless || consoleStarted) return;
+            if (!ModInformation.IsHeadlessServer || consoleStarted) return;
             consoleStarted = true;
 
             new Thread(ReadCommands)
@@ -272,7 +299,7 @@ namespace Coop
             // server and headless alike. Without it a client polls the command file once a second and
             // would run whatever a stray command.txt contained, and every log gained a "[Headless] alive"
             // line every thirty seconds on machines that are not headless at all.
-            if (!ModInformation.IsHeadless) return;
+            if (!ModInformation.IsHeadlessServer) return;
 
             var ticks = Interlocked.Increment(ref engineTicks);
 

@@ -100,7 +100,7 @@ internal class CampaignDifficultyHandler : IHandler
     /// default of VeryEasy for everyone connected to it.
     /// </remarks>
     private static bool IsHeadlessHost =>
-        ModInformation.IsHeadless ||
+        ModInformation.IsHeadlessServer ||
         string.IsNullOrEmpty(Environment.GetEnvironmentVariable("BANNERLORD_USER_DIR")) == false;
 
     /// <summary>By name, not ordinal — the game enum's numbering is not ours to rely on.</summary>

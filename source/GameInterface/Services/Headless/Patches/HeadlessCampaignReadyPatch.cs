@@ -38,11 +38,16 @@ namespace GameInterface.Services.Headless.Patches
         [HarmonyPatch("OnActivate")]
         private static void OnActivate(ref TaleworldGameState __instance)
         {
+            // Both render-free roles, not just the server. CampaignReady has only two publishers: this one,
+            // and GameLoadedPatch hanging off MapScreen.OnInitialize - a UI screen a headless process never
+            // builds. Gated on the server, a driven CLIENT fell between them: it reached MapState with the
+            // campaign fully loaded, nothing published CampaignReady, its LoadingState never completed, and
+            // the server sat on WaitingForCampaignEntry indefinitely.
             if (!ModInformation.IsHeadless || signalled) return;
             if (!(__instance is MapState)) return;
 
             signalled = true;
-            Logger.Information("[Headless] campaign is up; signalling the server to start listening");
+            Logger.Information("[Headless] campaign is up; publishing CampaignReady");
 
 
             MessageBroker.Instance.Publish(null, new CampaignReady());

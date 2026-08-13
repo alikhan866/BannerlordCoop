@@ -34,7 +34,12 @@ internal class HeadlessPartyVisualLifetimePatches
     // SandBoxViewSubModule - so the probe that was meant to DETECT headless was itself failing there, and
     // the exception escaped both postfixes below. RemoveParty is called from DestroyPartyAction through
     // GameThread, so the whole queued destroy died with it and the party was never fully removed.
-    private static bool IsHeadlessServer => ModInformation.IsServer && ModInformation.IsHeadless;
+    // Whether this process has no renderer - NOT whether it is the server. Both render-free roles need the
+    // shells: a driven client has no MobilePartyVisualManager either, and the engine builds a real visual per
+    // party while a campaign loads. Written as IsServer && IsHeadless, this guard was off on a headless
+    // client, which then died with a native access violation part way through loading a campaign - roughly
+    // fifteen hundred parties each asking for a visual on a process that cannot make one.
+    private static bool IsRenderFree => ModInformation.IsHeadless;
 
     // The same moment a graphical host builds the visual: the party's registration at the end of
     // the MobileParty constructor — the party is already id-registered (its creation prefix runs
@@ -43,7 +48,7 @@ internal class HeadlessPartyVisualLifetimePatches
     [HarmonyPostfix]
     private static void AddMobilePartyPostfix(MobileParty party)
     {
-        if (!IsHeadlessServer) return;
+        if (!IsRenderFree) return;
 
         var partyBase = party?.Party;
         if (partyBase == null) return;
@@ -58,7 +63,7 @@ internal class HeadlessPartyVisualLifetimePatches
     [HarmonyPostfix]
     private static void RemovePartyPostfix(MobileParty __instance)
     {
-        if (!IsHeadlessServer) return;
+        if (!IsRenderFree) return;
 
         var partyBase = __instance?.Party;
         if (partyBase == null) return;

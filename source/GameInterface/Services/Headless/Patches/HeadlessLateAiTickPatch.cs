@@ -1,4 +1,4 @@
-using Common;
+﻿using Common;
 using Common.Logging;
 using HarmonyLib;
 using Serilog;
@@ -45,7 +45,7 @@ namespace GameInterface.Services.Headless.Patches
         [HarmonyPostfix]
         private static void Postfix()
         {
-            if (!ModInformation.IsHeadless) return;
+            if (!ModInformation.IsHeadlessServer) return;
             if (Campaign.Current == null) return;
 
             try

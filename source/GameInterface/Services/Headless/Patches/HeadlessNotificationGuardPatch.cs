@@ -35,9 +35,21 @@ namespace GameInterface.Services.Headless.Patches;
 internal class HeadlessNotificationGuardPatch
 {
     /// <summary>Whether this process should run player-facing campaign notifications at all.</summary>
+    /// <remarks>
+    /// The argument is "is this a process with no player behind it", which the call site now answers with
+    /// IsHeadlessServer rather than IsHeadless. The reasoning in this class is entirely about a host that has
+    /// no main hero and therefore no <c>Clan.PlayerClan</c> to read - that is a dedicated SERVER. A driven
+    /// client is render-free but is a player in every other respect: it owns a hero, a party and a clan, and
+    /// `coop.debug.mobileparty.whoami` on one answers "You are Kan".
+    ///
+    /// Suppressing it there was not merely conservative, it was blinding: these handlers are where most of
+    /// what the campaign tells a player comes from, so a driven client raised no notifications at all and the
+    /// capture built to read them had nothing to read.
+    /// </remarks>
     internal static bool ShouldRegisterNotifications(bool isHeadless) => !isHeadless;
 
     [HarmonyPatch(nameof(DefaultNotificationsCampaignBehavior.RegisterEvents))]
     [HarmonyPrefix]
-    private static bool RegisterEventsPrefix() => ShouldRegisterNotifications(ModInformation.IsHeadless);
+    private static bool RegisterEventsPrefix() =>
+        ShouldRegisterNotifications(ModInformation.IsHeadlessServer);
 }

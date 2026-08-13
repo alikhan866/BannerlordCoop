@@ -108,6 +108,12 @@ internal class TimeControlInterface : ITimeControlInterface
                 requestedMode,
                 TimeControlEnum.Pause,
                 unpausePolicy);
+
+            // C30 - published here rather than at each handler that wants a pause, because THIS is where a
+            // pause is actually imposed. Instrumenting the handlers instead missed the dominant case: the
+            // campaign was held paused by a policy REFUSING to unpause, which no handler ever announces.
+            // One site, and it names whichever policy is responsible - including ones added later.
+            Services.Headless.CampaignPauseReason.Set($"blocked by {unpausePolicy}");
             return TimeControlEnum.Pause;
         }
 
@@ -121,6 +127,10 @@ internal class TimeControlInterface : ITimeControlInterface
                 fastForwardPolicy);
             return TimeControlEnum.Play_1x;
         }
+
+        // Nothing limited the request, so any earlier reason is stale. A reason that outlives its cause would
+        // explain away a real stall.
+        if (requestedMode != TimeControlEnum.Pause) Services.Headless.CampaignPauseReason.Clear();
 
         return requestedMode;
     }

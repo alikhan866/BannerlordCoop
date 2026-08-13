@@ -156,12 +156,21 @@ namespace Coop
 
             // Decided here rather than in NoHarmonyLoad because the UI patching just below has to know:
             // without a renderer those patches throw, and a throw would take the whole server with it.
+            // Two render-free roles, and the difference matters from here on. headlessRequested stays the
+            // SERVER answer, because everything downstream that reads it - the console, the command file, the
+            // Steam game-server boot - is server work a driven client must not do.
             headlessRequested = HeadlessServerBootstrap.IsRequested();
-            var headless = headlessRequested;
+            var headlessClient = HeadlessServerBootstrap.IsHeadlessClientRequested();
+            var headless = headlessRequested || headlessClient;
 
             // Published so GameInterface can take the render-free path - most importantly for the map
-            // scene, which vanilla cannot build without a renderer.
+            // scene, which vanilla cannot build without a renderer. True for both roles: neither has a screen.
             ModInformation.IsHeadless = headless;
+            ModInformation.IsHeadlessClient = headlessClient;
+
+            // A client that joins is not a server, and unlike ModInformation.IsServer - which is only set once
+            // a session starts - this is known now, at boot, which is when the render-free gates run.
+            if (headlessClient) isServer = false;
             GameInterface.Services.Headless.HeadlessServices.HostedSaveName = ManagedServerConfig.SaveName;
             GameInterface.Services.Headless.HeadlessServices.Install();
 
@@ -245,7 +254,13 @@ namespace Coop
             const long compactedLogFileSizeBytes = 28L * 1024 * 1024;
             var outputTemplate = "[({ProcessId}) {Timestamp:HH:mm:ss} {Level:u3} {SourceContext}] {Message:lj}{NewLine}{Exception}";
 
-            var filePostfix = isServer ? "server" : "client";
+            // Not isServer alone. A headless CLIENT runs in the engine's own dedicated-server mode, so the
+            // /server argument that sets isServer is present on both roles - which filed a driven client's log
+            // under "server", beside the real server's, where the two then fought over one name until the
+            // loser fell back to a pid suffix. Two "server" logs for a server and a client is a trap to read.
+            var filePostfix = isServer && !HeadlessServerBootstrap.IsHeadlessClientRequested()
+                ? "server"
+                : "client";
             var filePath = $"Coop_{filePostfix}.log";
 
             // File.Delete alone can't detect another live instance: it succeeds even on a file another
@@ -550,7 +565,13 @@ namespace Coop
             if (ContainerProvider.TryResolve<IGameInterface>(out var gameInterface))
                 gameInterface.PatchGameStarted();
 
-            if (ModInformation.IsClient && ContainerProvider.TryResolve<IChatService>(out var chatService))
+            // Not on a render-free process. The chat overlay builds a GauntletLayer, whose UIContext walks
+            // Widget's constructor into WidgetInfo.GetWidgetInfo - and with no Gauntlet UI loaded that
+            // dereferences null. The throw escapes through Campaign.DoLoadingForGameType and takes the whole
+            // campaign load with it, which is what stopped a headless client ever reaching the map.
+            // IsClient alone was not enough: a driven client IS a client, it just has nothing to draw on.
+            if (ModInformation.IsClient && !ModInformation.IsHeadless &&
+                ContainerProvider.TryResolve<IChatService>(out var chatService))
                 chatService.Initialize();
 
             if (gameStarterObject is CampaignGameStarter campaignGameStarter)
@@ -692,13 +713,10 @@ namespace Coop
             // /coopsave server also auto-loads without an owner-process id.
             if (!isServer || !ManagedServerConfig.HasAutoLoadSave || _managedAutoStarted) return;
 
-            // InitialState is the main menu. A windowless server never reaches it - there is no UI to show
-            // one - so waiting for it there means waiting forever. What the start actually needs is a state
-            // manager to push the loading state onto, so headless waits for that instead.
-            var atMenu = GameStateManager.Current?.ActiveState is InitialState;
-            var headlessReady = headlessRequested && GameStateManager.Current != null;
-            if (!atMenu && !headlessReady) return;
+            // Waiting for the main menu here would wait forever without a renderer; see SessionStartReadiness.
+            if (!SessionStartReadiness.CanStartSession()) return;
 
+            var atMenu = GameStateManager.Current?.ActiveState is InitialState;
             _managedAutoStarted = true;
             Logger.Information("[ManagedServer] {Trigger} — hosting save '{SaveName}'",
                 atMenu ? "InitialState active" : "headless engine ready", ManagedServerConfig.SaveName);
@@ -724,8 +742,9 @@ namespace Coop
             if (!isServer && isDeferredClientJoin) return;
 #endif
 
-            if (isAutoConnect && !_autoStarted &&
-                GameStateManager.Current?.ActiveState is InitialState)
+            // Same readiness test as the managed-server path: a headless client launched with /autoconnect but
+            // no deferred-join flag would otherwise sit waiting for a main menu that is never built.
+            if (isAutoConnect && !_autoStarted && SessionStartReadiness.CanStartSession())
             {
                 _autoStarted = true;
                 try

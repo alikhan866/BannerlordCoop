@@ -80,7 +80,9 @@ public static class SteamGameServerBoot
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void TryInitializeClientApi()
     {
-        if (!ModInformation.IsHeadless) return;
+        // A driven client joins a server; it must never BE one. IsHeadlessServer rather than IsHeadless,
+        // because both roles run render-free and only this one boots a Steam game server.
+        if (!ModInformation.IsHeadlessServer) return;
 
         try
         {
