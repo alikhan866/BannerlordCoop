@@ -122,7 +122,7 @@ internal class BattleLootApplier
     /// </remarks>
     private void MoveHero(MobileParty party, BattleLootHeroAction action)
     {
-        if (!objectManager.TryGetObject<Hero>(action.CharacterId, out var hero) || hero == null)
+        if (!TryResolveHero(objectManager, action.CharacterId, out var hero))
         {
             Logger.Warning("[Loot] Could not resolve hero {Hero}; skipping", action.CharacterId);
             return;
@@ -156,6 +156,36 @@ internal class BattleLootApplier
         }
 
         TakePrisonerAction.Apply(party.Party, hero);
+        Logger.Information("[Loot] {Hero} taken prisoner by {Party}", action.CharacterId, party.StringId);
+    }
+
+    /// <summary>
+    /// Resolves a hero loot line to its <see cref="Hero"/>.
+    /// </summary>
+    /// <remarks>
+    /// Every line of an offer - items, troops and heroes alike - is keyed by the id of the OBJECT the roster
+    /// element holds, and for a hero that object is a CharacterObject, not a Hero: the reserve builder keys
+    /// heroes by their CharacterObject id (hero CharacterObjects are registered in their own right), and
+    /// <see cref="GiveTroops"/> resolves the same field that way. Heroes are separately registered under Hero
+    /// ids, so asking for one of those with a CharacterObject id can never match.
+    ///
+    /// It did exactly that, silently: 13 offers carried heroes, all 14 claims logged "Could not resolve hero
+    /// CharacterObject_lord_..." and not one lord was ever imprisoned. The player claimed a captured lord in
+    /// the loot screen and simply did not get him.
+    ///
+    /// Resolved in one place, through the one id space the whole offer uses - deliberately NOT by trying the
+    /// Hero space as well. A reader that probes both spaces leaves the field's meaning ambiguous, which is the
+    /// defect itself rather than a fix for it.
+    /// </remarks>
+    internal static bool TryResolveHero(IObjectManager objectManager, string characterId, out Hero hero)
+    {
+        hero = null;
+        if (objectManager == null) return false;
+        if (!objectManager.TryGetObject<CharacterObject>(characterId, out var character) || character == null)
+            return false;
+
+        hero = character.HeroObject;
+        return hero != null;
     }
 
     /// <summary>Packs the party's rosters as they now stand.</summary>

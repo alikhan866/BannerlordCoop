@@ -26,8 +26,7 @@ public sealed class FixedTownNpcConversationBehavior : CampaignBehaviorBase
 
     private static void AddDialogs(CampaignGameStarter starter)
     {
-        string path = ModuleHelper.GetXmlPath("Coop", FixedTownNpcService.XmlName);
-        foreach (var definition in FixedTownNpcService.ReadDefinitions(path, Logger))
+        foreach (var definition in FixedTownNpcService.ReadDefinitions(FixedTownNpcService.GetXmlPath(), Logger))
         {
             if (string.IsNullOrWhiteSpace(definition.Dialogue)) continue;
 

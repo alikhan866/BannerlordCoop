@@ -439,6 +439,11 @@ public class MobilePartyBehaviorSnapshotTests
         }
     }
 
+    /// <remarks>
+    /// The exact-equality assertion became a StartsWith when the rejection began naming which parties diverged
+    /// rather than only how many. The count itself is unchanged, and deliberately so - see the counting rule
+    /// in TryApplyJoinBaseline.
+    /// </remarks>
     [Fact]
     public void TryApplyJoinBaseline_MissingActiveParty_ReportsActiveCount()
     {
@@ -464,7 +469,9 @@ public class MobilePartyBehaviorSnapshotTests
                 () => { });
 
             Assert.False(applied);
-            Assert.Equal(
+            // Still the active count: the inactive party here is one the baseline never names, so it is not
+            // part of what the server described and does not count against it.
+            Assert.StartsWith(
                 "party count mismatch (baseline=1, client=2)",
                 snapshot.LastJoinBaselineFailure);
         }

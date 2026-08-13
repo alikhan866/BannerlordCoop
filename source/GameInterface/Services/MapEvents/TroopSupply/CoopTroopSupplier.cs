@@ -51,6 +51,7 @@ public class CoopTroopSupplier : IMissionTroopSupplier
     private int playerOwnedPartyCount;
     private int reserveRevision;
     private int numWounded, numKilled, numRouted;
+    private bool sizingSourceReported;
     // Injected at construction (a stable per-session singleton) so the per-agent supply path resolves troop/party
     // objects without hitting the service locator each call. Null only in tests that don't exercise that path.
     private readonly IObjectManager objectManager;
@@ -528,7 +529,7 @@ public class CoopTroopSupplier : IMissionTroopSupplier
         // Only reinforcement is capped. BattleFieldRoom answers Unlimited while the opening wave is still
         // landing, because CheckDeployment skips a whole side - plan-making included - if its supplier
         // under-delivers, and a skipped side never spawns the player an agent.
-        int myQuota = RemainingFieldQuota(ResolveMapEvent());
+        int myQuota = RemainingFieldQuota();
         int capped = CapWaveToQuota(numberToAllocate, myQuota);
         if (capped != numberToAllocate)
         {
@@ -804,12 +805,39 @@ public class CoopTroopSupplier : IMissionTroopSupplier
     /// consume ours. Unlimited passes straight through: it means no sizing exists yet, and deployment must not
     /// be short-changed.
     /// </remarks>
-    public int RemainingFieldQuota(MapEvent mapEvent)
+    public int RemainingFieldQuota()
     {
-        var target = BattleFieldRoom.SideTarget(mapEvent, Side);
+        var target = BattleFieldRoom.SideTarget(objectManager, MapEventId, Side);
         if (target == BattleFieldRoom.Unlimited) return BattleFieldRoom.Unlimited;
 
+        ReportSizingSourceOnce(target);
+
         return Math.Max(0, OwnedShareOf(target) - CountMyTroopsOnField(Mission.Current));
+    }
+
+    /// <summary>
+    /// Says once per battle which of the two strength figures the cap is being computed from.
+    /// </summary>
+    /// <remarks>
+    /// The campaign's live count is used while it exists and the committed reserve only when it does not, and
+    /// the two do not have to agree: the reserve is the opening headcount and is never extended, so a side
+    /// reinforced mid-battle has moved on from it. Printing both, once, is what makes a battle that reinforced
+    /// oddly readable afterwards without having to reproduce it - and it is the line that says out loud when a
+    /// battle has lost its campaign event and is being sized from the reserve instead.
+    /// </remarks>
+    private void ReportSizingSourceOnce(int target)
+    {
+        if (sizingSourceReported) return;
+        sizingSourceReported = true;
+
+        var mapEvent = ResolveMapEvent();
+        int campaignTotal = mapEvent?.GetMapEventSide(Side)?.TroopCount ?? -1;
+
+        Logger.Information(
+            "[TroopSupply] {MapEvent} side {Side}: target {Target}, sized from {Source} (campaign says {Campaign}, reserve holds {Reserve})",
+            MapEventId, Side, target,
+            campaignTotal > 0 ? "the campaign" : "the RESERVE - this battle has no live map event",
+            campaignTotal, SideTotalTroops);
     }
 
     /// <summary>Live men on the field that came out of THIS supplier's reserve.</summary>

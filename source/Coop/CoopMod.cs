@@ -718,7 +718,11 @@ namespace Coop
         {
             // The auto-load-save start path owns this process's startup.
             if (ManagedServerConfig.HasAutoLoadSave) return;
+#if DEBUG
+            // Deferred client join is a live-test facility and its flag only exists in DEBUG, where the field
+            // is declared. Release has no deferred join to yield to.
             if (!isServer && isDeferredClientJoin) return;
+#endif
 
             if (isAutoConnect && !_autoStarted &&
                 GameStateManager.Current?.ActiveState is InitialState)

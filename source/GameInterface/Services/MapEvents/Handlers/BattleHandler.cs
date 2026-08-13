@@ -50,6 +50,7 @@ internal class BattleHandler : IHandler
     private readonly IMapEventLogger mapEventLogger;
     private readonly IPlayerManager playerRegistry;
     private readonly ITimeControlInterface timeControlInterface;
+    private readonly IFinalizedBattleRetention finalizedBattles;
 
     // Server-side: number of players in a map event at the last broadcast, used to
     // detect when fast-forward becomes (un)available and to keep clients informed.
@@ -61,7 +62,8 @@ internal class BattleHandler : IHandler
         INetwork network,
         IMapEventLogger mapEventLogger,
         IPlayerManager playerRegistry,
-        ITimeControlInterface timeControlInterface)
+        ITimeControlInterface timeControlInterface,
+        IFinalizedBattleRetention finalizedBattles)
     {
         this.messageBroker = messageBroker;
         this.objectManager = objectManager;
@@ -69,6 +71,7 @@ internal class BattleHandler : IHandler
         this.mapEventLogger = mapEventLogger;
         this.playerRegistry = playerRegistry;
         this.timeControlInterface = timeControlInterface;
+        this.finalizedBattles = finalizedBattles;
         messageBroker.Subscribe<PlayerJoinedBattle>(Handle_PlayerJoinedBattle);
         messageBroker.Subscribe<PlayerReconnectedToMapEvent>(Handle_PlayerReconnectedToMapEvent);
 
@@ -247,10 +250,29 @@ internal class BattleHandler : IHandler
         if (!objectManager.TryGetId(mapEvent, out var mapEventId)) return;
         if (!PlayersInBattleMissions.HasFightingMembers(mapEventId)) return;
 
+        // Classified rather than suppressed. Every battle ends this way - the map event is finalized while the
+        // player is still standing on the loot screen - so on its own this line fires constantly and says
+        // nothing: ten of them in one evening, all harmless. The one that matters is the battle finalized
+        // BEFORE it resolved, and the two are told apart by whether a winner was ever decided.
+        //
+        // Suppressing the harmless case was the obvious move and is the wrong one: a finalize that follows a
+        // conclusion can still be early, and a filter would hide exactly that. Classify, and let a grep pick.
+        //
+        // The stack is here because the alternative was guessing. When this last happened the trigger was
+        // never established - the log named the effect and nothing else, and by the time it was investigated
+        // the window had rotated away. Seven vanilla paths finalize a map event; this records which one.
+        bool resolved = mapEvent.WinningSide != BattleSideEnum.None;
+
         Logger.Warning(
-            "[MapEvent] {MapEventId} was FINALIZED while players are still in its battle mission. " +
-            "Their fight continues with no campaign event behind it, so its result has nowhere to commit",
-            mapEventId);
+            "[MapEvent] {MapEventId} was FINALIZED while players are still in its battle mission " +
+            "(finalizedBeforeConclusion={Premature}, winner={Winner}). Caller:\n{Stack}",
+            mapEventId, !resolved, mapEvent.WinningSide, System.Environment.StackTrace);
+
+        // Hold the object itself. The registry has dropped it, so when these players finish their fight the
+        // conclusion will find nothing to commit into and the win is discarded outright - the result cannot be
+        // replayed from data, because committing it means running the native cascade against this graph.
+        // Only the unresolved case: a battle that already has a winner has committed whatever it is going to.
+        if (!resolved) finalizedBattles.Retain(mapEventId, mapEvent);
     }
 
     private void Handle_TimeSpeedChangedAttempted(MessagePayload<TimeSpeedChangedAttempted> payload)

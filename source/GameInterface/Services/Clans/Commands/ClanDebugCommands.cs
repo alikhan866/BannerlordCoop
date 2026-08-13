@@ -115,6 +115,71 @@ namespace GameInterface.Services.GameDebug.Commands
             return stringBuilder.ToString();
         }
 
+        // coop.debug.clan.watch <clanNameOrId>
+        /// <summary>
+        /// Starts recording, once an in-game hour, what a clan's lords are actually doing.
+        /// </summary>
+        /// <remarks>
+        /// For the question "that clan looks idle - is it?", which cannot be answered from inside the game: a
+        /// clan with no parties, one whose parties never think, and one whose parties are held still all look
+        /// the same on the map and need different fixes. The report writes the few facts that separate them.
+        ///
+        /// Put it in the launcher's PostStartCommands to survive restarts, then read a day of it with
+        /// Scripts\Clan-Activity-Report.ps1.
+        /// </remarks>
+        [CommandLineArgumentFunction("watch", "coop.debug.clan")]
+        public static string WatchClan(List<string> args)
+        {
+            if (args == null || args.Count == 0)
+                return "Usage: coop.debug.clan.watch <clan name or id>";
+
+            var name = string.Join(" ", args).Trim();
+            var added = Clans.Handlers.ClanActivityWatchHandler.Watch(name);
+
+            // Report immediately as well: waiting an in-game hour to find out whether the name even matched a
+            // clan is a poor way to learn you typed it wrong.
+            Clans.Handlers.ClanActivityWatchHandler.ReportAll();
+
+            return added
+                ? $"Watching '{name}'. Hourly [ClanWatch] lines are in the server log; a first report was written now."
+                : $"Already watching '{name}'; a report was written now.";
+        }
+
+        // coop.debug.clan.watch_off [clanNameOrId]
+        [CommandLineArgumentFunction("watch_off", "coop.debug.clan")]
+        public static string UnwatchClan(List<string> args)
+        {
+            var name = args == null || args.Count == 0 ? null : string.Join(" ", args).Trim();
+            var removed = Clans.Handlers.ClanActivityWatchHandler.Unwatch(name);
+
+            if (name == null) return removed ? "Stopped watching every clan." : "No clans were being watched.";
+
+            return removed ? $"Stopped watching '{name}'." : $"'{name}' was not being watched.";
+        }
+
+        // coop.debug.clan.watch_list
+        [CommandLineArgumentFunction("watch_list", "coop.debug.clan")]
+        public static string ListWatchedClans(List<string> args)
+        {
+            var watching = Clans.Handlers.ClanActivityWatchHandler.Watching;
+
+            return watching.Count == 0
+                ? "No clans are being watched."
+                : "Watching: " + string.Join(", ", watching);
+        }
+
+        // coop.debug.clan.watch_now
+        [CommandLineArgumentFunction("watch_now", "coop.debug.clan")]
+        public static string ReportWatchedClansNow(List<string> args)
+        {
+            var watching = Clans.Handlers.ClanActivityWatchHandler.Watching;
+            if (watching.Count == 0) return "No clans are being watched; nothing to report.";
+
+            Clans.Handlers.ClanActivityWatchHandler.ReportAll();
+
+            return "Wrote a [ClanWatch] report for: " + string.Join(", ", watching);
+        }
+
         // coop.debug.clan.info <clanId>
         /// <summary>
         /// Reflection-dumps every field of a Clan so a server screenshot and a client screenshot can be

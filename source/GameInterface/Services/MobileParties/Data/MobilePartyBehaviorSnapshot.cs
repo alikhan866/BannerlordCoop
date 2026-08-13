@@ -297,13 +297,22 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
         // against it: CampaignObjectManager.MobileParties holds only ACTIVE parties, so a party the
         // joiner has but has deactivated is missing from every count and every walk of that
         // collection. Reconciling here is what makes the comparison below meaningful.
-        ApplyServerActivation(states, parties);
+        var baselineParties = ApplyServerActivation(states, parties);
 
+        // Active, OR named by this baseline. Those are two different reasons for a party to be part of the
+        // world the two sides are agreeing on, and taking only the first breaks the second: a party the SERVER
+        // says is inactive is deactivated a line above, would drop out of an active-only set, and would then
+        // be rejected three times over - as a count mismatch, as "not in the client campaign collection", and
+        // as a coverage mismatch - for having been made correct.
+        //
+        // An inactive party the baseline never mentions is the opposite case and still does not count: it is
+        // not part of what the server described, so it must not be measured against it.
         var liveParties = new HashSet<MobileParty>();
         for (int i = 0; i < parties.Count; i++)
         {
             MobileParty party = parties[i];
-            if (party?.IsActive == true) liveParties.Add(party);
+            if (party == null) continue;
+            if (party.IsActive || baselineParties.Contains(party)) liveParties.Add(party);
         }
 
         if (states.Length != liveParties.Count)
@@ -442,10 +451,12 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
         }
     }
 
-    private void ApplyServerActivation(MobilePartyJoinState[] states, IEnumerable<MobileParty> parties)
+    /// <summary>Returns the client parties this baseline names, whatever their activation ended up as.</summary>
+    private HashSet<MobileParty> ApplyServerActivation(MobilePartyJoinState[] states, IEnumerable<MobileParty> parties)
     {
+        var baselineParties = new HashSet<MobileParty>();
         var campaignObjectManager = Campaign.Current?.CampaignObjectManager;
-        if (campaignObjectManager == null) return;
+        if (campaignObjectManager == null) return baselineParties;
 
         var inCollection = new HashSet<MobileParty>(parties);
         int changed = 0;
@@ -458,6 +469,8 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
                 var id = state.Behavior.MobilePartyId;
                 if (string.IsNullOrEmpty(id)) continue;
                 if (!objectManager.TryGetObject(id, out MobileParty party) || party == null) continue;
+
+                baselineParties.Add(party);
 
                 bool present = inCollection.Contains(party);
                 if (party.IsActive == state.IsActive && present) continue;
@@ -481,6 +494,8 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
                 changed,
                 firstChange);
         }
+
+        return baselineParties;
     }
 
     /// <summary>

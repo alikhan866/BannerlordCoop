@@ -25,9 +25,11 @@ internal class MapEventHandler : IHandler
     private readonly IMapEventLogger mapEventLogger;
     private readonly IBattleHostRegistry hostRegistry;
     private readonly IPlayerManager playerManager;
+    private readonly IFinalizedBattleRetention finalizedBattles;
 
     public MapEventHandler(IMessageBroker messageBroker, INetwork network, IObjectManager objectManager,
-        IMapEventLogger mapEventLogger, IBattleHostRegistry hostRegistry, IPlayerManager playerManager)
+        IMapEventLogger mapEventLogger, IBattleHostRegistry hostRegistry, IPlayerManager playerManager,
+        IFinalizedBattleRetention finalizedBattles)
     {
         this.messageBroker = messageBroker;
         this.network = network;
@@ -35,6 +37,7 @@ internal class MapEventHandler : IHandler
         this.mapEventLogger = mapEventLogger;
         this.hostRegistry = hostRegistry;
         this.playerManager = playerManager;
+        this.finalizedBattles = finalizedBattles;
 
         messageBroker.Subscribe<MapEventBattleStateChangeAttempted>(Handle_MapEventBattleStateChangeAttempted);
         messageBroker.Subscribe<NetworkChangeBattleState>(Handle_NetworkChangeBattleState);
@@ -120,7 +123,24 @@ internal class MapEventHandler : IHandler
             try
             {
                 if (!objectManager.TryGetObjectWithLogging(mapEventId, out mapEvent))
-                    return;
+                {
+                    // The registry has dropped it, which for a battle players were still fighting means the
+                    // event was finalized underneath their live mission. Their result would otherwise be
+                    // discarded outright - measured live as a DefenderVictory refused three times, no
+                    // casualties applied, and the beaten army walking away whole.
+                    //
+                    // Committing means running the native cascade against the object, so the only thing that
+                    // can carry it is the object itself, held since the finalize. It may refuse: the guard
+                    // below catches a throw and leaves `applied` false, which is exactly where we already are
+                    // without this. There is nothing to lose by trying and a whole battle to win.
+                    if (!finalizedBattles.TryGet(mapEventId, out mapEvent) || mapEvent == null)
+                        return;
+
+                    Logger.Warning(
+                        "Committing {BattleState} for {MapEventId} against the map event retained when it was " +
+                        "finalized mid-mission; the registry no longer has it",
+                        battleState, mapEventId);
+                }
 
                 mapEventLogger.DebugMapEvent(mapEvent,
                     "Applying network battle state change. BattleState={BattleState}",
@@ -192,6 +212,10 @@ internal class MapEventHandler : IHandler
             finally
             {
                 applied |= mapEvent?.BattleState == battleState;
+
+                // Whether it committed or refused, this battle has had its one attempt; holding the object any
+                // longer only pins its graph.
+                if (applied) finalizedBattles.Release(mapEventId);
                 // Victory finalization is separate from the native result commit, so run it even if a later
                 // callback in the BattleState setter threw after the state itself changed.
                 if (applied && publishConclusion)

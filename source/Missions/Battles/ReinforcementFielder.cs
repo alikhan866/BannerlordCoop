@@ -712,14 +712,18 @@ public class ReinforcementFielder : IReinforcementFielder
         // missions run this way deliberately.
         if (spawnLogic == null) return int.MaxValue;
 
-        // An unresolvable map event is the opposite: the sizing exists, we simply cannot read the numbers that
-        // define it this instant. That must FAIL CLOSED. It used to return int.MaxValue too, and in the window
-        // where the map event would not resolve the fielder had no cap at all - 840 troops in a single minute,
-        // the attacker side reaching 1,072 on a battle sized for 400. Refusing to field for a moment costs a
+        // Not knowing the two sides' strengths is the opposite: the sizing exists, we simply cannot read the
+        // numbers that define it. That must FAIL CLOSED. It used to return int.MaxValue, and in the window
+        // where they could not be read the fielder had no cap at all - 840 troops in a single minute, the
+        // attacker side reaching 1,072 on a battle sized for 400. Refusing to field for a moment costs a
         // second of reinforcement; guessing cost the battle.
-        if (!objectManager.TryGetObject<MapEvent>(session.InstanceId, out var mapEvent))
+        //
+        // Read from the reserves rather than the map event. Asking the campaign was the second place a battle
+        // finalized underneath its own live mission froze reinforcement: this method takes the TIGHTER of the
+        // side room and the supplier's quota, so a zero here defeated the supplier's own fix on its own.
+        if (!BattleFieldRoom.TryReadSideTotals(objectManager, session.InstanceId, out var defenderTotal, out var attackerTotal))
         {
-            Logger.Warning("[BattleSync] Cannot resolve map event {MapEventId}; refusing to field reinforcements until it resolves", session.InstanceId);
+            Logger.Warning("[BattleSync] No reserve totals for {MapEventId}; refusing to field reinforcements until they land", session.InstanceId);
             return 0;
         }
 
@@ -732,8 +736,8 @@ public class ReinforcementFielder : IReinforcementFielder
 
         var settings = spawnLogic.SpawnSettings;
         var targets = RecoveryTargets.Calculate(
-            LiveSideStrength(mapEvent, BattleSideEnum.Defender),
-            LiveSideStrength(mapEvent, BattleSideEnum.Attacker),
+            defenderTotal,
+            attackerTotal,
             spawnLogic.BattleSize,
             settings.MaximumBattleSideRatio,
             settings.DefenderAdvantageFactor);
@@ -751,7 +755,7 @@ public class ReinforcementFielder : IReinforcementFielder
         // and cannot crowd out another client filling its own.
         foreach (var supplier in CoopTroopSupplierRegistry.GetSuppliers(session.InstanceId))
             if (supplier.Side == side)
-                return EffectiveAllowance(sideRoom, supplier.RemainingFieldQuota(mapEvent));
+                return EffectiveAllowance(sideRoom, supplier.RemainingFieldQuota());
 
         // No supplier for this side means nobody else is drawing against it here; the side-wide room is the
         // only bound, which is the behaviour before quotas existed.
@@ -782,10 +786,6 @@ public class ReinforcementFielder : IReinforcementFielder
     /// </remarks>
     internal static int EffectiveAllowance(int sideRoom, int ownQuota)
         => Math.Max(0, Math.Min(sideRoom, ownQuota));
-
-    /// <summary>Men a side currently has in the battle, including parties that joined after it began.</summary>
-    private static int LiveSideStrength(MapEvent mapEvent, BattleSideEnum side)
-        => mapEvent?.GetMapEventSide(side)?.TroopCount ?? 0;
 
     /// <summary>Room left on a side: its battle-size target less what is already standing on the field.</summary>
     internal static int RemainingFieldingAllowance(int sideTarget, int activeOnSide)

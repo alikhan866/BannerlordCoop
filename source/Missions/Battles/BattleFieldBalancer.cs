@@ -101,12 +101,16 @@ public class BattleFieldBalancer : IBattleFieldBalancer
         // engine to spawn replacements a moment later.
         if (!spawnLogic.IsInitialSpawnOver) return;
         if (!session.HasInstance) return;
-        if (!objectManager.TryGetObject<MapEvent>(session.InstanceId, out var mapEvent)) return;
+
+        // From the reserves, like the supplier and the fielder. Reading the campaign made this the third thing
+        // to go silent when a battle was finalized underneath its own live mission - and a balancer that stops
+        // is not merely idle: nothing then trims a side back to the battle size.
+        if (!BattleFieldRoom.TryReadSideTotals(objectManager, session.InstanceId, out var defenderTotal, out var attackerTotal)) return;
 
         var settings = spawnLogic.SpawnSettings;
         var targets = ReinforcementFielder.RecoveryTargets.Calculate(
-            mapEvent.GetMapEventSide(BattleSideEnum.Defender)?.TroopCount ?? 0,
-            mapEvent.GetMapEventSide(BattleSideEnum.Attacker)?.TroopCount ?? 0,
+            defenderTotal,
+            attackerTotal,
             spawnLogic.BattleSize,
             settings.MaximumBattleSideRatio,
             settings.DefenderAdvantageFactor);

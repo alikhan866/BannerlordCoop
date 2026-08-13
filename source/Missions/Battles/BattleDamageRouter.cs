@@ -641,7 +641,6 @@ public class BattleDamageRouter : IBattleDamageRouter
         ReportedUnkillable.Clear();
     }
 
-    private void TryApplyNetworkDamage(NetworkApplyBattleDamage damage)
     private void TryApplyNetworkDamage(
         NetworkApplyBattleDamage damage,
         bool authorityWasVerified)

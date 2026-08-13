@@ -29,8 +29,32 @@ internal sealed class FixedTownNpcService
     private readonly Lazy<IReadOnlyList<FixedTownNpcDefinition>> definitions;
 
     public FixedTownNpcService(ILogger logger, IObjectManager objectManager)
-        : this(logger, objectManager, () => ModuleHelper.GetXmlPath("Coop", XmlName))
+        : this(logger, objectManager, GetXmlPath)
     {
+    }
+
+    /// <summary>
+    /// Finds our own ModuleData XML, whatever the module folder happens to be called.
+    /// </summary>
+    /// <remarks>
+    /// The module id is not a constant. A test or share build installs the same module under a different
+    /// folder - CoopFixes rather than Coop - and <see cref="ModuleHelper.GetXmlPath"/> throws
+    /// KeyNotFoundException for an id that is not loaded rather than returning a path that does not exist.
+    /// That threw out of OnSessionLaunched, which the engine does not guard, so a renamed folder killed the
+    /// campaign during load with nothing in the log but an exit code.
+    ///
+    /// Asking the loaded modules removes the assumption entirely, and a genuinely absent file now falls
+    /// through to <see cref="ReadDefinitions"/>, which already warns and carries on with no NPCs.
+    /// </remarks>
+    internal static string GetXmlPath()
+    {
+        foreach (var module in ModuleHelper.GetActiveModules())
+        {
+            var path = Path.Combine(ModuleHelper.GetModuleFullPath(module.Id), "ModuleData", XmlName + ".xml");
+            if (File.Exists(path)) return path;
+        }
+
+        return null;
     }
 
     internal FixedTownNpcService(ILogger logger, IObjectManager objectManager, Func<string> pathProvider)

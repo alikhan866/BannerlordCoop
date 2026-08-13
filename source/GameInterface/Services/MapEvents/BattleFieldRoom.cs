@@ -1,5 +1,7 @@
-using System;
+﻿using GameInterface.Services.MapEvents.TroopSupply;
+using GameInterface.Services.ObjectManager;
 using TaleWorlds.CampaignSystem.MapEvents;
+using System;
 using TaleWorlds.Core;
 using TaleWorlds.MountAndBlade;
 
@@ -51,9 +53,9 @@ public static class BattleFieldRoom
     /// That fails CLOSED, because the one time it failed open the attacker side reached 1,072 on a battle sized
     /// for 400.
     /// </remarks>
-    public static int Remaining(MapEvent mapEvent, BattleSideEnum side)
+    public static int Remaining(IObjectManager objectManager, string mapEventId, BattleSideEnum side)
     {
-        var target = SideTarget(mapEvent, side);
+        var target = SideTarget(objectManager, mapEventId, side);
         if (target == Unlimited) return Unlimited;
 
         return RoomLeft(target, CountActiveHumans(Mission.Current, side));
@@ -76,23 +78,88 @@ public static class BattleFieldRoom
     /// Dividing the TARGET instead gives every owner a private quota it fills at its own pace, and nobody can
     /// be starved by being slower to ask.
     /// </remarks>
-    public static int SideTarget(MapEvent mapEvent, BattleSideEnum side)
+    public static int SideTarget(IObjectManager objectManager, string mapEventId, BattleSideEnum side)
     {
         var mission = Mission.Current;
         var spawnLogic = mission?.GetMissionBehavior<DefaultBattleMissionAgentSpawnLogic>();
         if (spawnLogic == null) return Unlimited;
         if (!spawnLogic.IsInitialSpawnOver) return Unlimited;
-        if (mapEvent == null) return 0;
+        if (!TryReadSideTotals(objectManager, mapEventId, out var defenderTotal, out var attackerTotal)) return 0;
 
         var settings = spawnLogic.SpawnSettings;
         var targets = BattleSizeTargets.Calculate(
-            mapEvent.GetMapEventSide(BattleSideEnum.Defender)?.TroopCount ?? 0,
-            mapEvent.GetMapEventSide(BattleSideEnum.Attacker)?.TroopCount ?? 0,
+            defenderTotal,
+            attackerTotal,
             spawnLogic.BattleSize,
             settings.MaximumBattleSideRatio,
             settings.DefenderAdvantageFactor);
 
         return targets.For(side);
+    }
+
+    /// <summary>
+    /// The two sides' strengths: the battle's live campaign strength, or the committed reserves when the
+    /// campaign can no longer answer.
+    /// </summary>
+    /// <remarks>
+    /// Both sources are wrong in a different way, so the order matters and neither may be dropped.
+    ///
+    /// The campaign is the better number while it exists, because it is LIVE. Reserves are built once, at
+    /// entry or host election, and are not extended when a side is reinforced afterwards - so sizing from them
+    /// bounds a side by the men it happened to start with, and a relief force of twelve lords arriving
+    /// mid-battle ends up unable to field anyone at all. That is why this reads the map event first.
+    ///
+    /// But the map event can stop existing while its mission is still being fought: finalized underneath a
+    /// live mission, it leaves every lookup failing while the fight carries on. All three sizing consumers
+    /// then read zero, and zero here does not mean "hold back" - it means the side may never field another
+    /// man. Measured live: both sides frozen for three and a half minutes holding 1,123 and 1,293 troops in
+    /// reserve, and an enemy army that survived because its men could never reach the field.
+    ///
+    /// The opening headcount is the wrong number in exactly the way described above, and still far better than
+    /// none: the battle stays fightable instead of stalling at whoever happened to be standing when the
+    /// campaign object went away.
+    ///
+    /// With neither available it fails CLOSED, which is what the original guard existed for: the one time this
+    /// failed open, the attacker side reached 1,072 on a battle sized for 400.
+    /// </remarks>
+    internal static bool TryReadSideTotals(IObjectManager objectManager, string mapEventId,
+        out int defenderTotal, out int attackerTotal)
+    {
+        defenderTotal = 0;
+        attackerTotal = 0;
+
+        // The campaign first, and deliberately so. The reserves are built once, at entry or host election, and
+        // are NOT extended when a side is reinforced afterwards - so a relief force that arrives mid-battle is
+        // invisible to them, and sizing from them bounds a side by the men it happened to start with. That was
+        // measured: twelve lords joining a battle, and the side unable to field anyone at all.
+        if (objectManager != null && !string.IsNullOrEmpty(mapEventId) &&
+            objectManager.TryGetObject<MapEvent>(mapEventId, out var mapEvent) && mapEvent != null)
+        {
+            defenderTotal = mapEvent.GetMapEventSide(BattleSideEnum.Defender)?.TroopCount ?? 0;
+            attackerTotal = mapEvent.GetMapEventSide(BattleSideEnum.Attacker)?.TroopCount ?? 0;
+            if (defenderTotal > 0 || attackerTotal > 0) return true;
+        }
+
+        // Only once the campaign cannot answer. A map event finalized underneath its own live mission stops
+        // resolving while the fight carries on, and every sizing consumer then read zero - which does not mean
+        // "hold back", it means the side may never field another man. Measured live: both sides frozen for
+        // three and a half minutes holding 1,123 and 1,293 troops in reserve.
+        //
+        // The opening headcount is the wrong number in the ways described above, and it is still enormously
+        // better than none: the battle stays fightable instead of stalling at whoever happened to be standing.
+        if (string.IsNullOrEmpty(mapEventId)) return false;
+
+        foreach (var supplier in CoopTroopSupplierRegistry.GetSuppliers(mapEventId))
+        {
+            // An unpopulated supplier has not been told its side's strength yet, and its zero would size the
+            // battle as if that side were empty.
+            if (supplier == null || !supplier.IsPopulated) continue;
+
+            if (supplier.Side == BattleSideEnum.Defender) defenderTotal = supplier.SideTotalTroops;
+            else if (supplier.Side == BattleSideEnum.Attacker) attackerTotal = supplier.SideTotalTroops;
+        }
+
+        return defenderTotal > 0 || attackerTotal > 0;
     }
 
     /// <summary>Room left on a side: its target less what is already standing, never negative.</summary>
