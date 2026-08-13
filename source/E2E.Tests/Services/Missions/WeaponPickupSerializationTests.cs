@@ -135,22 +135,11 @@ public class WeaponPickupSerializationTests
         Assert.Equal(typeof(string), item!.PropertyType);
     }
 
-    [Fact]
-    public void AnItemWithNoStringIdIsSentAsNoItem()
-    {
-        // An id the far side cannot resolve is worse than none: it would equip a weapon nobody else can see.
-        var item = ObjectHelper.SkipConstructor<ItemObject>();
-
-        Assert.Null(WeaponPickupHandler.ItemIdOf(item));
-        Assert.Null(WeaponPickupHandler.ItemIdOf(null));
-    }
-
-    [Fact]
-    public void ResolvingAnAbsentIdYieldsAnEmptyWeaponRatherThanThrowing()
-    {
-        // Runs with no MBObjectManager instance, which is also what a mid-teardown mission looks like. The
-        // receive path must degrade to an empty slot, not take down the handler.
-        Assert.Null(WeaponPickupHandler.ResolveItem(null));
-        Assert.Null(WeaponPickupHandler.ResolveItem(string.Empty));
-    }
+    // The two tests that stood here covered WeaponPickupHandler.ItemIdOf/ResolveItem, which resolved items
+    // through MBObjectManager. Development's rework routes the id through the coop object manager instead and
+    // adds world-item tracking those helpers had no equivalent for, so they went with the merge rather than
+    // being kept as an unused second way of doing the same thing.
+    //
+    // What they were guarding has not gone anywhere: the test above still fails if ItemObjectId is ever
+    // re-typed back to ItemObject, which is the mistake that took the whole message off the wire.
 }

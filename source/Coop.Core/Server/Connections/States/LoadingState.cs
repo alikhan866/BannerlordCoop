@@ -54,6 +54,13 @@ public class LoadingState : ConnectionStateBase
     /// which parties diverged, so a disconnect leaves a diagnosis behind rather than a hang.
     /// </remarks>
     private const int MaxBaselinesWithoutProgress = 25;
+#if DEBUG
+    private int totalBaselinesSent;
+
+    internal string DebugJoinState =>
+        $"phase={phase} initialBaselinesSent={initialBaselinesSent} " +
+        $"totalBaselinesSent={totalBaselinesSent} joinCatchUpPending={IsJoinCatchUpPending}";
+#endif
 
     public LoadingState(
         IConnectionLogic connectionLogic,
@@ -170,6 +177,9 @@ public class LoadingState : ConnectionStateBase
             coalescer.Flush(network);
             connectionMessageQueue.Flush(peer);
             if (!isFinal) initialBaselinesSent++;
+#if DEBUG
+            totalBaselinesSent++;
+#endif
             phase = waiting;
             campaignBaselineSender.Send(peer);
         }, context: context);

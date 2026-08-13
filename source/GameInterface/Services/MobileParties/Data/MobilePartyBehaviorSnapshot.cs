@@ -299,14 +299,20 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
         // collection. Reconciling here is what makes the comparison below meaningful.
         ApplyServerActivation(states, parties);
 
-        if (states.Length != parties.Count)
+        var liveParties = new HashSet<MobileParty>();
+        for (int i = 0; i < parties.Count; i++)
+        {
+            MobileParty party = parties[i];
+            if (party?.IsActive == true) liveParties.Add(party);
+        }
+
+        if (states.Length != liveParties.Count)
         {
             return RejectJoinBaseline(
-                $"party count mismatch (baseline={states.Length}, client={parties.Count}); " +
+                $"party count mismatch (baseline={states.Length}, client={liveParties.Count}); " +
                 DescribeDivergence(states, parties));
         }
 
-        var liveParties = new HashSet<MobileParty>(parties);
         var liveSettlements = new HashSet<Settlement>(settlements);
         var seenParties = new HashSet<MobileParty>();
         var resolved = new ResolvedBehaviorUpdate[states.Length];
