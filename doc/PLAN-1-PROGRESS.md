@@ -4,19 +4,43 @@ Tracks `PLAN-1-headless-client.md` capability by capability. Each entry records 
 verified, or why it is blocked.
 
 **Rig code lives outside the repo** at `Desktop\Bannerlord co op\Rig\`, alongside the launcher, because
-dedicated-client tooling does not go into source control. Mod-side changes needed for the headless client role
-live in the repo but stay uncommitted.
+dedicated-client tooling does not go into source control. The mod-side changes were pushed to the personal fork
+`alikhan866/BannerlordCoop` on branch `coop-kingdom-barter-and-2607-fixes` (commit `8ac0847d3`); nothing has
+gone to the upstream team repository.
+
+## All 56 capabilities are implemented
 
 | Group | Capabilities | State |
 |---|---|---|
+| A - Run headless | C1-C6 | **DONE** |
 | B - Sandbox | C7-C10 | **DONE** |
-| A - Run headless | C1-C6 | in progress |
-| C - Act | C11-C21 | not started |
-| D - Observe | C22-C27 | not started |
-| E - Detect stalls | C28-C33 | not started |
-| F - Compare | C34-C41 | not started |
-| G - Explore | C42-C51 | not started |
-| H - Harness | C52-C56 | not started |
+| C - Act | C11-C21 | **DONE** |
+| D - Observe | C22-C27 | **DONE** |
+| E - Detect stalls | C28-C33 | **DONE** |
+| F - Compare | C34-C41 | **DONE** |
+| G - Explore | C42-C51 | **DONE** |
+| H - Harness | C52-C56 | **DONE** |
+
+### Implemented is not the same as exercised
+
+The verification behind these entries is uneven, and the difference is the most important thing on this page.
+
+**Proven without the game** - 121 rig self-checks (scenario format, runner, failure bundle, soak trends) and 19
+unit tests (fixture undo log, RNG seeding). Full suite 1101 passed, 1 failed - `TryCreate_UnregisteredInteractable`,
+a known pre-existing failure. Release and Debug builds clean.
+
+**Proven against a live rig** - headless boot, join, character resolution, campaign load, join completion, the
+campaign clock, the control channel, C11 state queries against the fixture campaign, C14 position movement
+(drift settling to 0.0000), and the launcher's process classification.
+
+**Build-verified only, never executed** - the **42 `coop.debug.*` commands** added for C12-C21, plus C53's
+screenshot round trip, C55's headless-client launch and C56's soak. Compiling proves the API shapes are right
+and nothing about runtime: game-state assumptions, null paths, thread affinity, or whether changes replicate.
+Three real bugs in that batch were caught by *reading* (the `bitCode` bitmask, wounded troops arriving healthy,
+`ExplainedNumber` vs `int`); a live pass should be expected to surface more.
+
+An end-to-end run is the open item. Each entry below states its own verification, so no capability's status has
+to be inferred from this summary.
 
 ---
 
@@ -185,7 +209,11 @@ So there was never anything to observe, and adding an observable would only have
 capability was rewritten to what it actually needs to mean - render-free and ready to start a session - and the
 readiness test is a game state manager, which the working server has always relied on.
 
-### C4 - Join programmatically - CODE LANDED, live join not yet run
+### C4 - Join programmatically - DONE
+
+*(Heading corrected. It read "CODE LANDED, live join not yet run" for most of the plan, which stopped being
+true early on: the join completes, and every capability after this one was exercised through a joined client.
+The stale wording survived because nothing forced a re-read of an entry already written.)*
 
 **The rig runs the CoopDebug module in Debug, and that is a finding rather than a preference.** Everything that
 can drive a client is `#if DEBUG`: `LiveTestControlServer` and its named pipe, the `join` verb,
@@ -2638,14 +2666,16 @@ Full regression across the rig: **121 checks, 0 failed** (C52 34, C53 32, C54 27
 
 A first draft of this line claimed "55 of 56 DONE". That was wrong, and worth recording as a caution: the count
 came from a running tally rather than from the document, and a tally that drifts always drifts optimistic.
-Counted against the plan, **48 of 56** are recorded DONE and **Group C is the hole**.
+Counted against the plan at the time, **48 of 56** were recorded DONE and **Group C was the hole**.
+*(Superseded: Group C was finished afterwards - C12-C21 all have entries below. Kept because the counting
+mistake it records is the point, not the number.)*
 
 | A - Run headless | C1-C6 | done (C4's heading still says "live join not yet run"; the join has since completed) |
 | B - Sandbox | C7-C10 | done |
 | **C - Act** | **C11-C21** | **partial - see below** |
 | D - Observe | C22-C27 | done |
-| E - Watchdog | C28-C34 | done |
-| F - Compare | C35-C41 | done |
+| E - Detect stalls | C28-C33 | done |
+| F - Compare | C34-C41 | done |
 | G - Explore | C42-C51 | done |
 | H - Harness | C52-C56 | done |
 
