@@ -151,7 +151,7 @@ public class BattleRoundRestartTests
         // top. Without the rewind the second round could only field what the first had not yet reached, and a
         // side that had already committed most of its men would re-form nearly empty.
         var supplier = new CoopTroopSupplier("M1", BattleSideEnum.Attacker, null, new BattleAgentBudget());
-        supplier.SetReserve(new[] { Party("A", 10) });
+        supplier.SetReserve(new[] { Party("A", 10) }, sideTotal: 10, playerOwnedParties: 0, authoritativeBattleSize: 0);
         supplier.SupplyTroops(8);
 
         Assert.Equal(2, supplier.NumTroopsNotSupplied);
@@ -168,7 +168,7 @@ public class BattleRoundRestartTests
         // The ledger tracks reserves by revision; a rewind that kept the old one would read as "nothing
         // changed" and the server's view of who is on the field would drift from the clients'.
         var supplier = new CoopTroopSupplier("M1", BattleSideEnum.Attacker, null, new BattleAgentBudget());
-        supplier.SetReserve(new[] { Party("A", 4) });
+        supplier.SetReserve(new[] { Party("A", 4) }, sideTotal: 4, playerOwnedParties: 0, authoritativeBattleSize: 0);
         var before = supplier.ReserveRevision;
 
         supplier.RewindForRoundRestart();
@@ -182,7 +182,7 @@ public class BattleRoundRestartTests
         // Casualties describe men the campaign has already been told about. Re-forming the lines must not
         // un-report them, or the post-battle roster would credit back troops that died.
         var supplier = new CoopTroopSupplier("M1", BattleSideEnum.Attacker, null, new BattleAgentBudget());
-        supplier.SetReserve(new[] { Party("A", 5) });
+        supplier.SetReserve(new[] { Party("A", 5) }, sideTotal: 5, playerOwnedParties: 0, authoritativeBattleSize: 0);
         var removedBefore = supplier.NumRemovedTroops;
 
         supplier.RewindForRoundRestart();

@@ -4,6 +4,7 @@ using Common.Messaging;
 using Common.Network;
 using Common.Util;
 using GameInterface.Services.MapEvents.Data;
+using GameInterface.Services.MapEvents.Initialization;
 using GameInterface.Services.MapEvents.Interfaces;
 using GameInterface.Services.MapEvents.Loot;
 using GameInterface.Services.MapEvents.Messages.Leave;
@@ -34,6 +35,7 @@ internal class MapEventResultsHandler : IHandler
     private readonly INetwork network;
     private readonly IObjectManager objectManager;
     private readonly IMapEventResultsInterface mapEventResultsInterface;
+    private readonly IMapEventInitializationBarrier initializationBarrier;
     private readonly IMapEventContributionBarrier contributionBarrier;
     private readonly IPlayerManager playerManager;
 
@@ -42,6 +44,7 @@ internal class MapEventResultsHandler : IHandler
         INetwork network,
         IObjectManager objectManager,
         IMapEventResultsInterface mapEventResultsInterface,
+        IMapEventInitializationBarrier initializationBarrier,
         IMapEventContributionBarrier contributionBarrier,
         IPlayerManager playerManager)
     {
@@ -49,6 +52,7 @@ internal class MapEventResultsHandler : IHandler
         this.network = network;
         this.objectManager = objectManager;
         this.mapEventResultsInterface = mapEventResultsInterface;
+        this.initializationBarrier = initializationBarrier;
         this.contributionBarrier = contributionBarrier;
         this.playerManager = playerManager;
 
@@ -307,9 +311,18 @@ internal class MapEventResultsHandler : IHandler
         // Set the encounter state ahead to start at applying results when a winning player leaves the battle.
         // CaptureHeroes is the first EncounterState that doesn't rely on the MapEvent, which is already
         // destroyed when a player leaves a battle.
-        playerEncounter.EncounterState = data.WinningSide == data.PlayerSide
-            ? PlayerEncounterState.CaptureHeroes
-            : PlayerEncounterState.End;
+        if (data.WinningSide == data.PlayerSide)
+        {
+            playerEncounter.EncounterState = PlayerEncounterState.CaptureHeroes;
+        }
+        else
+        {
+            // Defeat itself is handled on the defeat path; the retention here keeps the simulated
+            // result alive through the barrier's teardown, which is what stops a client crashing
+            // after a siege auto-resolve.
+            playerEncounter.EncounterState = PlayerEncounterState.End;
+            initializationBarrier.RetainSimulationDefeat(mapEvent, MobileParty.MainParty?.Party);
+        }
 
         using (new AllowedThread())
         {

@@ -49,17 +49,17 @@ public readonly struct ModOptions
     [ProtoMember(14)]
     public readonly float MaximumLootersMultiplier { get; } = 1f;
     [ProtoMember(15)]
-    public readonly LordDefectionRetryMode LordDefectionRetries { get; } = LordDefectionRetryMode.Vanilla;
-    // 16 and 17 belong to development's hero-execution options. This branch had claimed the same two
-    // numbers for its siege options, so they are renumbered to 18-20: a ProtoMember number is the wire
-    // identifier, and two fields sharing one silently corrupts config sync between server and clients.
+    public readonly float LooterPartySizeMultiplier { get; } = 1f;
     [ProtoMember(16)]
-    public readonly bool EnableHeroExecutions { get; } = true;
+    public readonly LordDefectionRetryMode LordDefectionRetries { get; } = LordDefectionRetryMode.Vanilla;
     [ProtoMember(17)]
+    public readonly bool EnableHeroExecutions { get; } = true;
+    [ProtoMember(18)]
     public readonly bool EnablePlayerClanMemberExecutions { get; } = false;
+    [ProtoMember(19)]
+    public readonly bool ShowPlayerNameplates { get; } = true;
 
-    [ProtoMember(21)]
-/// <summary>
+    /// <summary>
     /// Whether a side that exceeds its share of the battle size has troops stood down to bring it back.
     /// </summary>
     /// <remarks>
@@ -78,15 +78,15 @@ public readonly struct ModOptions
     /// zero, so the switch stays: turning it off costs only that a side may exceed its share after a large
     /// reinforcement, which is a working battle.
     /// </remarks>
-    public readonly bool TrimFieldToBattleSize { get; } = true;
-    [ProtoMember(18)]
-    public readonly bool MilitiaJoinsSallyOut { get; } = true;
-    [ProtoMember(19)]
-    public readonly bool ResumeSiegeWhenEnemyRetreats { get; } = true;
     [ProtoMember(20)]
+    public readonly bool TrimFieldToBattleSize { get; } = true;
+    [ProtoMember(21)]
+    public readonly bool MilitiaJoinsSallyOut { get; } = true;
+    [ProtoMember(22)]
+    public readonly bool ResumeSiegeWhenEnemyRetreats { get; } = true;
+    [ProtoMember(23)]
     public readonly bool GarrisonJoinsSiegeRelief { get; } = true;
 
-    [ProtoMember(22)]
     /// <summary>
     /// Whether troops are stopped from breaking and fleeing when their morale gives out.
     /// </summary>
@@ -101,9 +101,9 @@ public readonly struct ModOptions
     ///
     /// Turning it off restores vanilla routing, at the cost of that noise.
     /// </remarks>
+    [ProtoMember(24)]
     public readonly bool DisableBattleMorale { get; } = true;
 
-    [ProtoMember(23)]
     /// <summary>
     /// Whether a kingdom led by a player is spared the AI's war and peace proposals.
     /// </summary>
@@ -116,41 +116,35 @@ public readonly struct ModOptions
     /// Only the AI's proposals are suppressed. The ruler's own diplomacy screen is untouched, and war can
     /// still arrive the ways it should: rebellion, crime, a call to war from an ally, hostility in the field.
     /// </remarks>
+    [ProtoMember(25)]
     public readonly bool PlayerLedKingdomsControlTheirOwnDiplomacy { get; } = true;
-
-    /// <summary>
-    /// Takes the configured value, or keeps the option's declared default when the config leaves it out.
-    /// Spelled as a call rather than <c>??</c> so the constructor reads as one straight line per option:
-    /// twenty null-coalesces in a row look like twenty branches, both to an analyzer and to anyone
-    /// skimming for the single option they care about.
-    /// </summary>
-    private static T Or<T>(T? configured, T declaredDefault) where T : struct => configured ?? declaredDefault;
 
     public ModOptions(ModOptionsData modOptionsData)
     {
-        FastForwardEnabled = Or(modOptionsData.FastForwardEnabled, FastForwardEnabled);
-        AutoPauseEnabled = Or(modOptionsData.AutoPauseEnabled, AutoPauseEnabled);
-        ClientsCanUseCheats = Or(modOptionsData.ClientsCanUseCheats, ClientsCanUseCheats);
-        GoldFoodInfluenceChangeInSettlements = Or(modOptionsData.GoldFoodInfluenceChangeInSettlements, GoldFoodInfluenceChangeInSettlements);
-        GoldFoodInfluenceChangeInBattles = Or(modOptionsData.GoldFoodInfluenceChangeInBattles, GoldFoodInfluenceChangeInBattles);
-        GoldFoodInfluenceChangeForDisconnectedPlayers = Or(modOptionsData.GoldFoodInfluenceChangeForDisconnectedPlayers, GoldFoodInfluenceChangeForDisconnectedPlayers);
-        PlayerBattleAiJoinWindowHours = Or(modOptionsData.PlayerBattleAiJoinWindowHours, PlayerBattleAiJoinWindowHours);
-        SpeedLimitWhilePlayersInBattle = Or(modOptionsData.SpeedLimitWhilePlayersInBattle, SpeedLimitWhilePlayersInBattle);
-        WandererLimit = Or(modOptionsData.WandererLimit, WandererLimit);
-        WandererLimitScalesWithPlayers = Or(modOptionsData.WandererLimitScalesWithPlayers, WandererLimitScalesWithPlayers);
-        PlayerKingdomClanTierRequired = Or(modOptionsData.PlayerKingdomClanTierRequired, PlayerKingdomClanTierRequired);
-        SmithingStaminaRecoveryOutsideSettlements = Or(modOptionsData.SmithingStaminaRecoveryOutsideSettlements, SmithingStaminaRecoveryOutsideSettlements);
-        SmithingStaminaRecoveryMultiplier = Or(modOptionsData.SmithingStaminaRecoveryMultiplier, SmithingStaminaRecoveryMultiplier);
-        MaximumLootersMultiplier = Or(modOptionsData.MaximumLootersMultiplier, MaximumLootersMultiplier);
-        LordDefectionRetries = Or(modOptionsData.LordDefectionRetries, LordDefectionRetries);
-        EnableHeroExecutions = Or(modOptionsData.EnableHeroExecutions, EnableHeroExecutions);
-        EnablePlayerClanMemberExecutions = Or(modOptionsData.EnablePlayerClanMemberExecutions, EnablePlayerClanMemberExecutions);
-        MilitiaJoinsSallyOut = Or(modOptionsData.MilitiaJoinsSallyOut, MilitiaJoinsSallyOut);
-        ResumeSiegeWhenEnemyRetreats = Or(modOptionsData.ResumeSiegeWhenEnemyRetreats, ResumeSiegeWhenEnemyRetreats);
-        TrimFieldToBattleSize = Or(modOptionsData.TrimFieldToBattleSize, TrimFieldToBattleSize);
-        GarrisonJoinsSiegeRelief = Or(modOptionsData.GarrisonJoinsSiegeRelief, GarrisonJoinsSiegeRelief);
-        TrimFieldToBattleSize = Or(modOptionsData.TrimFieldToBattleSize, TrimFieldToBattleSize);
-        DisableBattleMorale = Or(modOptionsData.DisableBattleMorale, DisableBattleMorale);
-        PlayerLedKingdomsControlTheirOwnDiplomacy = Or(modOptionsData.PlayerLedKingdomsControlTheirOwnDiplomacy, PlayerLedKingdomsControlTheirOwnDiplomacy);
+        FastForwardEnabled = modOptionsData.FastForwardEnabled ?? FastForwardEnabled;
+        AutoPauseEnabled = modOptionsData.AutoPauseEnabled ?? AutoPauseEnabled;
+        ClientsCanUseCheats = modOptionsData.ClientsCanUseCheats ?? ClientsCanUseCheats;
+        GoldFoodInfluenceChangeInSettlements = modOptionsData.GoldFoodInfluenceChangeInSettlements ?? GoldFoodInfluenceChangeInSettlements;
+        GoldFoodInfluenceChangeInBattles = modOptionsData.GoldFoodInfluenceChangeInBattles ?? GoldFoodInfluenceChangeInBattles;
+        GoldFoodInfluenceChangeForDisconnectedPlayers = modOptionsData.GoldFoodInfluenceChangeForDisconnectedPlayers ?? GoldFoodInfluenceChangeForDisconnectedPlayers;
+        PlayerBattleAiJoinWindowHours = modOptionsData.PlayerBattleAiJoinWindowHours ?? PlayerBattleAiJoinWindowHours;
+        SpeedLimitWhilePlayersInBattle = modOptionsData.SpeedLimitWhilePlayersInBattle ?? SpeedLimitWhilePlayersInBattle;
+        WandererLimit = modOptionsData.WandererLimit ?? WandererLimit;
+        WandererLimitScalesWithPlayers = modOptionsData.WandererLimitScalesWithPlayers ?? WandererLimitScalesWithPlayers;
+        PlayerKingdomClanTierRequired = modOptionsData.PlayerKingdomClanTierRequired ?? PlayerKingdomClanTierRequired;
+        SmithingStaminaRecoveryOutsideSettlements = modOptionsData.SmithingStaminaRecoveryOutsideSettlements ?? SmithingStaminaRecoveryOutsideSettlements;
+        SmithingStaminaRecoveryMultiplier = modOptionsData.SmithingStaminaRecoveryMultiplier ?? SmithingStaminaRecoveryMultiplier;
+        MaximumLootersMultiplier = modOptionsData.MaximumLootersMultiplier ?? MaximumLootersMultiplier;
+        LooterPartySizeMultiplier = modOptionsData.LooterPartySizeMultiplier ?? LooterPartySizeMultiplier;
+        LordDefectionRetries = modOptionsData.LordDefectionRetries ?? LordDefectionRetries;
+        EnableHeroExecutions = modOptionsData.EnableHeroExecutions ?? EnableHeroExecutions;
+        EnablePlayerClanMemberExecutions = modOptionsData.EnablePlayerClanMemberExecutions ?? EnablePlayerClanMemberExecutions;
+        ShowPlayerNameplates = modOptionsData.ShowPlayerNameplates ?? ShowPlayerNameplates;
+        TrimFieldToBattleSize = modOptionsData.TrimFieldToBattleSize ?? TrimFieldToBattleSize;
+        MilitiaJoinsSallyOut = modOptionsData.MilitiaJoinsSallyOut ?? MilitiaJoinsSallyOut;
+        ResumeSiegeWhenEnemyRetreats = modOptionsData.ResumeSiegeWhenEnemyRetreats ?? ResumeSiegeWhenEnemyRetreats;
+        GarrisonJoinsSiegeRelief = modOptionsData.GarrisonJoinsSiegeRelief ?? GarrisonJoinsSiegeRelief;
+        DisableBattleMorale = modOptionsData.DisableBattleMorale ?? DisableBattleMorale;
+        PlayerLedKingdomsControlTheirOwnDiplomacy = modOptionsData.PlayerLedKingdomsControlTheirOwnDiplomacy ?? PlayerLedKingdomsControlTheirOwnDiplomacy;
     }
 }

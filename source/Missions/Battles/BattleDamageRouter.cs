@@ -4,6 +4,7 @@ using Common.Messaging;
 using GameInterface.Services.MapEvents;
 using GameInterface.Services.MapEvents.Messages;
 using Missions.Agents;
+using Missions.Agents.Handlers;
 using Missions.Agents.Patches;
 using Missions.Messages;
 using Missions.Missiles.Handlers;
@@ -38,6 +39,8 @@ public class BattleDamageRouter : IBattleDamageRouter
     private readonly ICoopMissionComponent coopMissionComponent;
     private readonly IBattleSession session;
     private readonly IGuardedHitWindow guardedHitWindow;
+    private readonly IAgentNativeMountState agentNativeMountState;
+    private readonly IPuppetMountStateRepairer puppetMountStateRepairer;
     private readonly Func<Agent, bool?> mountAuthorityProbe;
     private readonly object inboundDamageGate = new();
     private readonly ConcurrentQueue<NetworkApplyBattleDamage> inboundDamage = new();
@@ -50,7 +53,6 @@ public class BattleDamageRouter : IBattleDamageRouter
     private float presentationTime;
     private bool disposed;
     private bool closing;
-
     private const int MinimumPresentationEpochs = 2;
     private const int MaxReconstructionHistory = 4096;
     private const double DamageTimeoutSeconds = 4d;
@@ -131,13 +133,17 @@ public class BattleDamageRouter : IBattleDamageRouter
 
     public BattleDamageRouter(IBattleNetwork network, IMessageBroker messageBroker,
         ICoopMissionComponent coopMissionComponent, IBattleSession session,
-        IGuardedHitWindow guardedHitWindow)
+        IGuardedHitWindow guardedHitWindow,
+        IAgentNativeMountState agentNativeMountState,
+        IPuppetMountStateRepairer puppetMountStateRepairer)
     {
         this.network = network;
         this.messageBroker = messageBroker;
         this.coopMissionComponent = coopMissionComponent;
         this.session = session;
         this.guardedHitWindow = guardedHitWindow;
+        this.agentNativeMountState = agentNativeMountState;
+        this.puppetMountStateRepairer = puppetMountStateRepairer;
 
         messageBroker.Subscribe<BattlePuppetHit>(Handle_BattlePuppetHit);
         messageBroker.Subscribe<NetworkApplyBattleDamage>(Handle_NetworkApplyBattleDamage);
@@ -246,7 +252,6 @@ public class BattleDamageRouter : IBattleDamageRouter
     {
         if (disposed || closing)
             return;
-
         var registry = coopMissionComponent.AgentRegistry;
         Guid attackerId = Guid.Empty;
         if (payload.What.Attacker != null
@@ -306,7 +311,6 @@ public class BattleDamageRouter : IBattleDamageRouter
 
         pendingLocalDamage.Enqueue(pending);
     }
-
     private void DrainPendingLocalDamage(bool force = false)
     {
         int count = pendingLocalDamage.Count;
@@ -429,7 +433,6 @@ public class BattleDamageRouter : IBattleDamageRouter
         var localCollision = hit.CollisionData;
         RegisterBlowPatch.RunOriginalRegisterBlow(orphan, localBlow, localCollision);
     }
-
     private void Handle_NetworkApplyBattleDamage(MessagePayload<NetworkApplyBattleDamage> payload)
     {
         NetworkApplyBattleDamage damage = payload.What;
@@ -723,6 +726,18 @@ public class BattleDamageRouter : IBattleDamageRouter
             return;
         }
 
+        bool hasNativeMountedPair = !blow.BlowFlag.HasAnyFlag(BlowFlags.CanDismount)
+            || agentNativeMountState.HasMountedPair(victim);
+        if (RemoveIncompatibleDismountFlag(ref blow, hasNativeMountedPair))
+        {
+            Logger.Debug(
+                "[BattleDamage] Removed stale routed dismount reaction: victimId={VictimId} " +
+                "victimIndex={VictimIndex} attackerId={AttackerId}",
+                damage.VictimAgentId,
+                victim.Index,
+                damage.AttackerAgentId);
+        }
+
         Agent attacker = null;
         string attackerControllerId = null;
         if (damage.AttackerAgentId != Guid.Empty &&
@@ -737,7 +752,6 @@ public class BattleDamageRouter : IBattleDamageRouter
         {
             blow.OwnerId = -1;
         }
-
         int routedDamage = blow.InflictedDamage;
         // The source calculated this blow against a puppet, so vanilla could not apply its main-agent multiplier.
         ApplyPlayerReceivedDamageMultiplier(victim, ref blow, ref collisionData);
@@ -772,8 +786,17 @@ public class BattleDamageRouter : IBattleDamageRouter
         // The agent index is unique within a mission and free to read, so the file can be grouped by it.
         Logger.Information("[BattleSync] Applying routed blow to {Agent} (#{Index}): dmg={Damage}, missile={Missile}, health={Health}, taken={Taken}",
             victim.Name, victim.Index, blow.InflictedDamage, wasMissile, victim.Health, NoteDamageTaken(victim, blow.InflictedDamage));
-        BattleSpawnGate.RunWithRoutedAttackerWeapon(damage.AttackerWeapon,
-            () => victim.RegisterBlow(blow, in collisionData));
+
+        Agent mountBeforeBlow = victim.IsMount ? null : victim.MountAgent;
+        try
+        {
+            BattleSpawnGate.RunWithRoutedAttackerWeapon(damage.AttackerWeapon,
+                () => victim.RegisterBlow(blow, in collisionData));
+        }
+        finally
+        {
+            puppetMountStateRepairer.PreserveRiderlessPuppet(mountBeforeBlow);
+        }
 
         float healthAfter = victim.Health;
         float appliedDamage = healthBefore - healthAfter;
@@ -842,6 +865,20 @@ public class BattleDamageRouter : IBattleDamageRouter
         {
             hero.HitPoints = Math.Max(1, (int)healthAfter);
         }
+    }
+
+    internal static bool RemoveIncompatibleDismountFlag(
+        ref Blow blow,
+        bool hasNativeMountedPair)
+    {
+        if (hasNativeMountedPair
+            || !blow.BlowFlag.HasAnyFlag(BlowFlags.CanDismount))
+        {
+            return false;
+        }
+
+        blow.BlowFlag &= ~BlowFlags.CanDismount;
+        return true;
     }
 
     private bool ShouldLogNoHealthReductionWarning(Guid victimId, out int suppressedHits)

@@ -273,7 +273,7 @@ internal sealed class PeaceBarterHandler : IHandler
                     targetParty = resolved;
                     return true;
                 }
-                reason = "The peace encounter is no longer active.";
+                reason = NetworkPeaceBarterResult.InactiveEncounterReason;
                 return false;
 
             case PeaceConversationContext.Settlement:

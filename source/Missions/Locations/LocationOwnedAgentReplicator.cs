@@ -1,4 +1,4 @@
-using Common;
+﻿using Common;
 using Common.Logging;
 using Common.Messaging;
 using GameInterface.Services.Locations;
@@ -10,6 +10,8 @@ using Serilog;
 using System;
 using System.Collections.Generic;
 using TaleWorlds.CampaignSystem;
+using TaleWorlds.CampaignSystem.AgentOrigins;
+using TaleWorlds.CampaignSystem.Party;
 using TaleWorlds.CampaignSystem.Settlements.Locations;
 using TaleWorlds.Core;
 using TaleWorlds.MountAndBlade;
@@ -143,11 +145,12 @@ public class LocationOwnedAgentReplicator : ILocationOwnedAgentReplicator
                 // An agent that died or deregistered between capture and flush sends no spawn
                 // record; its already-queued despawn then references an id peers never applied,
                 // which every receiver treats as a no-op.
-                if (!coopMissionComponent.AgentRegistry.TryGetAgentInfo(capture.agentId, out _)) continue;
+                if (!coopMissionComponent.AgentRegistry.TryGetAgentInfo(capture.agentId, out var info)) continue;
                 if (capture.agent == null || !capture.agent.IsActive()) continue;
 
                 var record = BuildRecord(capture.agent, capture.agentId, capture.movementId,
-                    movementScopeId, capture.binding, originalOwner: session.OwnControllerId);
+                    movementScopeId, capture.binding, originalOwner: session.OwnControllerId,
+                    authorityRevision: info.AuthorityRevision);
                 if (record != null)
                     records.Add(record);
             }
@@ -286,7 +289,8 @@ public class LocationOwnedAgentReplicator : ILocationOwnedAgentReplicator
             if (!bindingMap.TryGet(info.AgentId, out var binding)) continue; // not an NPC we replicate (e.g. our player agent)
 
             var record = BuildRecord(agent, info.AgentId, info.MovementId, info.MovementScopeId, binding,
-                originalOwner: info.OriginalOwner);
+                originalOwner: info.OriginalOwner,
+                authorityRevision: info.AuthorityRevision);
             if (record != null)
                 records.Add(record);
         }
@@ -298,6 +302,15 @@ public class LocationOwnedAgentReplicator : ILocationOwnedAgentReplicator
     {
         var agent = payload.What.Agent;
         if (agent == null || !(agent.Character is CharacterObject)) return;
+
+        // Defense in depth: player-owned companions use the party join-info path even when this client is
+        // also the elected NPC host. Never give them an ambient binding or migration eligibility.
+        if (agent.Origin is PartyAgentOrigin origin && origin.Party == PartyBase.MainParty)
+        {
+            Logger.Warning("[LocationSync] Ignored ambient capture event for local party agent {Character}",
+                agent.Character.StringId);
+            return;
+        }
 
         // The roster identity is extracted at capture time — the entry is resolvable via the agent's
         // origin right now, and any FUTURE host needs it to re-bind (SR-022).
@@ -351,7 +364,8 @@ public class LocationOwnedAgentReplicator : ILocationOwnedAgentReplicator
         ushort movementId,
         string scopeId,
         LocationAgentBinding binding,
-        string originalOwner)
+        string originalOwner,
+        long authorityRevision)
     {
         string characterId = null;
         if (binding.Kind == LocationAgentKind.Human)
@@ -410,7 +424,8 @@ public class LocationOwnedAgentReplicator : ILocationOwnedAgentReplicator
             binding.Kind == LocationAgentKind.Human ? new AgentEquipmentData(agent) : (AgentEquipmentData?)null,
             binding.RosterEntry,
             originalOwnerControllerId: originalOwner,
-            usedPointId: usedPointId);
+            usedPointId: usedPointId,
+            authorityRevision: authorityRevision);
     }
 
     private static void LogBatchSend(

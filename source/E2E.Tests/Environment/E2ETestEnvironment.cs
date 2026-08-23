@@ -1,9 +1,13 @@
 ﻿using Common;
 using Common.Logging;
+using Common.Messaging;
 using Common.Network;
 using Common.Network.Coalescing;
 using Common.Tests.Utils;
 using Common.Util;
+using Coop.Core.Server.Connections;
+using Coop.Core.Server.Connections.Messages;
+using Coop.Core.Server.Connections.States;
 using Coop.Core.Server.Services.Time.Handlers;
 using E2E.Tests.Environment.Instance;
 using E2E.Tests.Util;
@@ -111,6 +115,12 @@ public class E2ETestEnvironment : IDisposable
     /// Use this when a test needs server behavior that depends on a live player,
     /// such as time-control unpause policies.
     /// </summary>
+    /// <summary>Gives a registered player the peer a real connection would have.</summary>
+    /// <remarks>
+    /// A registered player with no peer is exactly how the server represents someone who has DROPPED,
+    /// and it does not wait for a vote from them. A fixture that skipped this would be modelling an
+    /// absent player while asking the test to prove a decision waits for a present one.
+    /// </remarks>
     public void ConnectRegisteredPlayer(EnvironmentInstance client, string controllerId)
     {
         Server.Call(() =>
@@ -121,6 +131,14 @@ public class E2ETestEnvironment : IDisposable
                 $"Player '{controllerId}' must be registered before connecting its peer.");
 
             playerManager.SetPeer(controllerId, client.NetPeer);
+
+            var connections = Server.Resolve<ConnectionCollection>();
+            if (!connections.ConnectionStates.TryGetValue(client.NetPeer, out var connection))
+            {
+                Server.Resolve<IMessageBroker>().Publish(this, new PlayerConnected(client.NetPeer));
+                Assert.True(connections.ConnectionStates.TryGetValue(client.NetPeer, out connection));
+            }
+            connection.SetState<CampaignState>();
 
             Assert.True(
                 playerManager.IsConnected(player),

@@ -93,7 +93,8 @@ public class BattleFieldRoomSideTotalsTests : IDisposable
         var supplier = new CoopTroopSupplier(BattleId, side, null, null);
         // An empty reserve with a side total is the shape a client that owns nothing on this side receives:
         // it still has to know how big the side is, or it sizes the battle from its own share of it.
-        supplier.SetReserve(Array.Empty<PartyReserve>(), sideTotal);
+        supplier.SetReserve(Array.Empty<PartyReserve>(), sideTotal, playerOwnedParties: 0,
+            authoritativeBattleSize: 0);
         CoopTroopSupplierRegistry.Register(supplier);
     }
 }

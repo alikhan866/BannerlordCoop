@@ -1,4 +1,4 @@
-using Common;
+﻿using Common;
 using Common.Logging;
 using Common.Messaging;
 using Missions.Messages;
@@ -16,24 +16,22 @@ namespace Missions.Locations;
 
 /// <summary>
 /// Owns the departure fork of a settlement location mission (SR-014/SR-015). On ANY member's
-/// departure every remaining client despawns that controller's PLAYER puppet only — its NPC puppets
+/// departure every remaining client despawns that controller's player and companion puppets — its NPC puppets
 /// (the ones recorded in the binding map) stay on the field awaiting adoption. On promotion
-/// (<see cref="LocationHostMigrated"/>, published only on the promoted client) the new host adopts
-/// the previous host's NPCs in place: authority transfer, interpolation forget (a stale interpolation
+/// (<see cref="LocationHostMigrated"/>) every peer transfers registry authority and the new host adopts
+/// the previous host's NPCs in place: interpolation forget (a stale interpolation
 /// target pins an adopted agent — the battle-migration lesson), then settlement-AI re-creation from
 /// the LOCAL roster entry the puppet's origin already points at (SR-030, V5). Mirrors the generic
-/// halves of <c>BattleAuthorityMigrator</c>; there is no withdrawn-own-party split — a location
-/// "party" is just the player's body, which always despawns.
+/// halves of <c>BattleAuthorityMigrator</c>; player and companion agents always despawn, while only
+/// roster-bound ambient NPCs survive for adoption.
 /// </summary>
 public interface ILocationAuthorityMigrator : System.IDisposable
 {
     /// <summary>
-    /// [Game thread] Adopt a single just-spawned puppet whose owner has already departed: a retained
-    /// old-host record applied AFTER the promotion (buffered by budget or mission load). The bulk
-    /// adoption on <see cref="Missions.Messages.LocationHostMigrated"/> ran before this record
-    /// spawned, so the spawner hands late arrivals over one by one.
+    /// [Game thread] Apply current authority to a just-spawned puppet whose owner already departed.
+    /// Every peer corrects its registry; the promoted host also revives settlement AI.
     /// </summary>
-    void AdoptSpawnedPuppet(Agent agent, System.Guid agentId);
+    void ApplyLateSpawnedPuppet(Agent agent, System.Guid agentId);
 }
 
 /// <inheritdoc cref="ILocationAuthorityMigrator"/>
@@ -45,6 +43,7 @@ public class LocationAuthorityMigrator : ILocationAuthorityMigrator
     private readonly ICoopMissionComponent coopMissionComponent;
     private readonly ILocationSession session;
     private readonly ILocationAgentBindingMap bindingMap;
+    private readonly ILocationPartyAgentMap partyAgentMap;
     private readonly IMissionContext missionContext;
     private readonly GameInterface.Services.Locations.Conversations.ILocationNpcHoldRegistry holdRegistry;
 
@@ -53,6 +52,7 @@ public class LocationAuthorityMigrator : ILocationAuthorityMigrator
         ICoopMissionComponent coopMissionComponent,
         ILocationSession session,
         ILocationAgentBindingMap bindingMap,
+        ILocationPartyAgentMap partyAgentMap,
         IMissionContext missionContext,
         GameInterface.Services.Locations.Conversations.ILocationNpcHoldRegistry holdRegistry)
     {
@@ -60,6 +60,7 @@ public class LocationAuthorityMigrator : ILocationAuthorityMigrator
         this.coopMissionComponent = coopMissionComponent;
         this.session = session;
         this.bindingMap = bindingMap;
+        this.partyAgentMap = partyAgentMap;
         this.missionContext = missionContext;
         this.holdRegistry = holdRegistry;
 
@@ -77,19 +78,19 @@ public class LocationAuthorityMigrator : ILocationAuthorityMigrator
 
     private void Handle_PeerLeft(MessagePayload<MissionPeerLeft> payload)
     {
-        DespawnPlayerPuppet(payload.What.ControllerId, payload.What.InstanceId);
+        DespawnPartyPuppets(payload.What.ControllerId, payload.What.InstanceId);
     }
 
     private void Handle_PeerDisconnected(MessagePayload<MissionPeerDisconnected> payload)
     {
-        DespawnPlayerPuppet(payload.What.ControllerId, payload.What.InstanceId);
+        DespawnPartyPuppets(payload.What.ControllerId, payload.What.InstanceId);
     }
 
-    // [All remaining clients] A member departed: despawn ITS PLAYER agent only. Its NPC puppets (every
+    // [All remaining clients] A member departed: despawn its player and companion agents. Its NPC puppets (every
     // registered agent with a binding-map record) stay — they belong to the promoted successor
     // (SR-015). This replaces the generic AgentMovementHandler.RemoveControllerParty sweep, which is
     // skipped for location missions exactly so it cannot fade the NPCs out with their departing host.
-    internal void DespawnPlayerPuppet(string controllerId, string instanceId)
+    internal void DespawnPartyPuppets(string controllerId, string instanceId)
     {
         if (string.IsNullOrEmpty(controllerId)) return;
         if (instanceId != null && instanceId != session.InstanceId) return;
@@ -102,26 +103,35 @@ public class LocationAuthorityMigrator : ILocationAuthorityMigrator
             int despawned = 0;
             foreach (var info in registry.GetAgents(controllerId))
             {
-                if (bindingMap.TryGet(info.AgentId, out _)) continue; // an NPC — awaits adoption
+                bool hasNpcBinding = bindingMap.TryGet(info.AgentId, out _);
+                if (partyAgentMap.ShouldAdoptAsNpc(info.AgentId, hasNpcBinding)) continue;
 
                 var agent = info.Agent;
-                if (agent != null && agent.IsActive() && agent.Health > 0)
+                coopMissionComponent.AgentMovementHandler.Interpolator.Forget(agent);
+                registry.RemoveAgent(info.AgentId);
+
+                // A party id can carry a stale NPC binding when a host's ambient spawn batch raced its
+                // companion join record. It is still a departing party agent and must never be adopted.
+                bindingMap.Forget(info.AgentId);
+
+                if (agent != null && agent.Mission == Mission.Current && agent.IsActive() && agent.Health > 0)
                 {
                     bool hideMount = agent.HasMount && agent.MountAgent != null && agent.MountAgent.IsActive();
                     agent.FadeOut(false, hideMount);
                 }
 
-                registry.RemoveAgent(info.AgentId);
+                Logger.Information("[LocationSync] Despawned departed party agent {AgentId} ({Character}) from {Controller}",
+                    info.AgentId, agent?.Character?.StringId ?? "<null>", controllerId);
                 despawned++;
             }
 
             if (despawned > 0)
                 Logger.Information("[LocationSync] Despawned {Count} player agent(s) of departed {Controller}", despawned, controllerId);
-        }, context: nameof(DespawnPlayerPuppet));
+        }, context: nameof(DespawnPartyPuppets));
     }
 
-    // [Promoted host] The previous host departed and the server promoted us — adopt its NPCs in place
-    // (SR-014). Published only on the promoted client, so no host check here.
+    // [All remaining clients] Apply the server's host epoch to NPC authority. The promoted host also
+    // revives the adopted agents' settlement AI.
     private void Handle_LocationHostMigrated(MessagePayload<LocationHostMigrated> payload)
     {
         if (payload.What.InstanceId != session.InstanceId) return;
@@ -143,7 +153,45 @@ public class LocationAuthorityMigrator : ILocationAuthorityMigrator
             absentControllers.Add(controllerId);
         }
 
-        AdoptAgentsFrom(absentControllers, "host migration + orphan sweep");
+        if (!session.IsOwn(payload.What.NewHostControllerId))
+        {
+            TransferRemoteAuthority(
+                absentControllers,
+                payload.What.NewHostControllerId,
+                payload.What.AuthorityRevision);
+            return;
+        }
+
+        AdoptAgentsFrom(
+            absentControllers,
+            "host migration + orphan sweep",
+            payload.What.AuthorityRevision);
+    }
+
+    private void TransferRemoteAuthority(
+        IEnumerable<string> controllerIds,
+        string newHostControllerId,
+        long authorityRevision)
+    {
+        if (controllerIds == null || string.IsNullOrEmpty(newHostControllerId)) return;
+        var controllers = new HashSet<string>(controllerIds);
+        var registry = coopMissionComponent.AgentRegistry;
+
+        GameThread.RunSafe(() =>
+        {
+            foreach (var controllerId in controllers)
+            {
+                foreach (var info in registry.GetAgents(controllerId))
+                {
+                    bool hasNpcBinding = bindingMap.TryGet(info.AgentId, out _);
+                    if (!partyAgentMap.ShouldAdoptAsNpc(info.AgentId, hasNpcBinding)) continue;
+                    registry.TryTransferAuthority(
+                        newHostControllerId,
+                        info.AgentId,
+                        authorityRevision);
+                }
+            }
+        }, context: nameof(TransferRemoteAuthority));
     }
 
     // Take over the NPCs owned by the departed controller: move authority to us (the movement poller
@@ -151,7 +199,10 @@ public class LocationAuthorityMigrator : ILocationAuthorityMigrator
     // origin points at — the native sequence (CampaignAgentComponent.CreateAgentNavigator +
     // entry.AddBehaviors, V5). Other peers keep them as puppets that now follow OUR movement (their
     // movement lookup is scope+id keyed, which survives the authority transfer).
-    private void AdoptAgentsFrom(IEnumerable<string> controllerIds, string reason)
+    private void AdoptAgentsFrom(
+        IEnumerable<string> controllerIds,
+        string reason,
+        long? authorityRevision = null)
     {
         if (controllerIds == null) return;
 
@@ -172,9 +223,18 @@ public class LocationAuthorityMigrator : ILocationAuthorityMigrator
             {
                 foreach (var info in registry.GetAgents(controllerId))
                 {
-                    // A lingering non-NPC entry (the departed player's own body whose despawn we
-                    // somehow missed) is not ours to adopt; DespawnPlayerPuppet owns it.
-                    if (!bindingMap.TryGet(info.AgentId, out _)) continue;
+                    // Party identity wins over a binding produced by any racing ambient spawn record.
+                    // Player and companion puppets always despawn with their controller and are never adopted.
+                    bool hasNpcBinding = bindingMap.TryGet(info.AgentId, out _);
+                    if (!partyAgentMap.ShouldAdoptAsNpc(info.AgentId, hasNpcBinding))
+                    {
+                        if (hasNpcBinding && partyAgentMap.Contains(info.AgentId))
+                        {
+                            Logger.Warning("[LocationSync] Refused host-migration adoption for party agent {AgentId}",
+                                info.AgentId);
+                        }
+                        continue;
+                    }
                     adopted.Add(info);
                 }
             }
@@ -182,7 +242,19 @@ public class LocationAuthorityMigrator : ILocationAuthorityMigrator
             if (adopted.Count == 0) return;
 
             foreach (var info in adopted)
-                registry.TryTransferAuthority(session.OwnControllerId, info.AgentId);
+            {
+                if (authorityRevision.HasValue)
+                {
+                    registry.TryTransferAuthority(
+                        session.OwnControllerId,
+                        info.AgentId,
+                        authorityRevision.Value);
+                }
+                else
+                {
+                    registry.TryTransferAuthority(session.OwnControllerId, info.AgentId);
+                }
+            }
 
             if (Mission.Current == null) return;
 
@@ -220,18 +292,32 @@ public class LocationAuthorityMigrator : ILocationAuthorityMigrator
         }, context: nameof(AdoptAgentsFrom));
     }
 
-    public void AdoptSpawnedPuppet(Agent agent, System.Guid agentId)
+    public void ApplyLateSpawnedPuppet(Agent agent, System.Guid agentId)
     {
         if (agent == null || agentId == System.Guid.Empty) return;
+        if (partyAgentMap.Contains(agentId))
+        {
+            Logger.Warning("[LocationSync] Refused late NPC adoption for party agent {AgentId}", agentId);
+            return;
+        }
+
+        string hostControllerId = session.HostControllerId;
+        long authorityRevision = session.HostEpoch - 1L;
+        if (string.IsNullOrEmpty(hostControllerId) || authorityRevision < 0) return;
 
         var registry = coopMissionComponent.AgentRegistry;
-        registry.TryTransferAuthority(session.OwnControllerId, agentId);
+        if (!registry.TryTransferAuthority(hostControllerId, agentId, authorityRevision)) return;
+        if (!session.IsLocalHost) return;
+
         coopMissionComponent.AgentMovementHandler.Interpolator.Forget(agent);
         // The spawner has just applied any catch-up point use from its canonical frame. Preserve that
         // single fresh lifecycle and only reconnect its newly-live AI navigator; do not stop/reuse it.
         ReviveSettlementAi(agent, agentId, reconnectPointUse: true);
         ReapplyConversationHold(agent, agentId);
-        Logger.Information("[LocationSync] Late-adopted NPC {AgentId} spawned after the migration", agentId);
+        Logger.Information(
+            "[LocationSync] Late-adopted NPC {AgentId} spawned after the migration at revision {Revision}",
+            agentId,
+            authorityRevision);
     }
 
     // [Game thread] An adopted NPC that a remote player currently holds the conversation lock on

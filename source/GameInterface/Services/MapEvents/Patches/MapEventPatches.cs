@@ -91,6 +91,26 @@ internal class MapEventPatches
             __instance,
             __instance._sides.SelectMany(side => side.Parties).ToList());
         MessageBroker.Instance.Publish(__instance, message);
+
+        if (isPlayerJoin && !InteractionPatches.IsInitializingPlayerBattle(__instance))
+        {
+            InteractionPatches.OpenAiJoinWindowAndPublish(
+                __instance,
+                () => MessageBroker.Instance.Publish(__instance, new PlayerJoinedBattle()));
+        }
+    }
+
+    [HarmonyPatch(nameof(MapEvent.RemoveInvolvedPartyInternal))]
+    [HarmonyPostfix]
+    private static void Postfix_RemoveInvolvedPartyInternal(MapEvent __instance, MapEventParty mapEventParty)
+    {
+        if (ModInformation.IsClient
+            || mapEventParty?.Party?.MobileParty is not MobileParty removedParty)
+        {
+            return;
+        }
+
+        MessageBroker.Instance.Publish(__instance, new PartyRemovedFromMapEvent(removedParty));
     }
 
     [HarmonyPatch(nameof(MapEvent.FinalizeEventAux))]
@@ -374,16 +394,21 @@ internal class InteractionPatches
 {
     private sealed class PlayerBattleWindows
     {
+        private readonly bool aiJoinWindowEnabled;
+
         public CampaignTime AiJoinWindowExpiresAt { get; }
         public CampaignTime GoldFoodConsumptionWindowExpiresAt { get; }
 
         public PlayerBattleWindows(int aiJoinWindowHours, int goldFoodConsumptionWindowHours = 24)
         {
+            aiJoinWindowEnabled = aiJoinWindowHours > 0;
             AiJoinWindowExpiresAt = CampaignTime.HoursFromNow(aiJoinWindowHours);
             GoldFoodConsumptionWindowExpiresAt = CampaignTime.HoursFromNow(goldFoodConsumptionWindowHours);
         }
 
-        public bool AiJoinWindowExpired => CampaignTime.Now > AiJoinWindowExpiresAt;
+        /// <summary>Whether AI joining is switched on at all, as opposed to switched on but timed out.</summary>
+        public bool AiJoinWindowEnabled => aiJoinWindowEnabled;
+        public bool AiJoinWindowExpired => !aiJoinWindowEnabled || CampaignTime.Now > AiJoinWindowExpiresAt;
         public bool GoldFoodConsumptionExpired => CampaignTime.Now > GoldFoodConsumptionWindowExpiresAt;
     }
 
@@ -435,6 +460,12 @@ internal class InteractionPatches
     public static bool IsWithinAiJoinWindow(MapEvent mapEvent)
     {
         if (!playerBattleWindows.TryGetValue(mapEvent, out var window)) return false;
+
+        // A window of zero hours is the feature switched OFF, not a window that has run out. The
+        // still-being-fought bypass below exists to defeat the CLOCK, and must not defeat the setting:
+        // an admin who turns AI joining off is entitled to no AI joining, live battle or not.
+        if (!window.AiJoinWindowEnabled) return false;
+
         if (!window.AiJoinWindowExpired) return true;
 
         return IsStillBeingFoughtByAPlayer(mapEvent);
@@ -585,16 +616,24 @@ internal class InteractionPatches
             return;
 
         initializingPlayerBattles.Remove(__instance);
-
-        // Window first, THEN the announcement. Publish is synchronous, so the reinforcement handler runs
-        // inside this call - and it asks IsWithinAiJoinWindow before deciding whether to scan. Announcing
-        // first meant that question was always asked of a window that did not exist yet, so the immediate
-        // scan was rejected every time and nearby lords only ever joined on a later tick, if at all.
-        playerBattleWindows.GetValue(
+        OpenAiJoinWindowAndPublish(
             __instance,
-            _ => new PlayerBattleWindows(ModConfigProvider.ModOptions.PlayerBattleAiJoinWindowHours));
+            () => MessageBroker.Instance.Publish(__instance, new PlayerJoinedBattle()));
+    }
 
-        MessageBroker.Instance.Publish(__instance, new PlayerJoinedBattle());
+    /// <summary>Opens the AI join window for a battle, then announces it.</summary>
+    /// <remarks>
+    /// Window first, THEN the announcement. Publish is synchronous, so the reinforcement handler runs
+    /// inside this call - and it asks IsWithinAiJoinWindow before deciding whether to scan. Announcing
+    /// first meant that question was always asked of a window that did not exist yet, so the immediate
+    /// scan was rejected every time and nearby lords only ever joined on a later tick, if at all.
+    /// </remarks>
+    internal static void OpenAiJoinWindowAndPublish(MapEvent mapEvent, Action publish)
+    {
+        playerBattleWindows.GetValue(
+            mapEvent,
+            _ => new PlayerBattleWindows(ModConfigProvider.ModOptions.PlayerBattleAiJoinWindowHours));
+        publish();
     }
 
     [HarmonyPatch(typeof(MapEvent), nameof(MapEvent.Initialize))]

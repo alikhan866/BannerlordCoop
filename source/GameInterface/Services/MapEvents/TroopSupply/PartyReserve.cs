@@ -33,9 +33,6 @@ public class PartyReserve
     /// coordination between them. Proportional rounding cannot do that - it overshoots or undershoots by a
     /// troop per owner - and a "never round down to zero" floor is worse still, spawning one troop per
     /// owner for a one-troop wave.
-    ///
-    /// Additive with a default of 0, so a reserve from a build that does not send it still deserialises;
-    /// 0 for every party simply reproduces the older proportional behaviour.
     /// </remarks>
     [ProtoMember(5)]
     public int SideOffset { get; }
@@ -47,23 +44,32 @@ public class PartyReserve
     /// <remarks>
     /// Together with <see cref="SideReserve.PlayerOwnedPartyCount"/> this is what lets every owner guarantee
     /// its player an agent WITHOUT overshooting the allocation. The share is computed as: reserve one troop
-    /// for each of the side's player-owned parties, apportion what remains across the whole side by the same
-    /// cumulative flooring as <see cref="SideOffset"/>, and add the reserved troop back for the party this
+    /// for each of the side's player-owned parties, remove those troops from the party intervals, apportion
+    /// what remains by cumulative flooring, and add the reserved troop back for the party this
     /// client owns. Those pieces sum to exactly the allocation, because the flooring covers the remainder
     /// exactly once and there are exactly as many reserved troops as player-owned parties.
     ///
     /// The rank matters only when the allocation is smaller than the number of player-owned parties, where
     /// there is not one troop to go round: the first <c>allocation</c> ranks get the troop and the rest get
     /// none, which every client agrees on because the ranks come from the server.
-    ///
-    /// Additive with a default of -1, so a reserve from a build that does not send it still deserialises and
-    /// falls back to the older proportional-with-top-up behaviour.
     /// </remarks>
     [ProtoMember(6)]
     public int PlayerOwnedRank { get; }
 
+    /// <summary>
+    /// How many guaranteed player slots precede this party. Removing them from <see cref="SideOffset"/> lets
+    /// every owner apportion the non-guaranteed remainder without assigning a party more troops than it holds.
+    /// </summary>
+    [ProtoMember(7)]
+    public int PlayerOwnedPartiesBefore { get; }
+
+    /// <summary>Whether <see cref="PlayerOwnedPartiesBefore"/> was supplied by this protocol version.</summary>
+    [ProtoMember(8)]
+    public bool HasPlayerOwnedPartiesBefore { get; }
+
     public PartyReserve(string partyId, int suppliedCount, TroopReserveEntry[] entries,
-        bool isReceiverPlayerParty = false, int sideOffset = 0, int playerOwnedRank = -1)
+        bool isReceiverPlayerParty = false, int sideOffset = 0, int playerOwnedRank = -1,
+        int playerOwnedPartiesBefore = 0)
     {
         PartyId = partyId;
         SuppliedCount = suppliedCount;
@@ -71,5 +77,7 @@ public class PartyReserve
         IsReceiverPlayerParty = isReceiverPlayerParty;
         SideOffset = sideOffset;
         PlayerOwnedRank = playerOwnedRank;
+        PlayerOwnedPartiesBefore = playerOwnedPartiesBefore;
+        HasPlayerOwnedPartiesBefore = true;
     }
 }

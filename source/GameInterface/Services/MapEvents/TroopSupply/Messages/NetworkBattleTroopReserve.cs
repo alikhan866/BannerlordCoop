@@ -45,7 +45,6 @@ public class NetworkBattleTroopReserve : IEvent
     /// Feeding every client the same side totals makes the split identical everywhere; each supplier then
     /// contributes only its own share of that allocation.
     /// </para>
-    /// Additive and default 0, which reads as "unknown" and falls back to sizing from owned totals.
     /// </summary>
     [ProtoMember(5)]
     public readonly int SideTotalTroops;
@@ -55,16 +54,23 @@ public class NetworkBattleTroopReserve : IEvent
     /// aside per player-owned party before the proportional split, so no player can be rounded down to
     /// nothing while the owners' slices still sum to exactly the allocation - see
     /// <see cref="PartyReserve.PlayerOwnedRank"/>.
-    /// <para>
-    /// Additive and default 0, which reads as "not sent" and falls back to the older apportionment with its
-    /// inexact per-owner top-up.
-    /// </para>
     /// </summary>
     [ProtoMember(6)]
     public readonly int PlayerOwnedPartyCount;
 
-    public NetworkBattleTroopReserve(string mapEventId, int side, PartyReserve[] parties, bool flushRequested = false,
-        int sideTotalTroops = 0, int playerOwnedPartyCount = 0)
+    /// <summary>
+    /// Identifies the complete two-side snapshot this message belongs to. Both side messages in one refresh
+    /// carry the same value, so a client never reconciles one side from each of two consecutive refreshes.
+    /// </summary>
+    [ProtoMember(7)]
+    public readonly long AllocationRevision;
+
+    /// <summary>The server's battle-size setting for this battle, shared by every mission owner.</summary>
+    [ProtoMember(8)]
+    public readonly int BattleSize;
+
+    public NetworkBattleTroopReserve(string mapEventId, int side, PartyReserve[] parties, int sideTotalTroops,
+        int playerOwnedPartyCount, long allocationRevision, int battleSize, bool flushRequested = false)
     {
         MapEventId = mapEventId;
         Side = side;
@@ -72,5 +78,7 @@ public class NetworkBattleTroopReserve : IEvent
         FlushRequested = flushRequested;
         SideTotalTroops = sideTotalTroops;
         PlayerOwnedPartyCount = playerOwnedPartyCount;
+        AllocationRevision = allocationRevision;
+        BattleSize = battleSize;
     }
 }

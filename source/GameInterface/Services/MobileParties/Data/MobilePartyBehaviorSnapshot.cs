@@ -45,6 +45,24 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
 
     public MobilePartyBehaviorSnapshot(IObjectManager objectManager) => this.objectManager = objectManager;
 
+    // Once per party per reference kind: a stuck party would otherwise repeat this every tick, and the point
+    // is to make a previously SILENT drop visible, not to trade one log flood for another.
+    private static readonly HashSet<string> warnedDrops = new HashSet<string>();
+
+    private static void WarnDroppedReference(MobileParty party, string what, string referenced)
+    {
+        var key = party.StringId + "|" + what;
+        lock (warnedDrops)
+        {
+            if (!warnedDrops.Add(key)) return;
+        }
+
+        Logger.Warning(
+            "[PartySync] {Party} references an unregistered {What} ('{Referenced}'); dropping that reference and " +
+            "syncing the behaviour without it, rather than sending nothing for this party",
+            party.StringId, what, referenced ?? "<null>");
+    }
+
     public bool TryCreate(
         MobileParty party,
         out PartyBehaviorUpdateData data) =>
@@ -63,26 +81,35 @@ public sealed class MobilePartyBehaviorSnapshot : IMobilePartyBehaviorSnapshot
             return FailCreation("party AI is unavailable", out failure);
         if (!TryGetCompactId(party, out string partyId))
             return FailCreation("party is not registered", out failure);
+        // An unresolvable REFERENCE must not abandon the whole update. These three used to return false, which
+        // meant no behaviour was ever produced for that party - and because the sync only ever sends behaviour
+        // this way, the client never learned the party's ShortTermBehavior and left it at None. Such a party
+        // shows the DefaultBehavior it was given ("patrolling", or nothing the UI can name) and never acts on
+        // it, permanently, because the missing reference never comes back.
+        //
+        // Seen live after a battle wedged and took its parties down with it: ~850 parties still pointed at
+        // destroyed ones, so 850 updates were dropped in silence - FailCreation discards its reason - leaving
+        // the map frozen on every client while the server ran on happily. Dropping the reference and keeping
+        // the behaviour is strictly better: the client gets a party that moves, and the AI re-targets on its
+        // next decision. This is what the MoveTargetParty branch below has always done.
         if (!TryGetInteractableReference(
             party.Ai.AiBehaviorInteractable,
             out string interactablePointId,
             out bool isInteractableAnchor))
         {
-            return FailCreation(
-                $"AI interactable '{party.Ai.AiBehaviorInteractable?.GetType().Name}' is not registered",
-                out failure);
+            WarnDroppedReference(party, "AI interactable", party.Ai.AiBehaviorInteractable?.GetType().Name);
+            interactablePointId = null;
+            isInteractableAnchor = false;
         }
         if (!TryGetCompactId(party.TargetParty, out string targetPartyId))
         {
-            return FailCreation(
-                $"target party '{party.TargetParty?.StringId}' is not registered",
-                out failure);
+            WarnDroppedReference(party, "target party", party.TargetParty?.StringId);
+            targetPartyId = null;
         }
         if (!TryGetCompactId(party.TargetSettlement, out string targetSettlementId))
         {
-            return FailCreation(
-                $"target settlement '{party.TargetSettlement?.StringId}' is not registered",
-                out failure);
+            WarnDroppedReference(party, "target settlement", party.TargetSettlement?.StringId);
+            targetSettlementId = null;
         }
 
         MoveModeType partyMoveMode = party.PartyMoveMode;

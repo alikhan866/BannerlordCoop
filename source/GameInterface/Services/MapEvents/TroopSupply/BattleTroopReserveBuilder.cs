@@ -135,20 +135,24 @@ public class BattleTroopReserveBuilder : IBattleTroopReserveBuilder
             if (partySide == BattleSideEnum.Attacker) attackerTotal += entries.Count;
             else defenderTotal += entries.Count;
 
-            // Ranked before ownership is considered, for the same reason the totals are: every client must
-            // agree on how many player-owned parties the side holds and in what order, or their guaranteed
-            // troops do not add up to the same number.
+            TryGetOwningPlayer(party, absentControllers, presentControllers, out var partyOwnerController);
+            TryGetArmyLeaderPlayer(party, absentControllers, presentControllers, out var armyLeaderController);
+            var owningController = ResolveOwningController(partyOwnerController, armyLeaderController, absentControllers);
+
+            // Only a present player's own party reserves a player slot. Offline or absent registrations fall
+            // to the host and must not reduce the allocation available to the players who entered this battle.
+            int playerOwnedPartiesBefore = partySide == BattleSideEnum.Attacker
+                ? attackerPlayerParties
+                : defenderPlayerParties;
             var playerOwnedRank = -1;
-            if (IsAnyPlayersOwnParty(party))
+            if (entries.Count > 0
+                && ResolveOwningController(partyOwnerController, null, absentControllers) != null)
             {
                 playerOwnedRank = partySide == BattleSideEnum.Attacker
                     ? attackerPlayerParties++
                     : defenderPlayerParties++;
             }
 
-            TryGetOwningPlayer(party, absentControllers, presentControllers, out var partyOwnerController);
-            TryGetArmyLeaderPlayer(party, absentControllers, presentControllers, out var armyLeaderController);
-            var owningController = ResolveOwningController(partyOwnerController, armyLeaderController, absentControllers);
             if (!IsOwnedByRequester(owningController, controllerId, isHost))
                 continue;
 
@@ -161,7 +165,8 @@ public class BattleTroopReserveBuilder : IBattleTroopReserveBuilder
                 entriesArray,
                 isReceiverPlayerParty: IsPartyRegisteredToController(party, controllerId),
                 sideOffset: partyOffset,
-                playerOwnedRank: playerOwnedRank);
+                playerOwnedRank: playerOwnedRank,
+                playerOwnedPartiesBefore: playerOwnedPartiesBefore);
             if (partySide == BattleSideEnum.Attacker)
                 attacker.Add(reserve);
             else
@@ -237,13 +242,15 @@ public class BattleTroopReserveBuilder : IBattleTroopReserveBuilder
                 if (!objectManager.TryGetId(party, out var partyId))
                     continue;
 
-                if (!builtParties.Add(partyId))
+                if (builtParties.Contains(partyId))
                     continue; // already flattened
 
                 bool hadRoster = party._roster != null;
                 var entries = FlattenParty(party);
                 DropDuplicateHeroes(mapEventId, partyId, party, entries);
+                PlacePlayerHeroFirstInReserve(party, entries);
                 ledger.SetReserve(mapEventId, partyId, entries);
+                builtParties.Add(partyId);
                 Logger.Information("[TroopSupply] Built reserve: party {PartyId} side {Side} -> {Count} troops (roster was {Roster})",
                     partyId, party.Party?.Side, entries.Count, hadRoster ? "present" : "null");
             }
@@ -426,6 +433,28 @@ public class BattleTroopReserveBuilder : IBattleTroopReserveBuilder
         return entries;
     }
 
+    private void PlacePlayerHeroFirstInReserve(MapEventParty party, List<TroopReserveEntry> entries)
+    {
+        var mobileParty = party.Party?.MobileParty;
+        if (mobileParty == null || !objectManager.TryGetId(mobileParty, out var mobilePartyId)) return;
+
+        string characterId = null;
+        foreach (var player in playerManager.Players)
+        {
+            if (player.MobilePartyId != mobilePartyId) continue;
+            characterId = player.CharacterObjectId;
+            break;
+        }
+        if (string.IsNullOrEmpty(characterId)) return;
+
+        int heroIndex = entries.FindIndex(entry => entry.CharacterId == characterId);
+        if (heroIndex <= 0) return;
+
+        var hero = entries[heroIndex];
+        entries.RemoveAt(heroIndex);
+        entries.Insert(0, hero);
+    }
+
     /// <summary>
     /// The controller that owns a party's reserve, or null if no present player does (so the host fields it).
     /// A party's own player wins; an AI party (no own player) in a player-led army falls to that army leader.
@@ -499,16 +528,6 @@ public class BattleTroopReserveBuilder : IBattleTroopReserveBuilder
         }
 
         return absentController ?? (presentControllers == null ? registeredController : null);
-    }
-
-    /// <summary>Whether this party is some player's own party — any player, not just the one being served.</summary>
-    private bool IsAnyPlayersOwnParty(MapEventParty party)
-    {
-        var mobileParty = party.Party?.MobileParty;
-        if (mobileParty == null || !objectManager.TryGetId(mobileParty, out var mobilePartyId))
-            return false;
-
-        return playerManager.Players.Any(player => player.MobilePartyId == mobilePartyId);
     }
 
     private bool IsPartyRegisteredToController(MapEventParty party, string controllerId)

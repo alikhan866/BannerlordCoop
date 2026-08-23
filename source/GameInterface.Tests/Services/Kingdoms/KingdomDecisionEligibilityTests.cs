@@ -153,7 +153,9 @@ public class KingdomDecisionEligibilityTests
                 playerManager.Object,
                 objectManager.Object,
                 messageBroker: null,
-                outcomeResolver: null);
+                outcomeResolver: null,
+                outcomeOrder: null,
+                roundPresentation: null);
         }
 
         public Player AddPlayer(string controllerId, string clanId, bool connected, bool inOtherKingdom = false)

@@ -54,10 +54,16 @@ public class WeaponPickupSerializationTests
         var sent = new NetworkWeaponPickedup(
             Guid.NewGuid(),
             EquipmentIndex.Weapon1,
+            Guid.NewGuid(),
             "sturgia_axe_2_t3",
             null,
             null,
-            new AgentEquipmentData(EquipmentIndex.Weapon1, EquipmentIndex.Weapon2, 0));
+            new AgentEquipmentData(EquipmentIndex.Weapon1, EquipmentIndex.Weapon2, 0),
+            previousSlotAmount: 0,
+            previousWorldItemAmount: 1,
+            resultingSlotAmount: 1,
+            resultingWorldItemAmount: 0,
+            worldItemConsumed: true);
 
         using var stream = new MemoryStream();
         Serializer.Serialize(stream, sent);
@@ -81,10 +87,16 @@ public class WeaponPickupSerializationTests
         var sent = new NetworkWeaponPickedup(
             Guid.NewGuid(),
             EquipmentIndex.Weapon0,
+            Guid.NewGuid(),
             null,
             null,
             null,
-            new AgentEquipmentData(EquipmentIndex.Weapon0, EquipmentIndex.None, 0));
+            new AgentEquipmentData(EquipmentIndex.Weapon0, EquipmentIndex.None, 0),
+            previousSlotAmount: 0,
+            previousWorldItemAmount: 0,
+            resultingSlotAmount: 0,
+            resultingWorldItemAmount: 0,
+            worldItemConsumed: false);
 
         using var stream = new MemoryStream();
         Serializer.Serialize(stream, sent);

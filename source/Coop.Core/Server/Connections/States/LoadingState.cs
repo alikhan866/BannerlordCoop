@@ -3,7 +3,9 @@ using Common.Logging;
 using Common.Messaging;
 using Common.Network;
 using Common.Network.Coalescing;
+using Common.Network.Messages;
 using Coop.Core.Server.Connections.Messages;
+using Coop.Core.Server.Services.Kingdoms;
 using Coop.Core.Server.Services.MobileParties;
 using LiteNetLib;
 using Serilog;
@@ -30,6 +32,7 @@ public class LoadingState : ConnectionStateBase
     private readonly IMessageBroker messageBroker;
     private readonly INetwork network;
     private readonly IJoinCampaignBaselineSender campaignBaselineSender;
+    private readonly IJoinCampaignKingdomBaseLineSender campaignKingdomBaselineSender;
     private readonly IConnectionMessageQueue connectionMessageQueue;
     private readonly ISendCoalescer coalescer;
     private static readonly ILogger Logger = LogManager.GetLogger<LoadingState>();
@@ -67,6 +70,7 @@ public class LoadingState : ConnectionStateBase
         IMessageBroker messageBroker,
         INetwork network,
         IJoinCampaignBaselineSender campaignBaselineSender,
+        IJoinCampaignKingdomBaseLineSender campaignKingdomBaselineSender,
         IConnectionMessageQueue connectionMessageQueue,
         ISendCoalescer coalescer)
         : base(connectionLogic)
@@ -74,6 +78,7 @@ public class LoadingState : ConnectionStateBase
         this.messageBroker = messageBroker;
         this.network = network;
         this.campaignBaselineSender = campaignBaselineSender;
+        this.campaignKingdomBaselineSender = campaignKingdomBaselineSender;
         this.connectionMessageQueue = connectionMessageQueue;
         this.coalescer = coalescer;
 
@@ -109,6 +114,7 @@ public class LoadingState : ConnectionStateBase
             if (!IsCurrent(JoinPhase.CampaignEntryQueued)) return;
 
             messageBroker.Publish(this, new PlayerCampaignEntered(peer));
+            messageBroker.Publish(this, new PlayerConnectionStateChanged());
             connectionMessageQueue.Flush(peer);
             phase = JoinPhase.WaitingForReplayApplied;
             network.SendImmediate(peer, new NetworkJoinSync(JoinSyncSignal.ReplayComplete));
@@ -182,6 +188,7 @@ public class LoadingState : ConnectionStateBase
 #endif
             phase = waiting;
             campaignBaselineSender.Send(peer);
+            campaignKingdomBaselineSender.Send(peer);
         }, context: context);
     }
 
@@ -208,6 +215,7 @@ public class LoadingState : ConnectionStateBase
             if (!IsCurrent(JoinPhase.CatchUpAppliedQueued)) return;
 
             connectionMessageQueue.CompleteCatchUp(peer);
+            messageBroker.Publish(this, new PlayerCampaignSynchronized(peer));
             ConnectionLogic.EnterCampaign();
         }, context: nameof(JoinSyncSignal.CatchUpApplied));
     }
