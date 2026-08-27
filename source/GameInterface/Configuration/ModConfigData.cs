@@ -119,6 +119,8 @@ public sealed class ModOptionsData
     public bool? EnableHeroExecutions { get; set; }
 
     public bool? EnablePlayerClanMemberExecutions { get; set; }
+    
+    public bool? PlayerWoundedBattleEntry { get; set; }
 
     /// <summary>
     /// Whether town militia join a garrison's sally-out. Vanilla keeps them on the walls.

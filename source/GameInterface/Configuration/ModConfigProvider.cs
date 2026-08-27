@@ -58,6 +58,8 @@ public readonly struct ModOptions
     public readonly bool EnablePlayerClanMemberExecutions { get; } = false;
     [ProtoMember(19)]
     public readonly bool ShowPlayerNameplates { get; } = true;
+    [ProtoMember(20)]
+    public readonly bool PlayerWoundedBattleEntry { get; } = true;
 
     /// <summary>
     /// Whether a side that exceeds its share of the battle size has troops stood down to bring it back.
@@ -78,13 +80,13 @@ public readonly struct ModOptions
     /// zero, so the switch stays: turning it off costs only that a side may exceed its share after a large
     /// reinforcement, which is a working battle.
     /// </remarks>
-    [ProtoMember(20)]
-    public readonly bool TrimFieldToBattleSize { get; } = true;
     [ProtoMember(21)]
-    public readonly bool MilitiaJoinsSallyOut { get; } = true;
+    public readonly bool TrimFieldToBattleSize { get; } = true;
     [ProtoMember(22)]
-    public readonly bool ResumeSiegeWhenEnemyRetreats { get; } = true;
+    public readonly bool MilitiaJoinsSallyOut { get; } = true;
     [ProtoMember(23)]
+    public readonly bool ResumeSiegeWhenEnemyRetreats { get; } = true;
+    [ProtoMember(24)]
     public readonly bool GarrisonJoinsSiegeRelief { get; } = true;
 
     /// <summary>
@@ -101,7 +103,7 @@ public readonly struct ModOptions
     ///
     /// Turning it off restores vanilla routing, at the cost of that noise.
     /// </remarks>
-    [ProtoMember(24)]
+    [ProtoMember(25)]
     public readonly bool DisableBattleMorale { get; } = true;
 
     /// <summary>
@@ -116,7 +118,7 @@ public readonly struct ModOptions
     /// Only the AI's proposals are suppressed. The ruler's own diplomacy screen is untouched, and war can
     /// still arrive the ways it should: rebellion, crime, a call to war from an ally, hostility in the field.
     /// </remarks>
-    [ProtoMember(25)]
+    [ProtoMember(26)]
     public readonly bool PlayerLedKingdomsControlTheirOwnDiplomacy { get; } = true;
 
     public ModOptions(ModOptionsData modOptionsData)
@@ -146,5 +148,6 @@ public readonly struct ModOptions
         GarrisonJoinsSiegeRelief = modOptionsData.GarrisonJoinsSiegeRelief ?? GarrisonJoinsSiegeRelief;
         DisableBattleMorale = modOptionsData.DisableBattleMorale ?? DisableBattleMorale;
         PlayerLedKingdomsControlTheirOwnDiplomacy = modOptionsData.PlayerLedKingdomsControlTheirOwnDiplomacy ?? PlayerLedKingdomsControlTheirOwnDiplomacy;
+        PlayerWoundedBattleEntry = modOptionsData.PlayerWoundedBattleEntry ?? PlayerWoundedBattleEntry;
     }
 }

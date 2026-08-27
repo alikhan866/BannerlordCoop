@@ -37,6 +37,7 @@ public class CoopTroopSupplier : IMissionTroopSupplier
         private readonly bool ownsReceiverPlayerParty;
         private readonly int receiverPlayerRank;
         private readonly bool hasPlayerOwnedPartiesBefore;
+        private readonly int[] supplyOrders;
 
         public long Revision { get; }
         public int BattleSize { get; }
@@ -48,7 +49,7 @@ public class CoopTroopSupplier : IMissionTroopSupplier
             int suppliedTroops,
             int playerOwnedPartyCount, bool ownsReceiverPlayerParty, int receiverPlayerRank,
             bool hasPlayerOwnedPartiesBefore,
-            int[] partyOffsets, int[] partyCounts)
+            int[] partyOffsets, int[] partyCounts, int[] supplyOrders)
         {
             Revision = revision;
             BattleSize = battleSize;
@@ -61,6 +62,7 @@ public class CoopTroopSupplier : IMissionTroopSupplier
             this.hasPlayerOwnedPartiesBefore = hasPlayerOwnedPartiesBefore;
             this.partyOffsets = partyOffsets;
             this.partyCounts = partyCounts;
+            this.supplyOrders = supplyOrders;
         }
 
         public int OwnedShareOf(int sideAllocation)
@@ -70,6 +72,14 @@ public class CoopTroopSupplier : IMissionTroopSupplier
             int total = SideTotalTroops;
             if (total <= 0) return 0;
             sideAllocation = Math.Min(sideAllocation, total);
+            if (supplyOrders != null)
+            {
+                int rankedShare = 0;
+                foreach (int supplyOrder in supplyOrders)
+                    if (supplyOrder > 0 && supplyOrder <= sideAllocation)
+                        rankedShare++;
+                return rankedShare;
+            }
             if (TotalTroops >= total) return sideAllocation;
 
             if (playerOwnedPartyCount > 0)
@@ -138,6 +148,7 @@ public class CoopTroopSupplier : IMissionTroopSupplier
     private long allocationRevision;
     private int battleSize;
     private int reserveRevision;
+    private bool usesSupplyOrder;
     private int numWounded, numKilled, numRouted;
     private bool sizingSourceReported;
     // Injected at construction (a stable per-session singleton) so the per-agent supply path resolves troop/party
@@ -224,6 +235,19 @@ public class CoopTroopSupplier : IMissionTroopSupplier
                         seedToPartyId[entry.Seed] = party.PartyId;
                 }
             }
+            usesSupplyOrder = false;
+            bool foundEntry = false;
+            bool allEntriesRanked = true;
+            foreach (var party in parties)
+            {
+                foreach (var entry in party.Entries)
+                {
+                    foundEntry = true;
+                    if (entry.SupplyOrder <= 0)
+                        allEntriesRanked = false;
+                }
+            }
+            usesSupplyOrder = foundEntry && allEntriesRanked;
             populated = true;
             reserveRevision++;
 
@@ -343,6 +367,16 @@ public class CoopTroopSupplier : IMissionTroopSupplier
                 receiverPlayerRank = party.PlayerOwnedRank;
             }
 
+            int[] ownedSupplyOrders = null;
+            if (usesSupplyOrder)
+            {
+                ownedSupplyOrders = new int[total];
+                int supplyOrderIndex = 0;
+                foreach (var party in parties)
+                    foreach (var entry in party.Entries)
+                        ownedSupplyOrders[supplyOrderIndex++] = entry.SupplyOrder;
+            }
+
             return new AllocationSnapshot(
                 allocationRevision,
                 battleSize,
@@ -354,7 +388,8 @@ public class CoopTroopSupplier : IMissionTroopSupplier
                 receiverPlayerRank,
                 hasGuaranteedSlotOffsets,
                 partyOffsets,
-                partyCounts);
+                partyCounts,
+                ownedSupplyOrders);
         }
     }
 
@@ -399,21 +434,24 @@ public class CoopTroopSupplier : IMissionTroopSupplier
                     ? agentBudget.RemainingCapacity(agentBudget.CountLiveAgents(Mission.Current))
                     : int.MaxValue;
                 int allocated = 0;
-                foreach (var party in parties)
-                {
-                    for (int index = party.Supplied;
-                         allocated < numberToAllocate && index < party.Entries.Length;
-                         index++)
-                    {
-                        var origin = CreateOrigin(party.Entries[index], party.PartyId);
-                        int slots = SlotsForOrigin(origin);
-                        if (slots > slotBudget) return action(origins);
+                var previewPointers = new int[parties.Count];
+                for (int i = 0; i < parties.Count; i++)
+                    previewPointers[i] = parties[i].Supplied;
 
-                        allocated++;
-                        slotBudget -= slots;
-                        if (origin != null) origins.Add(origin);
-                    }
-                    if (allocated >= numberToAllocate) break;
+                while (allocated < numberToAllocate)
+                {
+                    int partyIndex = GetNextPartyIndex(previewPointers);
+                    if (partyIndex < 0) break;
+
+                    var party = parties[partyIndex];
+                    var origin = CreateOrigin(party.Entries[previewPointers[partyIndex]], party.PartyId);
+                    int slots = SlotsForOrigin(origin);
+                    if (slots > slotBudget) return action(origins);
+
+                    previewPointers[partyIndex]++;
+                    allocated++;
+                    slotBudget -= slots;
+                    if (origin != null) origins.Add(origin);
                 }
             }
             return action(origins);
@@ -589,30 +627,55 @@ public class CoopTroopSupplier : IMissionTroopSupplier
         int supplied = 0;
         lock (gate)
         {
-            // Each party gives up its own share of the wave. Draining them in order instead emptied the first
-            // party before the second contributed anything, and the receiver's own party is deliberately first
-            // (below), so a player in an army fielded their whole party against the enemy's mixed wave and
-            // fought it alone - the allied lords trickled in one at a time as those men died.
-            var quota = BuildWaveQuota(numberToAllocate);
-
-            bool stop = false;
-            for (int i = 0; i < parties.Count && !stop; i++)
+            // A siege-ambush wave is ranked by SupplyOrder, and that ranking is only meaningful troop by
+            // troop, so honour it exactly as upstream does.
+            if (usesSupplyOrder)
             {
-                var party = parties[i];
-                int take = quota[i];
-                while (take > 0 && party.Supplied < party.Entries.Length)
+                while (supplied < numberToAllocate)
                 {
+                    var party = GetNextPartyWithRemaining();
+                    if (party == null) break;
+
                     var origin = CreateOrigin(party.Entries[party.Supplied], party.PartyId);
                     int slots = SlotsForOrigin(origin);
-                    // Stop rather than skip: the supplied pointer advances sequentially within a party, so a
-                    // troop that does not fit now must remain unsupplied (wave-eligible), not be jumped over.
-                    if (slots > slotBudget) { stop = true; break; }
+                    // Stop rather than skip: the supplied pointer advances sequentially, so a troop that does
+                    // not fit now must remain unsupplied (wave-eligible) instead of being jumped over.
+                    if (slots > slotBudget) break;
 
                     party.Supplied++;
                     supplied++;
-                    take--;
                     slotBudget -= slots;
                     if (origin != null) origins.Add(origin);
+                }
+            }
+            // Unranked, each party gives up its own share of the wave instead. GetNextPartyWithRemaining falls
+            // back to the first party still holding troops, which drains them in order: that emptied the first
+            // party before the second contributed anything, and the receiver's own party is deliberately first
+            // (below), so a player in an army fielded their whole party against the enemy's mixed wave and
+            // fought it alone - the allied lords trickled in one at a time as those men died.
+            else
+            {
+                var quota = BuildWaveQuota(numberToAllocate);
+
+                bool stop = false;
+                for (int i = 0; i < parties.Count && !stop; i++)
+                {
+                    var party = parties[i];
+                    int take = quota[i];
+                    while (take > 0 && party.Supplied < party.Entries.Length)
+                    {
+                        var origin = CreateOrigin(party.Entries[party.Supplied], party.PartyId);
+                        int slots = SlotsForOrigin(origin);
+                        // Stop rather than skip: the supplied pointer advances sequentially within a party, so
+                        // a troop that does not fit now must remain unsupplied (wave-eligible), not jumped over.
+                        if (slots > slotBudget) { stop = true; break; }
+
+                        party.Supplied++;
+                        supplied++;
+                        take--;
+                        slotBudget -= slots;
+                        if (origin != null) origins.Add(origin);
+                    }
                 }
             }
         }
@@ -719,17 +782,48 @@ public class CoopTroopSupplier : IMissionTroopSupplier
     {
         lock (gate)
         {
-            foreach (var party in parties)
-            {
-                if (party.Supplied < party.Entries.Length)
-                {
-                    var origin = CreateOrigin(party.Entries[party.Supplied], party.PartyId);
-                    party.Supplied++;
-                    return origin;
-                }
-            }
-            return null;
+            var party = GetNextPartyWithRemaining();
+            if (party == null) return null;
+
+            var origin = CreateOrigin(party.Entries[party.Supplied], party.PartyId);
+            party.Supplied++;
+            return origin;
         }
+    }
+
+    private PartyState GetNextPartyWithRemaining()
+    {
+        PartyState next = null;
+        int nextOrder = int.MaxValue;
+        foreach (var party in parties)
+        {
+            if (party.Supplied >= party.Entries.Length) continue;
+            if (!usesSupplyOrder) return party;
+
+            int supplyOrder = party.Entries[party.Supplied].SupplyOrder;
+            if (supplyOrder >= nextOrder) continue;
+            next = party;
+            nextOrder = supplyOrder;
+        }
+        return next;
+    }
+
+    private int GetNextPartyIndex(int[] pointers)
+    {
+        int nextIndex = -1;
+        int nextOrder = int.MaxValue;
+        for (int i = 0; i < parties.Count; i++)
+        {
+            var party = parties[i];
+            if (pointers[i] >= party.Entries.Length) continue;
+            if (!usesSupplyOrder) return i;
+
+            int supplyOrder = party.Entries[pointers[i]].SupplyOrder;
+            if (supplyOrder >= nextOrder) continue;
+            nextIndex = i;
+            nextOrder = supplyOrder;
+        }
+        return nextIndex;
     }
 
     /// <summary>Supply the next remaining troop from one party without consuming any other party.</summary>
@@ -755,12 +849,16 @@ public class CoopTroopSupplier : IMissionTroopSupplier
         var origins = new List<IAgentOriginBase>();
         lock (gate)
         {
-            foreach (var party in parties)
-                foreach (var entry in party.Entries)
-                {
-                    var origin = CreateOrigin(entry, party.PartyId);
-                    if (origin != null) origins.Add(origin);
-                }
+            var pointers = new int[parties.Count];
+            while (true)
+            {
+                int partyIndex = GetNextPartyIndex(pointers);
+                if (partyIndex < 0) break;
+
+                var party = parties[partyIndex];
+                var origin = CreateOrigin(party.Entries[pointers[partyIndex]++], party.PartyId);
+                if (origin != null) origins.Add(origin);
+            }
         }
         return origins;
     }
