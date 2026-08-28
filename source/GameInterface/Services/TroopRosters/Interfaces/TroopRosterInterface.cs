@@ -9,7 +9,6 @@ using GameInterface.Services.TroopRosters.Messages;
 using Serilog;
 using System.Collections.Generic;
 using System.Linq;
-using System.Xml.Linq;
 using TaleWorlds.CampaignSystem;
 using TaleWorlds.CampaignSystem.Actions;
 using TaleWorlds.CampaignSystem.Party;
@@ -228,6 +227,32 @@ internal class TroopRosterInterface : ITroopRosterInterface
                 if (!uniqueElements.Add((roster, character))) return false;
 
                 currentByCharacter.TryGetValue(character, out var current);
+                // Two rules meet here, because the two shapes of bad delta are not the same thing.
+                //
+                // A HERO is one indivisible person: there is no "move what is there" for half of one, so a
+                // delta that does not fit is a STALE request - the hero has already gone somewhere else - and
+                // the whole batch is refused rather than quietly clamped to nothing. Clamping one would let a
+                // stale transfer half-apply, which is the case upstream added these guards for.
+                //
+                // A TROOP STACK is divisible, so an overdrawn one is clamped to what is actually there and the
+                // shortfall is withheld from the destination below. That is the shape seen in the wild: a
+                // client moving 30 of a militia stack the server holds 15 of.
+                //
+                // Overflow is refused whichever it is: there is no sane state to clamp towards.
+                long finalNumber = current.number + elementData.Number;
+                long finalWounded = current.wounded + elementData.WoundedNumber;
+                long finalXp = current.xp + elementData.Xp;
+
+                bool doesNotFit =
+                    finalNumber < 0 ||
+                    finalWounded < 0 ||
+                    finalWounded > finalNumber ||
+                    finalXp < 0 ||
+                    (elementData.Xp != 0 && finalNumber == 0 && finalXp != 0);
+                bool overflows = finalNumber > int.MaxValue || finalXp > int.MaxValue;
+
+                if (overflows || (doesNotFit && character.IsHero)) return false;
+
                 var clamped = ClampToHoldableState(elementData, current);
                 if (clamped.Number != elementData.Number ||
                     clamped.WoundedNumber != elementData.WoundedNumber ||
