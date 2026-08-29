@@ -137,6 +137,24 @@ public class SiegeMachineStateReplicator : ISiegeMachineStateReplicator
         float elapsed = pollTimer;
         pollTimer = 0f;
 
+        // Everything below runs on the mission tick, where an escaping exception does not merely skip a poll -
+        // it takes the tick with it and the client dies outright. Every OTHER entry point into this replicator
+        // arrives through GameThread.WrapSafe and is caught; this one was the single unguarded path, which is
+        // why the same fault logged harmlessly on one peer and killed the other. Replicating siege machinery
+        // is an improvement on the battle, never a prerequisite for it - same guard, same reason, as
+        // BattleFieldBalancer.Tick.
+        try
+        {
+            TickCore(elapsed);
+        }
+        catch (Exception e)
+        {
+            Logger.Error(e, "[BattleSync] Siege machine replication pass failed; the battle continues unreplicated");
+        }
+    }
+
+    private void TickCore(float elapsed)
+    {
         RefreshMachineCache();
         DrainPendingMachineStates();
 
@@ -370,6 +388,26 @@ public class SiegeMachineStateReplicator : ISiegeMachineStateReplicator
             animationIndex);
     }
 
+    /// <summary>
+    /// Stops this peer's AI driving machines it does not simulate, WITHOUT closing them to the local player.
+    /// </summary>
+    /// <remarks>
+    /// This used to call <c>machine.Deactivate()</c>, which shuts a usable object for everyone - the human
+    /// player included - and it ran over every <see cref="UsableMachine"/> in the mission rather than over
+    /// siege machinery. On the peer that did not start the battle it switched off 1116 of ~1480 standing
+    /// points, including 231 chair use points and 552 animation points, so that player got no interaction
+    /// prompt on anything at all: not siege weapons, not stone piles, not the castle's furniture. The stone
+    /// piles still LOOKED full because nothing had been consumed - they were merely closed.
+    ///
+    /// It presented as "one player cannot interact" and followed whoever did not click attack, because that
+    /// is the peer this branch runs on. Measured by recording the writer of the flag rather than reading the
+    /// flag: every one of those deactivations traced to this method, and the client that started the battle
+    /// logged none.
+    ///
+    /// Disabling the AI is what the intent above actually asks for, and it is what RefreshMachineGates
+    /// already does for ranged weapons a few lines below. A player standing at a machine this peer does not
+    /// simulate is fine - claiming it is how ownership is taken in the first place.
+    /// </remarks>
     private void DeactivateNewMachines()
     {
         foreach (var machine in machines)
@@ -382,7 +420,7 @@ public class SiegeMachineStateReplicator : ISiegeMachineStateReplicator
 
             if (!deactivated.Add(machine.Id.Id)) continue;
 
-            machine.Deactivate();
+            machine.SetIsDisabledForAI(true);
         }
     }
 
@@ -800,7 +838,26 @@ public class SiegeMachineStateReplicator : ISiegeMachineStateReplicator
         {
             foreach (var formation in new List<Formation>(siegeWeapon._forcedUseFormations))
             {
-                formation.StopUsingMachine(machine, !formation.IsAIControlled);
+                // A formation this peer never ATTACHED cannot be detached. On a non-host peer
+                // DeactivateNewMachines disables the machine's AI, so the machine is never registered with
+                // that team's DetachmentManager - while _forcedUseFormations, an engine field we read
+                // directly, still carries entries. Vanilla's OnFormationLeaveDetachment then indexes a
+                // dictionary that has no such key and throws KeyNotFoundException.
+                //
+                // Caught PER FORMATION so one stale entry cannot abandon the rest of the list, and - the part
+                // that actually matters - so the Clear below still runs. The throw used to happen before it,
+                // leaving the offending formation in place for every later gate refresh to trip over again:
+                // a fault that, once triggered, repeated for the remainder of the mission.
+                try
+                {
+                    formation.StopUsingMachine(machine, !formation.IsAIControlled);
+                }
+                catch (Exception e)
+                {
+                    Logger.Warning(e,
+                        "[BattleSync] Formation could not be detached from siege machine {Machine}; it was never attached on this peer",
+                        machine.Id.Id);
+                }
             }
 
             siegeWeapon._forcedUseFormations.Clear();

@@ -151,6 +151,15 @@ public class CoopTroopSupplier : IMissionTroopSupplier
     private bool usesSupplyOrder;
     private int numWounded, numKilled, numRouted;
     private bool sizingSourceReported;
+    /// <summary>How long the side must stand short before another owner's unused share may be taken up.</summary>
+    /// <remarks>
+    /// Long enough that an owner mid-wave, mid-load or briefly stalled is never raced, short enough that a
+    /// side is not left bleeding for minutes. The live fault ran for twenty minutes, so anything under that is
+    /// an improvement; twenty seconds is roughly two native reinforcement intervals.
+    /// </remarks>
+    internal const double UnusedShareGraceSeconds = 20d;
+    // Null whenever our own quota is open or the side is at strength - see UnusedShareBackfill.
+    private DateTime? sideShortSinceUtc;
     // Injected at construction (a stable per-session singleton) so the per-agent supply path resolves troop/party
     // objects without hitting the service locator each call. Null only in tests that don't exercise that path.
     private readonly IObjectManager objectManager;
@@ -609,6 +618,9 @@ public class CoopTroopSupplier : IMissionTroopSupplier
         {
             Logger.Information("[TroopSupply] {MapEvent} side {Side}: engine asked for {Req}, my remaining quota is {Quota}; supplying {Capped}",
                 MapEventId, Side, numberToAllocate, myQuota, capped);
+            // C4 - the same decision, kept where a test can ask for it. A refusal explains why men never
+            // reached the field, and that question is asked while the battle is still running.
+            BattleObservationLedger.RecordRefusal(MapEventId, Side, numberToAllocate, myQuota, capped);
             numberToAllocate = capped;
         }
         if (numberToAllocate <= 0) return Array.Empty<IAgentOriginBase>();
@@ -707,44 +719,45 @@ public class CoopTroopSupplier : IMissionTroopSupplier
     /// </remarks>
     private int[] BuildWaveQuota(int numberToAllocate)
     {
-        var quota = new int[parties.Count];
-
+        var remaining = new int[parties.Count];
         long totalRemaining = 0;
         for (int i = 0; i < parties.Count; i++)
-            totalRemaining += parties[i].Entries.Length - parties[i].Supplied;
-        if (totalRemaining <= 0) return quota;
+        {
+            remaining[i] = parties[i].Entries.Length - parties[i].Supplied;
+            totalRemaining += remaining[i];
+        }
+        if (totalRemaining <= 0) return new int[parties.Count];
 
         // Asking for more than exists is normal (the engine asks for a side's whole deficit); apportioning the
         // capped figure is what keeps each party's share inside its own remainder.
         long target = Math.Min(numberToAllocate, totalRemaining);
 
-        long cumulative = 0;
-        long allocatedSoFar = 0;
-        for (int i = 0; i < parties.Count; i++)
-        {
-            long remaining = parties[i].Entries.Length - parties[i].Supplied;
-            cumulative += remaining;
-            // long throughout: cumulative * target overflows int for a large army and a large wave, and an
-            // overflow here would hand out a negative or wrapped share.
-            long end = cumulative * target / totalRemaining;
-            quota[i] = (int)Math.Min(end - allocatedSoFar, remaining);
-            allocatedSoFar += quota[i];
-        }
+        // The own party is only present in the supplier for the side this player is actually on, so its
+        // absence is the side guard: a supplier for the OTHER side has no playerPartyId and can never have
+        // its composition reordered by this client's preference.
+        int ownIndex = IndexOfPlayerParty();
+        bool ownFirst = ownIndex >= 0 &&
+            LocalTroopDeploymentPreference.Current == TroopDeploymentPreference.MyTroopsFirst;
+
+        // Read per wave, not captured at battle start, so the deployment screen can change it mid-battle and
+        // have reinforcements honour it - reinforcement comes through this same path.
+        int[] quota = ownFirst
+            ? WaveQuota.OwnPartyFirst(remaining, target, ownIndex)
+            : WaveQuota.Proportional(remaining, target);
 
         GuaranteeReceiverPlayerATroop(quota, target);
         return quota;
     }
 
-    /// <summary>
-    /// Makes sure the receiver's own party contributes to a non-empty wave, taking the troop from the largest
-    /// share so the wave still totals exactly what was asked for.
-    /// </summary>
-    /// <remarks>
-    /// A player whose party is tiny next to the army it fights with rounds to nothing - "one player with only
-    /// himself" alongside a 999-strong lord is the extreme case. That player would field no agent at all,
-    /// which is not a cosmetic loss: they have nothing to control, and the spawn handler reads a missing
-    /// origin on the side holding the local player as a reason to abort the battle.
-    /// </remarks>
+    /// <summary>Index of this client's own party, or -1 when this supplier is not for the player's side.</summary>
+    private int IndexOfPlayerParty()
+    {
+        if (playerPartyId == null) return -1;
+        for (int i = 0; i < parties.Count; i++)
+            if (parties[i].PartyId == playerPartyId) return i;
+        return -1;
+    }
+
     private void GuaranteeReceiverPlayerATroop(int[] quota, long target)
     {
         if (playerPartyId == null || target <= 0) return;
@@ -946,7 +959,93 @@ public class CoopTroopSupplier : IMissionTroopSupplier
 
         ReportSizingSourceOnce(target);
 
-        return Math.Max(0, OwnedShareOf(target) - CountMyTroopsOnField(Mission.Current));
+        int ownQuota = Math.Max(0, OwnedShareOf(target) - CountMyTroopsOnField(Mission.Current));
+        if (ownQuota > 0)
+        {
+            sideShortSinceUtc = null;
+            return ownQuota;
+        }
+
+        return UnusedShareBackfill(target);
+    }
+
+    /// <summary>
+    /// Room another owner has been given but is not using, once it has gone unused long enough to be a fault
+    /// rather than a delay.
+    /// </summary>
+    /// <remarks>
+    /// The private quota above exists so owners cannot race each other for the same slots, and that is right.
+    /// What it lacks is a floor: a share its owner never fields is unreachable by anyone, FOREVER. Nothing
+    /// times it out, and the side simply stands short with men in reserve and nothing able to draw them.
+    ///
+    /// Measured live at the siege of Rovalt (2026-08-29): this client's defender supplier held 1 party / 123
+    /// of the side's 628 men; the co-owner held the other 505 and three of its parties never fielded a single
+    /// agent. The defence decayed from 198 on the field to 52 across twenty minutes with 572 men unspawned,
+    /// while the attackers reinforced freely. It recovered to 145 within ninety seconds of that owner
+    /// dropping and its parties being adopted here - which is the whole proof: one owner holding the side was
+    /// never the problem, an owner holding a share it would not spend was.
+    ///
+    /// Claimed only after the side has stood short for <see cref="UnusedShareGraceSeconds"/> CONTINUOUSLY, so
+    /// an owner that is merely slow to ask keeps its share; the timer resets the moment our own quota reopens
+    /// or the side comes back to strength.
+    ///
+    /// ponytail: one grace timer per supplier, no cross-client coordination. Two owners can therefore both
+    /// back-fill the same gap and overshoot the target; BattleFieldBalancer already trims a side that stands
+    /// over its share, which is exactly what it is there for. Coordinate through the host only if the trim
+    /// churn shows up in practice.
+    /// </remarks>
+    private int UnusedShareBackfill(int target)
+    {
+        int sideRoom = BattleFieldRoom.RoomLeft(target, BattleFieldRoom.CountActiveHumans(Mission.Current, Side));
+        int grant = BackfillGrant(sideRoom, DateTime.UtcNow, ref sideShortSinceUtc);
+        if (grant <= 0) return 0;
+
+        Logger.Information(
+            "[TroopSupply] {MapEvent} side {Side}: my share is spent but the side is still {Room} short of {Target}; " +
+            "taking up the unused share",
+            MapEventId, Side, sideRoom, target);
+
+        return grant;
+    }
+
+    /// <summary>
+    /// Whether a side that has stood short long enough may be back-filled, and how much.
+    /// </summary>
+    /// <remarks>
+    /// Pure but for the clock, and separated for the same reason <see cref="WaveQuota"/> is: the question is
+    /// really about a stopwatch, and standing up a mission, an object manager and two live reserves to ask it
+    /// would mean sampling the answer rather than proving it.
+    ///
+    /// The property that matters is that the wait is CONTINUOUS. A side that dips short, recovers, and dips
+    /// again must start its wait over - otherwise a battle that has merely been fought for a while accumulates
+    /// enough scattered short moments to unlock the back-fill while the co-owner is supplying perfectly well,
+    /// and both owners then fill the same gap. Resetting the mark on every recovery is what makes the grace a
+    /// measure of "this owner has stopped" rather than of "this battle has lasted".
+    /// </remarks>
+    internal static int BackfillGrant(int sideRoom, DateTime now, ref DateTime? shortSinceUtc)
+    {
+        if (sideRoom <= 0)
+        {
+            shortSinceUtc = null;
+            return 0;
+        }
+
+        if (shortSinceUtc == null)
+        {
+            shortSinceUtc = now;
+            return 0;
+        }
+
+        // A clock that has gone backwards (a resumed process, an NTP step) would otherwise hold the wait open
+        // forever. Re-mark and start again rather than grant on a negative interval.
+        double waited = (now - shortSinceUtc.Value).TotalSeconds;
+        if (waited < 0)
+        {
+            shortSinceUtc = now;
+            return 0;
+        }
+
+        return waited >= UnusedShareGraceSeconds ? sideRoom : 0;
     }
 
     /// <summary>

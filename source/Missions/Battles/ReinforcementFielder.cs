@@ -1119,6 +1119,23 @@ public class ReinforcementFielder : IReinforcementFielder
 
     private bool TryGetFriendlyLinePosition(Mission mission, Team team, out Vec3 position, out Vec2 direction)
     {
+        position = Vec3.Zero;
+        direction = Vec2.Forward;
+
+        // A SIEGE has no line to average. The centroid rule below assumes a side that stands together facing
+        // one way, which is true of a field battle and false the moment a wall is involved: a besieging side is
+        // spread from its camp, up the ladders, along the battlements and - once it breaks in - inside the
+        // town. Average those and the answer walks inward across the wall as the assault succeeds, until every
+        // reinforcement is being placed INSIDE the settlement its own side is attacking. Reported exactly that
+        // way: "enemies were spawning inside my city and not their spawn."
+        //
+        // The engine's own reinforcement frame is right here and does not need helping. The override exists
+        // because a co-op FIELD battle has no properly built deployment plan; a siege scene carries real spawn
+        // points as scene data, so falling back restores the correct behaviour rather than merely a safer one.
+        // Both sides are excluded, not just the attacker: a sally-out puts the defenders through the same gate
+        // and gives their centroid the same problem in the other direction.
+        if (mission != null && mission.IsSiegeBattle) return false;
+
         var side = team?.Side ?? BattleSideEnum.None;
         var now = mission.CurrentTime;
 

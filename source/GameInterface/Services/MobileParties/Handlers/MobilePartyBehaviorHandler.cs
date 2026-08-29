@@ -3,6 +3,7 @@ using Common.Logging;
 using Common.Messaging;
 using Common.Util;
 using GameInterface.Services.Entity;
+using GameInterface.Services.GameState.Messages;
 using GameInterface.Services.MobileParties.Data;
 using GameInterface.Services.MobileParties.Extensions;
 using GameInterface.Services.MobileParties.Interfaces;
@@ -38,6 +39,7 @@ internal class MobilePartyBehaviorHandler : IHandler
     private readonly IMobilePartyInterface mobilePartyInterface;
     private readonly IObjectManager objectManager;
     private readonly IMobilePartyBehaviorSnapshot mobilePartyBehaviorSnapshot;
+    private readonly PartyPositionCorrection positionCorrection = new PartyPositionCorrection();
 
     public MobilePartyBehaviorHandler(
         IMessageBroker messageBroker,
@@ -54,12 +56,59 @@ internal class MobilePartyBehaviorHandler : IHandler
 
         messageBroker.Subscribe<PartyBehaviorChangeAttempted>(Handle_PartyBehaviorChanged);
         messageBroker.Subscribe<UpdatePartyBehavior>(Handle_UpdatePartyBehavior);
+        messageBroker.Subscribe<CampaignReady>(Handle_CampaignReady);
     }
 
     public void Dispose()
     {
         messageBroker.Unsubscribe<PartyBehaviorChangeAttempted>(Handle_PartyBehaviorChanged);
         messageBroker.Unsubscribe<UpdatePartyBehavior>(Handle_UpdatePartyBehavior);
+        messageBroker.Unsubscribe<CampaignReady>(Handle_CampaignReady);
+    }
+
+    /// <summary>
+    /// Starts the drift sweep once a campaign exists to sweep.
+    /// </summary>
+    /// <remarks>
+    /// Registered here rather than in the constructor because the handler is built by the container before any
+    /// campaign is loaded, and <c>CampaignEvents</c> has nothing to attach to until then.
+    /// </remarks>
+    private void Handle_CampaignReady(MessagePayload<CampaignReady> obj)
+    {
+        // Server only: the correction re-states what the authority believes, so a client emitting them would
+        // simply be arguing with the server about parties it does not own.
+        if (!ModInformation.IsServer) return;
+
+        CampaignEvents.HourlyTickEvent.AddNonSerializedListener(this, CorrectDriftedPartyPositions);
+    }
+
+    /// <summary>
+    /// Re-states the position of parties that have travelled far enough for the clients' copies to have
+    /// drifted - see <see cref="PartyPositionCorrection"/> for why this is needed at all.
+    /// </summary>
+    /// <remarks>
+    /// Hourly rather than per-frame: a campaign hour is the coarsest cadence that still bounds the error to
+    /// something a player would not read as a jump, and it costs one pass over the party list per hour instead
+    /// of per frame. The pass is budgeted, so the cost of a fast-forward is bounded too.
+    ///
+    /// Failures are swallowed deliberately. This runs on the campaign tick, where an escaping exception stops
+    /// the whole tick; a missed correction is a party that jumps once, which is the bug this reduces, not a
+    /// reason to take the campaign down with it.
+    /// </remarks>
+    private void CorrectDriftedPartyPositions()
+    {
+        try
+        {
+            var parties = Campaign.Current?.CampaignObjectManager?.MobileParties;
+            if (parties == null) return;
+
+            foreach (var party in positionCorrection.SelectPartiesToCorrect(parties))
+                PublishForcedPosition(party);
+        }
+        catch (Exception e)
+        {
+            Logger.Error(e, "Party position drift correction failed; the campaign continues uncorrected");
+        }
     }
 
     public void Handle_PartyBehaviorChanged(MessagePayload<PartyBehaviorChangeAttempted> obj)
@@ -265,6 +314,24 @@ internal class MobilePartyBehaviorHandler : IHandler
         return latestPredictions.TryGetValue(partyId, out data);
     }
 
+    /// <summary>
+    /// Whether the client should take the server's word for where a party is.
+    /// </summary>
+    /// <remarks>
+    /// A moving party is normally left to the client's own simulation - it is already walking the same
+    /// replicated target, so an in-flight snapshot is a frame or two stale and adopting it only jitters.
+    ///
+    /// What that reasoning lacked was a CEILING. Nothing bounded how far the two simulations could part
+    /// company, and since a position only travels inside a behaviour update - which
+    /// <see cref="MobilePartyAIs.Patches.PartyBehaviorPatch"/> publishes only when the behaviour CHANGES - a
+    /// party marching under one unchanged order was corrected by nothing at all for the whole journey. The
+    /// debt was then settled in a single assignment the moment it held or was forced, which is what
+    /// "lords teleport across the map to join an army" actually was.
+    ///
+    /// So a distance term, at the same threshold the server re-states positions on
+    /// (<see cref="PartyPositionCorrection.CorrectionDistance"/>): below it the snapshot is merely stale and is
+    /// still ignored, above it the client is not slightly behind, it is somewhere else.
+    /// </remarks>
     internal static bool ShouldApplyAuthoritativePosition(
         bool isSelfEcho,
         bool forcePosition,
@@ -273,6 +340,9 @@ internal class MobilePartyBehaviorHandler : IHandler
         CampaignVec2 authoritativePosition)
     {
         return !isSelfEcho &&
-            (forcePosition || isHolding || currentPosition.IsOnLand != authoritativePosition.IsOnLand);
+            (forcePosition
+             || isHolding
+             || currentPosition.IsOnLand != authoritativePosition.IsOnLand
+             || currentPosition.DistanceSquared(authoritativePosition) >= PartyPositionCorrection.CorrectionDistanceSquared);
     }
 }
