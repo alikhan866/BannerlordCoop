@@ -923,6 +923,97 @@ public sealed class MovementRateController : IMovementRateController
             ? double.Epsilon
             : bytesPerSecond;
 
+    /// <summary>
+    /// The lowest duty tier. Under it, movement is not a meaningful share of the frame.
+    /// </summary>
+    internal const double MeaningfulSenderDuty = 0.12d;
+
+    /// <summary>
+    /// The floor the FRAME-RATE ladder may not drag us below while movement is not a meaningful share of the
+    /// frame.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately 40 and not <see cref="MaximumAdaptiveHz"/>: it doubles the rate for the clients this
+    /// actually affects while only halving the extra cost, which keeps the first version of this change small
+    /// enough to reason about. Clients whose frame rate already earns 60 still get 60 - the floor only ever
+    /// raises, never lowers.
+    /// </remarks>
+    internal const int UnattributedFrameFloorHz = 40;
+
+    /// <summary>
+    /// Below this the frame is in trouble whatever the cause, so shedding work is worth it even though we are
+    /// not the cause.
+    /// </summary>
+    internal const float EmergencyFramesPerSecond = 20f;
+
+    /// <summary>
+    /// How fast we may send, from the frame rate alone.
+    /// </summary>
+    internal static int FrameCeilingHz(float normalizedFramesPerSecond)
+    {
+        if (normalizedFramesPerSecond < 25f) return 10;
+        if (normalizedFramesPerSecond < 35f) return 15;
+        if (normalizedFramesPerSecond < 45f) return 20;
+        if (normalizedFramesPerSecond < 55f) return 30;
+        if (normalizedFramesPerSecond < 58f) return 40;
+        return MaximumAdaptiveHz;
+    }
+
+    /// <summary>
+    /// How fast we may send, from what sending actually COSTS us - the share of each second spent on it.
+    /// </summary>
+    internal static int DutyCeilingHz(double duty)
+    {
+        if (duty > 0.30d) return 10;
+        if (duty > 0.25d) return 15;
+        if (duty > 0.20d) return 20;
+        if (duty > 0.15d) return 30;
+        if (duty > MeaningfulSenderDuty) return 40;
+        return MaximumAdaptiveHz;
+    }
+
+    /// <summary>
+    /// The rate this client may send at, from its frame rate and from what sending costs it.
+    /// </summary>
+    /// <remarks>
+    /// These two used to be alternatives in one ladder - "step down if the frame rate is low OR sending is
+    /// expensive" - and the frame-rate half fired on its own constantly. Measured on a player's machine over
+    /// 3330 in-battle samples: median 47 fps, so the frame ladder pinned him to 20-30Hz for 87% of the battle,
+    /// while sending cost 6% of each second. Every duty tier starts at 12%, so none of them were ever close.
+    ///
+    /// Throttling could not have helped him. Dropping 60Hz to 20Hz gives back about two thirds of 6%, and no
+    /// amount of that lifts 47 fps to 58 - the frames were going on drawing 570 to 1090 agents, which is the
+    /// base game's cost. So the rate fell, the frame rate did not recover, the rate stayed down, and the only
+    /// thing that changed was that he saw everyone else at a third of the update rate: agents jumping between
+    /// sparse positions, and his blows landing where they used to be rather than where they are.
+    ///
+    /// The evidence that it was reading the correlation backwards is in the same data: samples costing
+    /// 100-200ms/s had a HIGHER median frame rate (60.1) than samples costing 50-100ms/s (46.0). Cost does not
+    /// depress the frame rate here; a healthy frame rate is what earns permission to spend more.
+    ///
+    /// So cost decides, and the frame rate is only allowed to pull us below <see cref="UnattributedFrameFloorHz"/>
+    /// when sending is genuinely a meaningful share of the frame, or when the frame rate is so low that
+    /// shedding work is worth it regardless of who caused it. Nothing here relaxes the ceiling - both ladders
+    /// still apply in full whenever the cost is real.
+    ///
+    /// This cannot desync anything. An agent has exactly one owner, only that owner sends its position, and
+    /// receivers apply the newest one they have - so the rate decides how STALE a remote position is, never
+    /// whether two machines disagree about something that persists. A higher rate converges them; the 20Hz
+    /// this replaces is the version with more drift. The receiver-side cap is untouched and still answers to
+    /// real apply time and queue backlog, which is where genuine backpressure belongs.
+    /// </remarks>
+    internal static int SenderCeilingHz(float normalizedFramesPerSecond, double duty)
+    {
+        int ceiling = Math.Min(FrameCeilingHz(normalizedFramesPerSecond), DutyCeilingHz(duty));
+
+        bool sendingIsTheProblem = duty > MeaningfulSenderDuty;
+        bool frameIsInTrouble = normalizedFramesPerSecond < EmergencyFramesPerSecond;
+        if (sendingIsTheProblem || frameIsInTrouble) return ceiling;
+
+        // Raises only - a client whose frame rate already earns more than the floor keeps it.
+        return Math.Max(ceiling, UnattributedFrameFloorHz);
+    }
+
     private static int CalculateSenderCeiling(
         float framesPerSecond,
         double senderMillisecondsPerSecond,
@@ -932,21 +1023,10 @@ public sealed class MovementRateController : IMovementRateController
             framesPerSecond,
             effectiveFrameLimitHz);
         double duty = senderMillisecondsPerSecond / 1000d;
-        int desired;
-        if (normalizedFramesPerSecond < 25f || duty > 0.30d)
-            desired = 10;
-        else if (normalizedFramesPerSecond < 35f || duty > 0.25d)
-            desired = 15;
-        else if (normalizedFramesPerSecond < 45f || duty > 0.20d)
-            desired = 20;
-        else if (normalizedFramesPerSecond < 55f || duty > 0.15d)
-            desired = 30;
-        else if (normalizedFramesPerSecond < 58f || duty > 0.12d)
-            desired = 40;
-        else
-            desired = MaximumAdaptiveHz;
 
-        return Math.Min(desired, NormalizeRate(effectiveFrameLimitHz));
+        return Math.Min(
+            SenderCeilingHz(normalizedFramesPerSecond, duty),
+            NormalizeRate(effectiveFrameLimitHz));
     }
 
     private static int CalculateReceiverCap(

@@ -73,7 +73,7 @@ namespace Coop.LiveTesting
                 processId = process.Id;
                 processStartedUtc = process.StartTime.ToUniversalTime();
             }
-            string[] arguments = Environment.GetCommandLineArgs();
+            string[] arguments = LaunchArguments();
             processInfo = new LiveTestProcessInfo
             {
                 Pid = processId,
@@ -93,6 +93,35 @@ namespace Coop.LiveTesting
             endpointRegistrationPath = System.IO.Path.Combine(
                 endpointDirectory,
                 processId.ToString(CultureInfo.InvariantCulture) + ".json");
+        }
+
+        /// <summary>Every launch argument this process can see, from both sources that carry them.</summary>
+        /// <remarks>
+        /// The two sources are NOT interchangeable. Environment.GetCommandLineArgs() carries the game arguments
+        /// in the client host, but the dedicated-server starter hosts the engine rather than being it, and there
+        /// the engine's arguments are only in TaleWorlds' own copy. Reading the environment copy alone therefore
+        /// made a headless server decide its own /cooptestrun was absent and start with NO control channel - so
+        /// the rig could drive every client and not the server it was testing them against, and did it silently,
+        /// because "not requested" and "requested but unreachable" look identical from outside.
+        ///
+        /// Both are read and concatenated rather than one being chosen. Choosing needs a rule for which host
+        /// this is, and getting that rule wrong reintroduces exactly this failure in the other direction; a
+        /// concatenation cannot lose an argument that either source holds.
+        /// </remarks>
+        internal static string[] LaunchArguments()
+        {
+            string[] fromEngine;
+            try
+            {
+                fromEngine = (TaleWorlds.Engine.Utilities.GetFullCommandLineString() ?? string.Empty)
+                    .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            }
+            catch
+            {
+                fromEngine = Array.Empty<string>();
+            }
+
+            return fromEngine.Concat(Environment.GetCommandLineArgs()).ToArray();
         }
 
         public static bool IsEnabled(string[] arguments) =>

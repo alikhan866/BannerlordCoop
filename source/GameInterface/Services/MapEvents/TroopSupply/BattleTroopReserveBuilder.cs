@@ -351,6 +351,9 @@ public class BattleTroopReserveBuilder : IBattleTroopReserveBuilder
             {
                 Logger.Error("[TroopSupply] DUPLICATE HERO {Hero} appears TWICE in party {PartyId} (battle {MapEvent}); dropping the second copy",
                     entry.CharacterId, partyId, mapEventId);
+                // C5 - recorded as well as logged, so reserve integrity can be asserted on rather than grepped.
+                BattleObservationLedger.RecordFinding(
+                    "DUPLICATE_HERO_IN_PARTY", mapEventId, partyId, $"hero={entry.CharacterId}");
                 duplicateIndexes.Add(i);
                 continue;
             }
@@ -374,6 +377,13 @@ public class BattleTroopReserveBuilder : IBattleTroopReserveBuilder
                     Logger.Error("[TroopSupply] DUPLICATE HERO {Hero} is in BOTH party {First} and party {Second} (battle {MapEvent}); dropping it from {Second}, which it does not belong to, and leaving it with {First}",
                         entry.CharacterId, firstParty, partyId, mapEventId);
                 }
+
+                // C5 - both branches are the same integrity fault seen from two sides, so both are recorded.
+                // ownParty says which copy was dropped, because "the hero fights with the wrong party" and
+                // "a stray copy was cleaned up" have very different consequences for a battle's roster.
+                BattleObservationLedger.RecordFinding(
+                    "HERO_IN_TWO_PARTIES", mapEventId, partyId,
+                    $"hero={entry.CharacterId} claimedBy={firstParty} ownParty={belongsHere}");
 
                 duplicateIndexes.Add(i);
                 continue;

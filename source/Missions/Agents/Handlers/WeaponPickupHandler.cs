@@ -359,9 +359,20 @@ namespace Missions.Agents.Handlers
             {
                 if (!pendingWorldItemIdentities.Contains(payload.WorldItem))
                 {
-                    RejectWeaponPickup(
-                        new PendingIdentityPickup(agentInfo.AgentId, payload),
-                        "uncorrelated-runtime-identity");
+                    // No shared identity for this ground item, and there never will be: it was dropped by an
+                    // agent nobody registered - a dying AI trooper, most of a siege floor.
+                    //
+                    // This used to reject the pickup and roll it back, and the rollback re-equipped the
+                    // previous weapon with a NEW entity while the engine had already swapped the original out
+                    // onto the ground. One weapon became two, ~300 times in a single siege across 85 agents,
+                    // almost all of them AI. The player-visible version was "my weapon duplicated instead of
+                    // picking up the crossbow".
+                    //
+                    // What the peers actually need to agree on is what this agent is now HOLDING, not which
+                    // object on the floor it came from. Guid.Empty says exactly that: no ground item to
+                    // reconcile. The engine's swap was already legal and conserves the item count, so the
+                    // right move is to replicate it rather than to undo it by minting.
+                    SendWeaponPickup(payload, agentInfo.AgentId, Guid.Empty);
                     return;
                 }
 
@@ -545,10 +556,18 @@ namespace Missions.Agents.Handlers
                 return;
             }
 
-            if (message.WorldItemId == Guid.Empty)
+            // Guid.Empty means the sender had no shared identity for the ground item. That is not a reason to
+            // drop the whole pickup: the equipment change still has to land, or the two clients disagree about
+            // what this agent is holding.
+            //
+            // A consumed item needs no ground-item bookkeeping at all - canApplyResultingState below is already
+            // true for "consumed and not present locally", and ApplyResultingPickupState takes no world item.
+            // So let that case through, and keep refusing only the partial pickups (arrows and the like) that
+            // genuinely cannot be reconciled without knowing which pile they came from.
+            if (message.WorldItemId == Guid.Empty && !message.WorldItemConsumed)
             {
                 Logger.Warning(
-                    "Ignored weapon pickup without canonical world item agent={AgentId} slot={EquipmentIndex}",
+                    "Ignored partial weapon pickup without canonical world item agent={AgentId} slot={EquipmentIndex}",
                     message.AgentId,
                     message.EquipmentIndex);
                 return;

@@ -1,5 +1,6 @@
 ﻿using Common;
 using GameInterface;
+using GameInterface.Configuration;
 using GameInterface.Registry.Auto;
 using GameInterface.Services.MapEvents;
 using GameInterface.Services.MapEvents.Commands;
@@ -790,6 +791,76 @@ internal static class BattleDebugCommands
             $"enemyMovedSinceLast={moved} damageReceivedEvents={ownDamageEvents} " +
             $"resultState={result?.BattleState.ToString() ?? "None"} " +
             $"battleResolved={result?.BattleResolved ?? false} playerVictory={result?.PlayerVictory ?? false}";
+    }
+
+    /// <summary>
+    /// Reports the two battle sizes that must agree, and whether they do. Needs no mission.
+    /// </summary>
+    /// <remarks>
+    /// There are two authorities for one quantity and nothing reconciles them. The SERVER dictates a battle
+    /// size through mod-config.json (modOptions.battleSize), and that value sizes the OPENING wave. Each
+    /// CLIENT has its own engine battle size from the game's own options, and THAT value caps REINFORCEMENT
+    /// through BattleFieldRoom.SideTarget.
+    ///
+    /// Disagreement is silent and asymmetric. Measured: a coop size of 1000 against an engine size of 400 let
+    /// a 300-man side land whole in the uncapped opening wave while an 786-man side stalled at about 250,
+    /// because its surplus had to arrive through the capped path. Nothing logged a complaint.
+    ///
+    /// size_state answers a richer question but needs a live mission; this one can be asked before a battle,
+    /// which is when the mismatch is worth catching.
+    /// </remarks>
+    [CommandLineArgumentFunction("engine_size", "coop.debug.battle")]
+    public static string EngineSize(List<string> args)
+    {
+        if (args.Count != 0)
+            return "Usage: coop.debug.battle.engine_size";
+
+        int index = BannerlordConfig.BattleSize;
+        int engineSize;
+        try { engineSize = BannerlordConfig.GetRealBattleSize(); }
+        catch (Exception e) { return $"ENGINE_BATTLE_SIZE error=could not read the engine size: {e.GetType().Name}"; }
+
+        // Asked through the provider rather than read out of the config, so this reports exactly what the
+        // server would compute - defaults, clamping and all - rather than a second opinion about one file.
+        int coopSize = -1;
+        string coopSource = "unavailable";
+        if (ContainerProvider.TryResolve<IBattleSizeProvider>(out var battleSizeProvider))
+        {
+            try
+            {
+                coopSize = battleSizeProvider.GetBattleSize();
+                coopSource = "IBattleSizeProvider";
+            }
+            catch (Exception ex) { coopSource = "error: " + ex.GetType().Name; }
+        }
+
+        bool agree = coopSize > 0 && coopSize == engineSize;
+
+        // The slider is an INDEX into a table the game does not expose, and the table is not uniform - index 2
+        // is 400 while index 5 is 800, so "700 = index 5" was a wrong guess. Rather than guess again, walk the
+        // indices and ask the game what each one really means, restoring the original before returning.
+        var sizes = new StringBuilder();
+        int originalIndex = BannerlordConfig.BattleSize;
+        // MinBattleSize/MaxBattleSize are SIZES (200, 1000), not indices - iterating them as indices threw
+        // IndexOutOfRange on the first step. The index space is small and unpublished, so walk it from zero and
+        // stop at the first index the game rejects, guarding each step separately.
+        for (int i = 0; i < 32; i++)
+        {
+            try
+            {
+                BannerlordConfig.BattleSize = i;
+                int real = BannerlordConfig.GetRealBattleSize();
+                if (sizes.Length > 0) sizes.Append(' ');
+                sizes.Append(i).Append(':').Append(real);
+            }
+            catch { break; }
+        }
+        BannerlordConfig.BattleSize = originalIndex;
+
+        return $"ENGINE_BATTLE_SIZE sliderIndex={index} engineSize={engineSize} " +
+               $"coopSize={coopSize} coopSource={coopSource} agree={agree.ToString().ToLowerInvariant()} " +
+               $"sliderTable=[{sizes}]" +
+               (agree ? "" : "  <-- MISMATCH: the opening wave and reinforcement are sized differently");
     }
 
     [CommandLineArgumentFunction("size_state", "coop.debug.battle")]

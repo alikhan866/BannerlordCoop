@@ -476,6 +476,54 @@ internal class PartyCommands
     }
 
     /// <summary>
+    /// Stages a PRISONER release on an open Party screen, the way clicking the prisoner row does.
+    /// </summary>
+    /// <remarks>
+    /// The member-roster twin above cannot do this: it looks the row up in MainPartyTroops, and a prisoner is
+    /// never in there. Releasing is the half of the screen that carries its own network path
+    /// (HandleReleasedAndTakenPrisoners is suppressed locally and replayed by the server), so it is also the
+    /// half that needs driving with nobody there to click it.
+    /// </remarks>
+    [CommandLineArgumentFunction("stage_party_screen_prisoner_release", "coop.debug.mobileparty")]
+    public static string StagePartyScreenPrisonerReleaseCommand(List<string> strings)
+    {
+        if (ModInformation.IsServer) return "Command can only be run on a client.";
+        if (strings.Count < 1 || strings.Count > 2)
+            return "Usage: coop.debug.mobileparty.stage_party_screen_prisoner_release <character id> [count]";
+        if (!TryGetObjectManager(out var objectManager)) return "Unable to resolve ObjectManager.";
+        if (!objectManager.TryGetObject(strings[0], out CharacterObject character))
+            return $"Character with id {strings[0]} not found.";
+        if (!(Game.Current?.GameStateManager?.ActiveState is PartyState partyState))
+            return "No active party screen.";
+
+        int count = 1;
+        if (strings.Count == 2 && (!int.TryParse(strings[1], out count) || count < 1))
+            return "Count must be a positive whole number.";
+
+        var logic = partyState.PartyScreenLogic;
+        var partyVm = (ScreenManager.TopScreen as GauntletPartyScreen)?._dataSource;
+        if (partyVm == null) return "No active Party screen view model.";
+
+        var row = partyVm.MainPartyPrisoners.FirstOrDefault(vm => vm.Character == character);
+        if (row == null) return $"{strings[0]} is not in the right prisoner roster.";
+
+        partyVm.OnTransferTroop(row, -1, count, row.Side);
+        partyVm.ExecuteRemoveZeroCounts();
+
+        // The transfer history is what DoneLogic reads to decide what was released, so it is reported here: a
+        // staged release that left no history entry would commit as a no-op and look exactly like the sync bug
+        // this command exists to investigate.
+        int released = 0;
+        foreach (var entry in logic.CurrentData.TransferredPrisonersHistory)
+        {
+            if (entry.Item1 == character && entry.Item2 < 0) released += -entry.Item2;
+        }
+
+        return $"PARTY_SCREEN_PRISONER_RELEASE_STAGED character={strings[0]} requested={count} " +
+               $"inTransferHistory={released} pending={logic.IsThereAnyChanges()}";
+    }
+
+    /// <summary>
     /// Reports the visible roster, Done baseline, and rendered VM state for one open Party-screen row.
     /// </summary>
     [CommandLineArgumentFunction("party_screen_troop_state", "coop.debug.mobileparty")]
@@ -676,6 +724,71 @@ internal class PartyCommands
         if (count > 0) party.MemberRoster.AddToCounts(troop, count);
 
         return $"{party.Name} ({party.StringId}) now has {count}x {troop.Name} plus its heroes; {party.MemberRoster.TotalManCount} total";
+    }
+
+    /// <summary>
+    /// Puts a hero into a party's MEMBER roster, so defeating that party CAPTURES them.
+    /// </summary>
+    /// <remarks>
+    /// take_prisoner stages the other case - a hero the defeated party was already holding, whom the winner
+    /// RESCUES. The two go down different paths after the battle and only this one produces the free-or-capture
+    /// offer, so a scenario about releasing a captured lord cannot be built out of take_prisoner. Measured: an
+    /// at-war lord staged as a prisoner produced no conversation at all (ReleaseChoices=0), and the scenario
+    /// passed without ever exercising the thing it was written to test.
+    /// </remarks>
+    [CommandLineArgumentFunction("add_hero_member", "coop.debug.mobileparty")]
+    public static string AddHeroMemberCommand(List<string> strings)
+    {
+        if (ModInformation.IsClient) return "Command can only be run on the server.";
+        if (strings.Count != 2) return "Usage: coop.debug.mobileparty.add_hero_member <partyId> <heroId>";
+        if (TryGetObjectManager(out var objectManager) == false) return "Unable to resolve ObjectManager.";
+        if (!objectManager.TryGetObject(strings[0], out MobileParty party)) return $"Party with id {strings[0]} not found";
+        if (!objectManager.TryGetObject(strings[1], out Hero hero)) return $"Hero with id {strings[1]} not found";
+        if (!hero.IsAlive) return $"Hero {hero.StringId} is not alive.";
+        if (hero.IsPrisoner) return $"Hero {hero.StringId} is a prisoner; free them first.";
+        // Already a member is ALREADY STAGED, and reporting it as anything else makes a caller abandon a run
+        // over a state it actually wanted. The flag stays so a scenario can still tell the two apart.
+        if (hero.PartyBelongedTo == party)
+            return $"ADD_HERO_MEMBER hero={hero.StringId} party={party.StringId} inParty=true alreadyThere=true " +
+                   $"partyMembers={party.MemberRoster.TotalManCount}";
+
+        party.MemberRoster.AddToCounts(hero.CharacterObject, 1);
+
+        return $"ADD_HERO_MEMBER hero={hero.StringId} party={party.StringId} " +
+               $"inParty={(hero.PartyBelongedTo == party).ToString().ToLowerInvariant()} " +
+               $"partyMembers={party.MemberRoster.TotalManCount}";
+    }
+
+    /// <summary>
+    /// Sets a party's PRISONER roster to an exact number of one troop type, keyed by party id.
+    /// </summary>
+    /// <remarks>
+    /// The twin of set_troops, and it exists for the same reason: addprisoners takes a hero NAME and resolves
+    /// it by searching, which a scenario cannot depend on - it silently added nothing when handed a hero id,
+    /// and the release under test then had nothing to release and looked like the bug it was checking for.
+    /// Hero prisoners are left alone; they move by action only, and take_prisoner is how they get here.
+    /// </remarks>
+    [CommandLineArgumentFunction("set_prisoners", "coop.debug.mobileparty")]
+    public static string SetPrisonersCommand(List<string> strings)
+    {
+        if (ModInformation.IsClient) return "Command can only be run on the server.";
+        if (strings.Count != 3) return "Usage: coop.debug.mobileparty.set_prisoners <partyId> <troopId> <count>";
+        if (TryGetObjectManager(out var objectManager) == false) return "Unable to resolve ObjectManager.";
+        if (!objectManager.TryGetObject(strings[0], out MobileParty party)) return $"Party with id {strings[0]} not found";
+        if (!objectManager.TryGetObject(strings[1], out CharacterObject troop)) return $"Troop with id {strings[1]} not found";
+        if (!int.TryParse(strings[2], out var count) || count < 0) return $"'{strings[2]}' is not a prisoner count";
+
+        // Snapshot first: removing entries mutates the roster we would otherwise be iterating.
+        var existing = party.PrisonRoster.GetTroopRoster()
+            .Where(element => element.Character?.IsHero == false)
+            .ToList();
+        foreach (var element in existing)
+            party.PrisonRoster.AddToCounts(element.Character, -element.Number);
+
+        if (count > 0) party.PrisonRoster.AddToCounts(troop, count);
+
+        return $"SET_PRISONERS party={party.StringId} troop={strings[1]} count={count} " +
+               $"total={party.PrisonRoster.TotalManCount}";
     }
 
     [CommandLineArgumentFunction("siege_buff", "coop.debug.mobileparty")]

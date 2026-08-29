@@ -1,4 +1,5 @@
-﻿using TaleWorlds.Engine.GauntletUI;
+﻿using Common;
+using TaleWorlds.Engine.GauntletUI;
 using TaleWorlds.GauntletUI.Data;
 using TaleWorlds.ScreenSystem;
 
@@ -32,6 +33,13 @@ public sealed class JoinAttemptOverlay : GlobalLayer, IJoinAttemptOverlay
     public void Show(string cancelLabel)
     {
         if (isShown) return;
+
+        // A render-free process has no Gauntlet to put this on, and building the layer there throws - which
+        // surfaced as "Failed to run action on the game thread: ShowJoinAttempt" in the middle of a headless
+        // client's join. The overlay is a CANCEL BUTTON: a driven client has nobody to press it and the rig
+        // cancels through the control channel instead, so there is nothing to replace it with. Hide() is
+        // already safe to call when nothing is shown, so leaving isShown false keeps the pair balanced.
+        if (ModInformation.IsHeadless) return;
 
         // Marked before the layer goes up so a partial Show can still be taken down.
         isShown = true;

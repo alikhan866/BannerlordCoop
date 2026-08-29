@@ -5,6 +5,7 @@ using Common.Network;
 using GameInterface.Services.Entity;
 using GameInterface.Services.MapEvents;
 using GameInterface.Services.MapEvents.Messages;
+using GameInterface.Services.MapEvents.TroopSupply;
 using GameInterface.Services.ObjectManager;
 using GameInterface.Services.Players;
 using LiteNetLib;
@@ -252,7 +253,14 @@ public class CoopBattleController : CoopMissionController
         Deployment.OnMissionReady();
 
         if (Session.HasInstance)
+        {
+            BattleObservationLedger.RecordEvent(
+                Session.InstanceId,
+                "MISSION_READY",
+                $"controller={Session.OwnControllerId} host={Session.IsLocalHost} " +
+                $"scene={Mission.Current?.SceneName ?? "?"}");
             messageBroker.Publish(this, new BattleMissionReady(Session.InstanceId));
+        }
         else
             Logger.Warning("[BattleHost] Battle mission finished loading with no instance session — cannot announce mission-ready");
     }

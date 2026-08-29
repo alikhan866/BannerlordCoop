@@ -1,4 +1,5 @@
 using GameInterface.Services.MapEvents.Loot;
+using System.Collections.Generic;
 using System.Linq;
 using Xunit;
 
@@ -49,6 +50,44 @@ public class BattleLootSelectionTests
         var result = BattleLootSelection.FromRemaining(offer, new[] { 10 });
 
         Assert.Empty(result.Claims);
+    }
+
+    [Fact]
+    public void ReleasingALord_SurvivesIntoTheAnswer()
+    {
+        // The defect this covers: FromRemaining has always handled a release correctly, but nothing ever built
+        // the dispositions to hand it. Every production caller passed null, so the only line that can construct
+        // a Release claim was unreachable and a freed lord reached the server marked "keep".
+        var offer = Offer(HeroPrisoner("CharacterObject_lord_1_68"), Item("grain", 10));
+        var released = new HashSet<string> { "CharacterObject_lord_1_68" };
+
+        var dispositions = BattleLootSelection.DispositionsFor(offer, released);
+        var result = BattleLootSelection.FromRemaining(offer, new[] { 1, 0 }, dispositions);
+
+        var heroClaim = Assert.Single(result.Claims, claim => claim.LineIndex == 0);
+        Assert.Equal(BattleLootDisposition.Release, heroClaim.Disposition);
+    }
+
+    [Fact]
+    public void ALordNobodyFreed_IsNotMarkedForRelease()
+    {
+        var offer = Offer(HeroPrisoner("CharacterObject_lord_1_68"));
+
+        var dispositions = BattleLootSelection.DispositionsFor(offer, new HashSet<string>());
+
+        Assert.Equal(BattleLootDisposition.Keep, dispositions[0]);
+    }
+
+    [Fact]
+    public void OnlyHeroPrisonerLinesCanBeReleased()
+    {
+        // Releasing an item or a troop is meaningless, and BattleLootValidator rejects such a claim outright -
+        // so it must never be produced in the first place, however the released set was gathered.
+        var offer = Offer(Item("grain", 10));
+
+        var dispositions = BattleLootSelection.DispositionsFor(offer, new HashSet<string> { "grain" });
+
+        Assert.Equal(BattleLootDisposition.Keep, dispositions[0]);
     }
 
     [Fact]

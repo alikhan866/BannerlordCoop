@@ -140,8 +140,8 @@ namespace Coop
 #if DEBUG
             isDeferredClientJoin = args.Any(a =>
                                        a.Equals("/cooptestmanualjoin", StringComparison.OrdinalIgnoreCase)) &&
-                                   LiveTestControlServer.IsEnabled(Environment.GetCommandLineArgs());
-            isLiveTestRun = LiveTestControlServer.IsEnabled(Environment.GetCommandLineArgs());
+                                   LiveTestControlServer.IsEnabled(LiveTestControlServer.LaunchArguments());
+            isLiveTestRun = LiveTestControlServer.IsEnabled(LiveTestControlServer.LaunchArguments());
 #endif
 
             // Creates the handler during launch
@@ -527,7 +527,34 @@ namespace Coop
             Updateables.Add(GameThread.Instance);
 
 #if DEBUG
-            if (isAutoConnect && LiveTestControlServer.IsEnabled(Environment.GetCommandLineArgs()))
+            // The control channel is how a driven process is reached at all, so it has to exist for every role
+            // the rig drives - not only the ones that JOIN. A dedicated server never passes /autoconnect,
+            // because it hosts rather than connects, so gating on that alone left the headless server with no
+            // channel: its own commands answered "Run this command on the server" with no way to comply, and
+            // the server-side observables (battle state, supply refusals, reserve integrity, ownership census)
+            // were unreachable in a dedicated-server rig - which is the only rig that matters for headless
+            // battle work.
+            //
+            // /cooptestrun remains the switch. Nothing starts without it, so an ordinary play session is
+            // unaffected in either role, and this whole block is DEBUG-only besides.
+            // Logged before the decision, not only when it goes wrong. Whether this process can be driven
+            // at all is the first thing a rig needs from a log, and reconstructing it afterwards from the
+            // absence of a later line is exactly the guesswork that cost several restart cycles. The
+            // arguments themselves are never written - they can carry the hosted-server password - so only
+            // the three facts that decide the gate are.
+            var liveTestArguments = LiveTestControlServer.LaunchArguments();
+            var liveTestEnabled = LiveTestControlServer.IsEnabled(liveTestArguments);
+            Logger.Information(
+                "[LiveTest] gate: enabled={Enabled} isAutoConnect={IsAutoConnect} " +
+                "headlessServer={HeadlessServer} argCount={ArgCount}",
+                liveTestEnabled,
+                isAutoConnect,
+                headlessRequested,
+                liveTestArguments.Length);
+            Logger.Information("[LiveTest] gate switches: {Switches}",
+                string.Join(" ", liveTestArguments.Where(a => a.StartsWith("/")).ToArray()));
+
+            if ((isAutoConnect || headlessRequested) && liveTestEnabled)
             {
                 liveTestControlServer = new LiveTestControlServer(
                     isServer,
@@ -535,6 +562,14 @@ namespace Coop
                     isDeferredClientJoin,
                     () => Coop.StartAsClient());
                 liveTestControlServer.Start();
+            }
+            else if (liveTestEnabled)
+            {
+                // A run token with no channel behind it is the worst of the three outcomes, because from
+                // the rig's side it is indistinguishable from a process that is merely slow to register.
+                Logger.Warning(
+                    "[LiveTest] /cooptestrun was passed but no control channel was started. " +
+                    "This process cannot be driven.");
             }
 #endif
 

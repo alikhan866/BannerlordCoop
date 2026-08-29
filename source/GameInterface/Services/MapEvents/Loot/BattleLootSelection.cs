@@ -22,6 +22,42 @@ namespace GameInterface.Services.MapEvents.Loot;
 public static class BattleLootSelection
 {
     /// <summary>
+    /// Turns "these heroes were freed" into the per-line dispositions <see cref="FromRemaining"/> expects.
+    /// </summary>
+    /// <remarks>
+    /// This existed only as a parameter before, and every production caller passed null - so the one line that
+    /// can construct a Release claim was unreachable, and a lord the player freed on the after-battle screen
+    /// reached the server marked "keep" and was imprisoned. The choice with consequences was the single thing
+    /// that never travelled.
+    ///
+    /// Keyed by the line's ObjectId, which for a hero is their CharacterObject id - the same id the offer was
+    /// built with. Only hero PRISONER lines can carry a release: BattleLootValidator rejects one on any other
+    /// kind, so producing it would turn a player's choice into a rejected answer.
+    /// </remarks>
+    public static BattleLootDisposition[] DispositionsFor(
+        BattleLootOffer offer,
+        ICollection<string> releasedObjectIds)
+    {
+        var lines = offer.Lines ?? new BattleLootOfferLine[0];
+        var dispositions = new BattleLootDisposition[lines.Length];
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i];
+
+            bool freed = releasedObjectIds != null
+                && line.IsHero
+                && line.Kind == BattleLootLineKind.Prisoner
+                && line.ObjectId != null
+                && releasedObjectIds.Contains(line.ObjectId);
+
+            dispositions[i] = freed ? BattleLootDisposition.Release : BattleLootDisposition.Keep;
+        }
+
+        return dispositions;
+    }
+
+    /// <summary>
     /// Builds the answer to <paramref name="offer"/> from how much of each line is still unclaimed.
     /// </summary>
     /// <param name="remainingPerLine">

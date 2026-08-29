@@ -2,6 +2,7 @@
 using Common.Logging;
 using Common.Messaging;
 using GameInterface.Services.MapEvents;
+using GameInterface.Services.MapEvents.TroopSupply;
 using Missions.Messages;
 using Serilog;
 using System;
@@ -34,6 +35,9 @@ public interface IBattleDeploymentCoordinator : IDisposable
     /// that first commit.
     /// </summary>
     bool OnLocalDeploymentFinished(Action replicateCommittedTroops = null);
+
+    /// <summary>Finishes the local deployment now, instead of waiting out the BR-025 time limit.</summary>
+    DeploymentAutoFinishResult FinishNow();
 
     /// <summary>This client was just promoted to host (migration): release the adopted NPCs if the battle is live.</summary>
     void OnPromotedToHost();
@@ -162,6 +166,14 @@ public class BattleDeploymentCoordinator : IBattleDeploymentCoordinator
                 throw;
             }
 
+            // C9: the moment own-party troops stop being withheld, so a timeline can show whether the
+            // peer's men were ever released at all - see ShouldWithhold above. A battle missing this entry on
+            // one client is a battle where that client fought alone without ever saying so.
+            BattleObservationLedger.RecordEvent(
+                session.InstanceId,
+                "DEPLOYMENT_COMMITTED",
+                $"controller={session.OwnControllerId} host={session.IsLocalHost} withheldTroopsReleased=true");
+
             if (deployerFinished) RelatchSiegeTactic();
         }
 
@@ -220,6 +232,29 @@ public class BattleDeploymentCoordinator : IBattleDeploymentCoordinator
         // reverse-indexing MissionBehaviors, otherwise the shortened list makes its next index invalid.
         autoFinishPending = true;
         enqueueDeferred(FinishDeferredDeployment);
+    }
+
+    /// <summary>
+    /// Finishes the local deployment now, through the same seam the time limit uses.
+    /// </summary>
+    /// <remarks>
+    /// For a DRIVEN client, which has no Start Battle button to press. Without this the only way a headless
+    /// client ever commits is to wait out BR-025 - measured at about two minutes per battle - and until it
+    /// commits it withholds its own party's troops from every peer, so a two-owner battle spends that whole
+    /// window at half strength. That made the withhold window impossible to test deliberately and expensive to
+    /// sit through incidentally.
+    ///
+    /// It goes through finishNativeDeployment rather than calling DeploymentHandler.FinishDeployment itself,
+    /// so it inherits the Unavailable/Retry/Finished vocabulary, the TeamSetupOver guard and the deferral out
+    /// of the behavior tick - and it feeds the result back to the timer, so an armed auto-finish disarms
+    /// instead of firing again on top of this one.
+    /// </remarks>
+    public DeploymentAutoFinishResult FinishNow()
+    {
+        autoFinishPending = false;
+        DeploymentAutoFinishResult result = finishNativeDeployment();
+        deploymentTimer.OnAutoFinishResult(result);
+        return result;
     }
 
     private void FinishDeferredDeployment()

@@ -32,7 +32,23 @@ namespace GameInterface.Services.Headless.Patches
     {
         private static readonly ILogger Logger = LogManager.GetLogger<HeadlessCampaignReadyPatch>();
 
-        private static bool signalled;
+        /// <summary>
+        /// The campaign this process has already announced, so the announcement is once PER CAMPAIGN.
+        /// </summary>
+        /// <remarks>
+        /// A plain bool was wrong for a joining client, and silently so. Such a client reaches MapState TWICE:
+        /// once with the throwaway campaign it creates to have something to join with, and again after the
+        /// server's world has been received and loaded. A one-shot latch burns on the first, so the second -
+        /// the only one that means anything - never publishes, LoadingState never completes, and the client
+        /// sits in a fully loaded world that its own state machine does not believe is ready. Measured
+        /// exactly: CampaignReady at 21:44:02 on the throwaway campaign, the real MapState at 21:44:11,
+        /// nothing after it.
+        ///
+        /// Keying on the campaign instance tells the two apart without needing to know which is which. A
+        /// server loads one campaign and still announces once. Weak, so a discarded campaign is not pinned
+        /// alive by a diagnostic.
+        /// </remarks>
+        private static readonly WeakReference SignalledCampaign = new WeakReference(null);
 
         [HarmonyPostfix]
         [HarmonyPatch("OnActivate")]
@@ -43,11 +59,16 @@ namespace GameInterface.Services.Headless.Patches
             // builds. Gated on the server, a driven CLIENT fell between them: it reached MapState with the
             // campaign fully loaded, nothing published CampaignReady, its LoadingState never completed, and
             // the server sat on WaitingForCampaignEntry indefinitely.
-            if (!ModInformation.IsHeadless || signalled) return;
+            if (!ModInformation.IsHeadless) return;
             if (!(__instance is MapState)) return;
 
-            signalled = true;
-            Logger.Information("[Headless] campaign is up; publishing CampaignReady");
+            Campaign campaign = Campaign.Current;
+            if (campaign == null || ReferenceEquals(SignalledCampaign.Target, campaign)) return;
+
+            bool again = SignalledCampaign.Target != null;
+            SignalledCampaign.Target = campaign;
+            Logger.Information(
+                "[Headless] campaign is up; publishing CampaignReady (secondCampaign={Again})", again);
 
 
             MessageBroker.Instance.Publish(null, new CampaignReady());

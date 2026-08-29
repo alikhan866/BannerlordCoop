@@ -228,6 +228,30 @@ public class CoopLogBugReportTests : IDisposable
         Assert.True(SavePatches.ShouldPublishGameSaved(new FileDriver()));
     }
 
+    /// <summary>
+    /// A save driver this code does not recognise still writes the co-op session sidecar.
+    /// </summary>
+    /// <remarks>
+    /// The regression this guards: the gate used to ask "is this a FileDriver", which also answered no for
+    /// the DEDICATED SERVER's ordinary campaign save. Every server save then dropped its &lt;name&gt;.json,
+    /// and with it every controller's hero, party and clan - so the next load sent both players off to build
+    /// new characters. Nothing reported it; the .sav is complete and the engine calls the save a success.
+    ///
+    /// So the question is asked the other way round, and this pins that direction: only the in-memory drivers
+    /// are excluded, and anything unrecognised is treated as a real save. Getting it wrong this way costs a
+    /// stray sidecar; getting it wrong the other way costs everyone their character.
+    /// </remarks>
+    [Fact]
+    public void ShouldPublishGameSaved_UnrecognisedDriver_StillWritesTheSidecar()
+    {
+        Assert.True(SavePatches.ShouldPublishGameSaved(new FileDriver()));
+        Assert.True(SavePatches.ShouldPublishGameSaved(new InMemDriver()));
+
+        // The two the bug reporter and the join transfer use, which must stay excluded.
+        Assert.False(SavePatches.ShouldPublishGameSaved(new CoopInMemSaveDriver()));
+        Assert.False(SavePatches.ShouldPublishGameSaved(new CoopFileInMemSaveDriver()));
+    }
+
     [Fact]
     public void Archive_DeletesOldestPendingReportWhenCountQuotaIsReached()
     {

@@ -6,6 +6,7 @@ using Common.Util;
 using GameInterface.Services.MapEvents.Loot;
 using GameInterface.Services.MapEvents.Messages.Loot;
 using GameInterface.Services.ObjectManager;
+using GameInterface.Services.PlayerCaptivityService.Messages;
 using Serilog;
 using System.Collections.Generic;
 using TaleWorlds.CampaignSystem.Encounters;
@@ -34,6 +35,11 @@ internal class BattleLootClientHandler : IHandler
     private List<TroopRosters.Data.TroopRosterElementData> declinedMembers;
     private List<TroopRosters.Data.TroopRosterElementData> declinedPrisoners;
 
+    // Heroes the player FREED while this offer was open, keyed by CharacterObject id to match the offer lines.
+    // A release is an action, not an absence: the staged roster looks identical whether a lord was freed or
+    // ignored, so unless the choice is remembered here it cannot be told apart later and the lord is imprisoned.
+    private readonly HashSet<string> releasedHeroes = new HashSet<string>();
+
     public BattleLootClientHandler(IMessageBroker messageBroker, INetwork network, IObjectManager objectManager)
     {
         this.messageBroker = messageBroker;
@@ -42,17 +48,48 @@ internal class BattleLootClientHandler : IHandler
 
         messageBroker.Subscribe<NetworkBattleLootOffer>(Handle_Offer);
         messageBroker.Subscribe<NetworkBattleLootApplied>(Handle_Applied);
+        messageBroker.Subscribe<EndCaptivityAttempted>(Handle_ReleaseAttempted);
     }
 
     public void Dispose()
     {
         messageBroker.Unsubscribe<NetworkBattleLootOffer>(Handle_Offer);
         messageBroker.Unsubscribe<NetworkBattleLootApplied>(Handle_Applied);
+        messageBroker.Unsubscribe<EndCaptivityAttempted>(Handle_ReleaseAttempted);
+    }
+
+    /// <summary>
+    /// Remembers a hero the player freed while an offer is open.
+    /// </summary>
+    /// <remarks>
+    /// The client already intercepts every local release here (EndCaptivityActionPatches turns it into this
+    /// message rather than applying it), so this is the one place the choice is knowable before the encounter
+    /// throws its staged rosters away.
+    ///
+    /// Only while an offer is PENDING. A release at any other time - a ransom, a peace treaty, a prisoner let
+    /// go from the party screen - has its own path and must not be folded into an unrelated battle's spoils.
+    /// </remarks>
+    private void Handle_ReleaseAttempted(MessagePayload<EndCaptivityAttempted> payload)
+    {
+        if (ModInformation.IsServer) return;
+        if (!ClientBattleLootOffer.HasPending) return;
+
+        var character = payload.What.Prisoner?.CharacterObject;
+        if (character == null) return;
+        if (!objectManager.TryGetId(character, out var characterId) || string.IsNullOrEmpty(characterId)) return;
+
+        releasedHeroes.Add(characterId);
+
+        Logger.Information("[Loot] The player freed {Hero} while an offer was open", characterId);
     }
 
     private void Handle_Offer(MessagePayload<NetworkBattleLootOffer> payload)
     {
         if (ModInformation.IsServer) return;
+
+        // A new battle's spoils start from nothing. Carrying a release across offers would free a lord in a
+        // battle the player never fought him in.
+        releasedHeroes.Clear();
 
         var offer = payload.What.Offer;
 
@@ -136,13 +173,19 @@ internal class BattleLootClientHandler : IHandler
             members,
             prisoners);
 
-        var result = BattleLootSelection.FromRemaining(offer, remaining);
+        // The releases are what turn "left on the roster" into "deliberately freed" - without them every hero
+        // line answers as Keep and a lord the player let go is imprisoned by the server anyway.
+        var dispositions = BattleLootSelection.DispositionsFor(offer, releasedHeroes);
+        var result = BattleLootSelection.FromRemaining(offer, remaining, dispositions);
+
+        int releaseCount = releasedHeroes.Count;
+        releasedHeroes.Clear();
 
         network.SendAll(new NetworkBattleLootResult(partyId, result));
 
         Logger.Information(
-            "[Loot] Answered offer {Offer} for {MapEvent} with {Claims} claim(s)",
-            offer.OfferId, offer.MapEventId, result.Claims?.Length ?? 0);
+            "[Loot] Answered offer {Offer} for {MapEvent} with {Claims} claim(s), {Released} release(s)",
+            offer.OfferId, offer.MapEventId, result.Claims?.Length ?? 0, releaseCount);
     }
 
     /// <summary>
@@ -191,6 +234,10 @@ internal class BattleLootClientHandler : IHandler
         var partyId = string.Empty;
         var mainParty = MobileParty.MainParty;
         if (mainParty != null) objectManager.TryGetId(mainParty, out partyId);
+
+        // Never shown means the player chose nothing at all, so any release recorded against this offer is
+        // not theirs to have made.
+        releasedHeroes.Clear();
 
         var result = BattleLootAbandonPolicy.AnswerFor(offer, BattleLootAbandonReason.NeverShown);
 

@@ -617,9 +617,9 @@ public class MapEventDebugCommands
             return "Run this command on the server.";
         }
 
-        if (args.Count < 1 || args.Count > 2)
+        if (args.Count < 1 || args.Count > 3)
         {
-            return "Usage: coop.debug.mapevent.start_nearest_bandit_attack <controllerId> [excludedPartyId]";
+            return "Usage: coop.debug.mapevent.start_nearest_bandit_attack <controllerId> [excludedPartyId] [maxTroops]";
         }
 
         if (!TryGetPlayerParty(args[0], requireReady: true, out var objectManager, out var playerParty, out var error))
@@ -627,7 +627,30 @@ public class MapEventDebugCommands
             return error;
         }
 
-        const int maximumFixtureTroops = 8;
+        // Plan 2 C10 - scale is a PARAMETER, because the faults this rig exists to catch only appear at size.
+        // Eight troops was the right default for a quick encounter fixture, but it also means every battle
+        // this command produces is fully spawned on the first tick with nothing held in reserve - so a
+        // spawn-progress or supply-refusal check run against it can only ever come back clean, whether it
+        // works or not. The motivating defect needed battle size 400 against ~2,800 reserve troops.
+        //
+        // Default unchanged, so every existing caller and scenario behaves exactly as before.
+        // A bare number in the second slot is read as maxTroops rather than a party id. Registry ids are
+        // "MobileParty_Created_1234" and StringIds carry letters, so an all-digits argument is never a party -
+        // which makes the common "just make it bigger" call a two-argument one.
+        const int defaultFixtureTroops = 8;
+        var maximumFixtureTroops = defaultFixtureTroops;
+        var troopsArgument = args.Count == 3 ? args[2]
+            : args.Count == 2 && int.TryParse(args[1], out _) ? args[1]
+            : null;
+        if (troopsArgument != null && !int.TryParse(troopsArgument, out maximumFixtureTroops))
+        {
+            return $"maxTroops must be a whole number, got '{troopsArgument}'.";
+        }
+        if (maximumFixtureTroops < 1)
+        {
+            return "maxTroops must be at least 1 - a player with no troops cannot field a battle.";
+        }
+
         var remainingFixtureTroops = maximumFixtureTroops;
         var removedTroops = 0;
         for (var index = playerParty.MemberRoster.Count - 1; index >= 0; index--)
@@ -656,7 +679,7 @@ public class MapEventDebugCommands
             LeaveSettlementAction.ApplyForParty(playerParty);
         }
 
-        var excludedPartyId = args.Count == 2 ? args[1] : null;
+        var excludedPartyId = args.Count >= 2 && troopsArgument != args[1] ? args[1] : null;
         var playerPosition = playerParty.Position.ToVec2();
         var banditParty = MobileParty.All
             .Where(p => p.IsActive && p.IsBandit && p != playerParty

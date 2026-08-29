@@ -1,0 +1,29 @@
+<Prefab>
+  <Window>
+    <!-- DoNotAcceptEvents, and the layer that hosts this claims no input at all. This panel only reports who
+         the battle is still waiting on, so it must never take a click - an informational overlay that eats
+         input reads as "the game froze", which is how the first version of this feature went wrong. -->
+    <Widget WidthSizePolicy="StretchToParent" HeightSizePolicy="StretchToParent" DoNotAcceptEvents="true">
+      <Children>
+        <ListPanel WidthSizePolicy="Fixed" SuggestedWidth="420"
+                   HeightSizePolicy="CoverChildren"
+                   HorizontalAlignment="Center" VerticalAlignment="Center"
+                   LayoutImp.LayoutMethod="VerticalTopToBottom"
+                   Sprite="BlankWhiteSquare_9" Color="#000000FF" AlphaFactor="0.8">
+          <Children>
+            <TextWidget WidthSizePolicy="StretchToParent" HeightSizePolicy="Fixed" SuggestedHeight="40"
+                        MarginTop="12"
+                        Brush="Clan.TabControl.Text" Brush.FontSize="22"
+                        Brush.TextHorizontalAlignment="Center" Brush.TextVerticalAlignment="Center"
+                        Text="@TitleText"/>
+            <TextWidget WidthSizePolicy="StretchToParent" HeightSizePolicy="Fixed" SuggestedHeight="34"
+                        MarginBottom="14"
+                        Brush="Clan.TabControl.Text" Brush.FontSize="18"
+                        Brush.TextHorizontalAlignment="Center" Brush.TextVerticalAlignment="Center"
+                        Text="@WaitingText"/>
+          </Children>
+        </ListPanel>
+      </Children>
+    </Widget>
+  </Window>
+</Prefab>

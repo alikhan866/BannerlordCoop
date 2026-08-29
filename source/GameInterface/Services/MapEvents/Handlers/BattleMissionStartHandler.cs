@@ -9,6 +9,7 @@ using GameInterface.Services.MapEvents.Messages.Leave;
 using GameInterface.Services.MapEvents.Messages.Start;
 using GameInterface.Services.MapEvents.Patches;
 using GameInterface.Services.MapEvents.TroopSupply;
+using GameInterface.Services.MapEvents.UI;
 using GameInterface.Services.MapEventSides.Messages;
 using GameInterface.Services.ObjectManager;
 using GameInterface.Services.Players;
@@ -19,6 +20,7 @@ using System.Collections.Concurrent;
 using System.Threading;
 using TaleWorlds.CampaignSystem;
 using System.Collections.Generic;
+using System.Linq;
 using TaleWorlds.CampaignSystem.Encounters;
 using TaleWorlds.CampaignSystem.Map;
 using TaleWorlds.CampaignSystem.MapEvents;
@@ -67,6 +69,32 @@ internal class BattleMissionStartHandler : IHandler
     // container keeps syncing. Evicted with the terrain seed when the event finalizes.
     private readonly ConcurrentDictionary<string, NetworkStartSiegeMission> siegeMissionSnapshots = new ConcurrentDictionary<string, NetworkStartSiegeMission>();
 
+    /// <summary>
+    /// Battles held at the starting line while their players choose how their troops deploy.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, HeldMissionStart> heldMissionStarts =
+        new ConcurrentDictionary<string, HeldMissionStart>();
+
+    /// <summary>
+    /// How long a battle waits for an answer before starting anyway.
+    /// </summary>
+    /// <remarks>
+    /// A battle that never starts is a far worse failure than one that starts on whatever a player last chose,
+    /// and the preference is client-local and always has a value - a timeout leaves it unasked, never invalid.
+    /// </remarks>
+    private static readonly TimeSpan TroopPreferenceTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>A mission start that is built and ready, waiting only on its players to choose.</summary>
+    private sealed class HeldMissionStart : IDisposable
+    {
+        public TroopPreferenceBarrier Barrier;
+        public IReadOnlyList<MissionParticipant> Participants;
+        public IMessage MissionStartMessage;
+        public System.Threading.Timer Expiry;
+
+        public void Dispose() => Expiry?.Dispose();
+    }
+
     public BattleMissionStartHandler(
         IMessageBroker messageBroker,
         IObjectManager objectManager,
@@ -88,6 +116,9 @@ internal class BattleMissionStartHandler : IHandler
         messageBroker.Subscribe<NetworkStartAttackMission>(Handle_NetworkStartAttackMission);
         messageBroker.Subscribe<NetworkStartSiegeMission>(Handle_NetworkStartSiegeMission);
         messageBroker.Subscribe<MapEventFinalized>(Handle_MapEventFinalized);
+        messageBroker.Subscribe<NetworkTroopPreferenceChosen>(Handle_NetworkTroopPreferenceChosen);
+        messageBroker.Subscribe<NetworkTroopPreferenceRequest>(Handle_NetworkTroopPreferenceRequest);
+        messageBroker.Subscribe<NetworkTroopPreferenceProgress>(Handle_NetworkTroopPreferenceProgress);
     }
 
     public void Dispose()
@@ -96,6 +127,12 @@ internal class BattleMissionStartHandler : IHandler
         messageBroker.Unsubscribe<NetworkStartAttackMission>(Handle_NetworkStartAttackMission);
         messageBroker.Unsubscribe<NetworkStartSiegeMission>(Handle_NetworkStartSiegeMission);
         messageBroker.Unsubscribe<MapEventFinalized>(Handle_MapEventFinalized);
+        messageBroker.Unsubscribe<NetworkTroopPreferenceChosen>(Handle_NetworkTroopPreferenceChosen);
+        messageBroker.Unsubscribe<NetworkTroopPreferenceRequest>(Handle_NetworkTroopPreferenceRequest);
+        messageBroker.Unsubscribe<NetworkTroopPreferenceProgress>(Handle_NetworkTroopPreferenceProgress);
+
+        foreach (var held in heldMissionStarts.Values) held.Dispose();
+        heldMissionStarts.Clear();
     }
 
     /// <summary>The battle ended — drop its cached mission inputs (server-side; a no-op on a client's empty maps).</summary>
@@ -105,6 +142,7 @@ internal class BattleMissionStartHandler : IHandler
         {
             mapEventMissionInitializers.TryRemove(mapEventId, out _);
             siegeMissionSnapshots.TryRemove(mapEventId, out _);
+            if (heldMissionStarts.TryRemove(mapEventId, out var held)) held.Dispose();
         }
     }
 
@@ -255,8 +293,17 @@ internal class BattleMissionStartHandler : IHandler
                 network.Send(requester, new NetworkBattleStartReply(payload.What.RequestId, true));
                 startAccepted = true;
 
-                operation = "send mission start";
-                SendMissionStart(participants, missionStartMessage);
+                // Hold the battle here, not later. At this line no client has a mission open and no battle
+                // traffic is flowing, so waiting for everyone to choose costs nothing and lets nobody run
+                // ahead. Asking a single client AFTER the battle had started for the others is what broke
+                // mission loading before - it came back to hundreds of queued deaths and a mission that could
+                // no longer initialise.
+                operation = "hold for troop preference";
+                if (!TryHoldForTroopPreference(payload.What.MapEventId, participants, missionStartMessage))
+                {
+                    operation = "send mission start";
+                    SendMissionStart(participants, missionStartMessage);
+                }
 
                 // Claim the event for the mission mode on every client, so one still sitting at the encounter menu
                 // greys out the auto-resolve option — a map event is fought as a live mission XOR an auto-resolve,
@@ -329,6 +376,218 @@ internal class BattleMissionStartHandler : IHandler
             messageBroker.Publish(participant.Peer,
                 new BattleJoinAccepted(mapEventId, participant.ControllerId, Guid.NewGuid()));
         }
+    }
+
+    /// <summary>
+    /// Asks every player in this battle how their troops should deploy, and holds the start until they answer.
+    /// </summary>
+    /// <returns>True if the battle is now held; false if it should start immediately.</returns>
+    /// <remarks>
+    /// Only acknowledgements are collected. What each player chose stays on their own client and is read when
+    /// that client allocates its troops, so there is no preference state on the wire to drift.
+    /// </remarks>
+    private bool TryHoldForTroopPreference(
+        string mapEventId,
+        IReadOnlyList<MissionParticipant> participants,
+        IMessage missionStartMessage)
+    {
+        var heroIds = new List<string>();
+        foreach (var participant in participants)
+        {
+            if (playerManager.TryGetPlayer(participant.ControllerId, out var player) &&
+                !string.IsNullOrEmpty(player.HeroId))
+            {
+                heroIds.Add(player.HeroId);
+            }
+        }
+
+        // Nobody to ask: a solo battle, or one whose players cannot be identified, starts exactly as it did
+        // before this existed. Waiting on someone we cannot name or notify would hang the battle for 30s.
+        if (heroIds.Count == 0) return false;
+
+        var held = new HeldMissionStart
+        {
+            Barrier = new TroopPreferenceBarrier(mapEventId, heroIds, DateTime.UtcNow),
+            Participants = participants,
+            MissionStartMessage = missionStartMessage,
+        };
+
+        if (!heldMissionStarts.TryAdd(mapEventId, held))
+        {
+            // Already held - a re-requested start. Let the existing hold own it rather than racing a second
+            // timer and a second SendMissionStart against it.
+            held.Dispose();
+            return true;
+        }
+
+        var roster = heroIds.ToArray();
+        foreach (var participant in participants)
+            network.Send(participant.Peer, new NetworkTroopPreferenceRequest(mapEventId, roster));
+
+        held.Expiry = new System.Threading.Timer(
+            _ => GameThread.RunSafe(() => ReleaseHold(mapEventId, "timed out"), context: nameof(ReleaseHold)),
+            null,
+            TroopPreferenceTimeout,
+            Timeout.InfiniteTimeSpan);
+
+        Logger.Information("[TroopPreference] holding {MapEventId} while {Count} player(s) choose", mapEventId, roster.Length);
+        return true;
+    }
+
+    private void Handle_NetworkTroopPreferenceChosen(MessagePayload<NetworkTroopPreferenceChosen> payload)
+    {
+        if (!ModInformation.IsServer) return;
+
+        var mapEventId = payload.What.MapEventId;
+        if (!heldMissionStarts.TryGetValue(mapEventId, out var held)) return;
+
+        // Identity comes from the peer, never from the message - otherwise one client could answer for another
+        // and start a battle the rest were still choosing for.
+        if (payload.Who is not NetPeer peer || !playerManager.TryGetPlayer(peer, out var player)) return;
+
+        bool complete = held.Barrier.Record(player.HeroId);
+        Logger.Information("[TroopPreference] {MapEventId}: {Hero} chose; still waiting on [{Outstanding}]",
+            mapEventId, player.HeroId, string.Join(", ", held.Barrier.Outstanding));
+
+        if (complete)
+        {
+            ReleaseHold(mapEventId, "everyone chose");
+            return;
+        }
+
+        BroadcastPreferenceProgress(held, held.Barrier.Outstanding.ToArray());
+    }
+
+    private void BroadcastPreferenceProgress(HeldMissionStart held, string[] outstanding)
+    {
+        foreach (var participant in held.Participants)
+            network.Send(participant.Peer, new NetworkTroopPreferenceProgress(held.Barrier.MapEventId, outstanding));
+    }
+
+    /// <summary>Starts a held battle. Removes the hold first, so it can only fire once.</summary>
+    private void ReleaseHold(string mapEventId, string reason)
+    {
+        if (!heldMissionStarts.TryRemove(mapEventId, out var held)) return;
+
+        using (held)
+        {
+            Logger.Information("[TroopPreference] starting {MapEventId}: {Reason}{Unanswered}",
+                mapEventId,
+                reason,
+                held.Barrier.Outstanding.Count == 0
+                    ? string.Empty
+                    : $" (never answered: {string.Join(", ", held.Barrier.Outstanding)})");
+
+            // An empty list is what tells a client the wait is over and its waiting panel can go, whether the
+            // battle started because everyone chose or because it ran out of patience.
+            BroadcastPreferenceProgress(held, Array.Empty<string>());
+            SendMissionStart(held.Participants, held.MissionStartMessage);
+        }
+    }
+
+    // ---- client side of the barrier -------------------------------------------------------------------
+
+    /// <summary>The battle this client has already answered for, so progress updates know to show the wait.</summary>
+    private string answeredPreferenceForMapEventId;
+
+    /// <summary>
+    /// The server is holding a battle open for this player to choose how their troops deploy.
+    /// </summary>
+    /// <remarks>
+    /// Safe to block on: no mission exists yet on any client, so nothing runs ahead while the dialog is up.
+    /// That is the whole difference from the earlier attempt, which asked one client after the battle had
+    /// already started for everyone else.
+    /// </remarks>
+    private void Handle_NetworkTroopPreferenceRequest(MessagePayload<NetworkTroopPreferenceRequest> payload)
+    {
+        if (ModInformation.IsServer) return;
+
+        var mapEventId = payload.What.MapEventId;
+        var roster = payload.What.ParticipantHeroIds ?? Array.Empty<string>();
+
+        // A driven client has nobody to press a button and PopupCapture suppresses inquiries there, so it must
+        // answer immediately - otherwise every headless battle waits out the full timeout.
+        if (ModInformation.IsHeadless)
+        {
+            AnswerTroopPreference(mapEventId, LocalTroopDeploymentPreference.Current, roster);
+            return;
+        }
+
+        GameThread.RunSafe(() =>
+        {
+            bool mineIsCurrent = LocalTroopDeploymentPreference.Current == TroopDeploymentPreference.MyTroopsFirst;
+            InformationManager.ShowInquiry(new InquiryData(
+                "Deployment Preference",
+                "Which of your troops should fill this battle first?\n\n" +
+                "Prefer My Troops - your own party deploys and reinforces first; the garrison, the militia " +
+                "and other lords only once your party has nothing left to send." + "\n\n" +
+                "Prefer All Party Troops - every party you field shares each wave in proportion to what it " +
+                "has left." + "\n\n" +
+                $"Currently: {(mineIsCurrent ? "Prefer My Troops" : "Prefer All Party Troops")}. This is " +
+                "yours alone - it changes which of your troops arrive, never how many.",
+                isAffirmativeOptionShown: true,
+                isNegativeOptionShown: true,
+                affirmativeText: "Prefer My Troops",
+                negativeText: "Prefer All Party Troops",
+                affirmativeAction: () => AnswerTroopPreference(mapEventId, TroopDeploymentPreference.MyTroopsFirst, roster),
+                negativeAction: () => AnswerTroopPreference(mapEventId, TroopDeploymentPreference.AllPartyTroops, roster)));
+        }, context: nameof(Handle_NetworkTroopPreferenceRequest));
+    }
+
+    private void AnswerTroopPreference(string mapEventId, TroopDeploymentPreference choice, string[] roster)
+    {
+        LocalTroopDeploymentPreference.Current = choice;
+        answeredPreferenceForMapEventId = mapEventId;
+        network.SendAll(new NetworkTroopPreferenceChosen(mapEventId));
+
+        Logger.Information("[TroopPreference] {MapEventId}: chose {Choice}; waiting for the others", mapEventId, choice);
+
+        // Show the wait immediately rather than waiting for the first progress message, so the moment between
+        // clicking and the server answering is not a blank map with nothing happening.
+        var others = DescribeHeroes(roster.Where(id => !IsLocalHero(id)));
+        if (!string.IsNullOrEmpty(others)) TroopPreferenceWaitOverlay.ShowWaitingFor(others);
+    }
+
+    private void Handle_NetworkTroopPreferenceProgress(MessagePayload<NetworkTroopPreferenceProgress> payload)
+    {
+        if (ModInformation.IsServer) return;
+
+        var outstanding = (payload.What.OutstandingHeroIds ?? Array.Empty<string>())
+            .Where(id => !IsLocalHero(id))
+            .ToArray();
+
+        GameThread.RunSafe(() =>
+        {
+            // Empty means the wait is over - either everyone chose or the server ran out of patience. Either
+            // way the mission start is on its way and the notice must go.
+            if (outstanding.Length == 0 ||
+                !string.Equals(answeredPreferenceForMapEventId, payload.What.MapEventId, StringComparison.Ordinal))
+            {
+                if (outstanding.Length == 0) answeredPreferenceForMapEventId = null;
+                TroopPreferenceWaitOverlay.HideIfShown();
+                return;
+            }
+
+            TroopPreferenceWaitOverlay.ShowWaitingFor(DescribeHeroes(outstanding));
+        }, context: nameof(Handle_NetworkTroopPreferenceProgress));
+    }
+
+    private bool IsLocalHero(string heroId) =>
+        !string.IsNullOrEmpty(heroId) &&
+        objectManager.TryGetId(Hero.MainHero, out var mine) &&
+        string.Equals(mine, heroId, StringComparison.Ordinal);
+
+    /// <summary>Turns hero ids into readable names, falling back to the id so a waiting list is never blank.</summary>
+    private string DescribeHeroes(IEnumerable<string> heroIds)
+    {
+        var names = new List<string>();
+        foreach (var heroId in heroIds)
+        {
+            names.Add(objectManager.TryGetObject<Hero>(heroId, out var hero) && hero?.Name != null
+                ? hero.Name.ToString()
+                : heroId);
+        }
+        return string.Join(", ", names);
     }
 
     private void SendMissionStart(IReadOnlyList<MissionParticipant> participants, IMessage message)

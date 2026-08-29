@@ -120,6 +120,11 @@ internal class MapEventPatches
     {
         __state = false;
 
+        // C8: the rosters still exist here and do not survive the original, so this is the only moment the
+        // result of the battle can be read. It runs before the IsFinalized bail-out so a re-entrant finalize
+        // cannot silently skip the capture - MapEventOutcomeCapture ignores an already-finalized event itself.
+        MapEventOutcomeCapture.Capture(__instance);
+
         if (__instance.IsFinalized)
             return false;
 
@@ -147,6 +152,11 @@ internal class MapEventPatches
     {
         if (!__runOriginal || !__state)
             return;
+
+        // C8: reaching here IS the commit. A capture starts life as committedToCampaign=false, so the case
+        // that matters - a client that recorded an outcome it never applied, because the prefix above skips
+        // the original off the server - needs no record of its own; it is the absence of this mark.
+        MapEventOutcomeCapture.MarkCommitted(__instance);
 
         // Keep the event registered while finalized handlers clear their per-event state.
         MessageBroker.Instance.Publish(__instance, new MapEventFinalized(__instance));
