@@ -51,13 +51,17 @@ class SavePatches
     /// players off to build new characters. Nothing reported it: the .sav is complete and the engine calls
     /// the save a success.
     ///
-    /// The in-memory drivers are the ones that must be excluded - the bug reporter's and the join
-    /// transfer's - and they are ours, so they can be named directly. Anything else is treated as a real
-    /// save, which fails towards keeping player bindings rather than silently dropping them.
+    /// The in-memory driver is the one that must be excluded - the join transfer's - and it is ours, so it
+    /// can be named directly. Anything else is treated as a real save, which fails towards keeping player
+    /// bindings rather than silently dropping them.
+    ///
+    /// The bug reporter used to need excluding too, via CoopFileInMemSaveDriver. Development removed that
+    /// driver when bug-report saves became persistent (73efa3b73), so a bug report may now write a stray
+    /// sidecar. That is the cheap direction to be wrong in, and deliberately so.
     /// </remarks>
     internal static bool ShouldPublishGameSaved(ISaveDriver driver)
     {
-        return !(driver is CoopInMemSaveDriver) && !(driver is CoopFileInMemSaveDriver);
+        return !(driver is CoopInMemSaveDriver);
     }
 }
 

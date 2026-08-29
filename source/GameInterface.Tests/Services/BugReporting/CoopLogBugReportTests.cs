@@ -182,12 +182,12 @@ public class CoopLogBugReportTests : IDisposable
     }
 
     [Fact]
-    public void ServerSaveProvider_ReturnsTheCampaignSaveFileData()
+    public void ServerSaveProvider_PersistsAndReturnsTheCampaignSave()
     {
         var saveData = Encoding.UTF8.GetBytes("campaign save");
         var saveInterface = new Mock<ISaveInterface>();
         saveInterface
-            .Setup(value => value.SaveCurrentGameAsFileData(BugReportServerSaveProvider.SaveName))
+            .Setup(value => value.SaveCurrentGameToFile(BugReportServerSaveProvider.SaveName))
             .Returns(new SaveResults(true, saveData, "campaign-id"));
         var provider = new BugReportServerSaveProvider(saveInterface.Object, Mock.Of<Serilog.ILogger>());
 
@@ -197,35 +197,8 @@ public class CoopLogBugReportTests : IDisposable
         Assert.Equal("coop_bug_report.sav", save.FileName);
         Assert.Equal(saveData, save.Data);
         saveInterface.Verify(
-            value => value.SaveCurrentGameAsFileData(BugReportServerSaveProvider.SaveName),
+            value => value.SaveCurrentGameToFile(BugReportServerSaveProvider.SaveName),
             Times.Once);
-    }
-
-    [Fact]
-    public async Task ServerSaveSnapshot_DoesNotOverwriteExistingSavePair()
-    {
-        Directory.CreateDirectory(tempRoot);
-        var campaignPath = Path.Combine(tempRoot, "coop_bug_report.sav");
-        var sessionPath = Path.Combine(tempRoot, "coop_bug_report.json");
-        var existingCampaign = Encoding.UTF8.GetBytes("existing campaign");
-        var existingSession = Encoding.UTF8.GetBytes("existing session");
-        File.WriteAllBytes(campaignPath, existingCampaign);
-        File.WriteAllBytes(sessionPath, existingSession);
-        var driver = new CoopFileInMemSaveDriver();
-        var gameData = new GameData(
-            new byte[] { 1 },
-            new byte[] { 2 },
-            new[] { new byte[] { 3 } },
-            new[] { new byte[] { 4 } });
-
-        await driver.Save(BugReportServerSaveProvider.SaveName, 1, new MetaData(), gameData);
-
-        Assert.Equal(existingCampaign, File.ReadAllBytes(campaignPath));
-        Assert.Equal(existingSession, File.ReadAllBytes(sessionPath));
-        Assert.NotEmpty(driver.Data);
-        Assert.Equal(gameData.Header, driver.Load(BugReportServerSaveProvider.SaveName).GameData.Header);
-        Assert.False(SavePatches.ShouldPublishGameSaved(driver));
-        Assert.True(SavePatches.ShouldPublishGameSaved(new FileDriver()));
     }
 
     /// <summary>
@@ -247,9 +220,9 @@ public class CoopLogBugReportTests : IDisposable
         Assert.True(SavePatches.ShouldPublishGameSaved(new FileDriver()));
         Assert.True(SavePatches.ShouldPublishGameSaved(new InMemDriver()));
 
-        // The two the bug reporter and the join transfer use, which must stay excluded.
+        // The one the join transfer uses, which must stay excluded. The bug reporter's
+        // CoopFileInMemSaveDriver was removed upstream when bug-report saves became persistent.
         Assert.False(SavePatches.ShouldPublishGameSaved(new CoopInMemSaveDriver()));
-        Assert.False(SavePatches.ShouldPublishGameSaved(new CoopFileInMemSaveDriver()));
     }
 
     [Fact]
@@ -352,17 +325,13 @@ public class CoopLogBugReportTests : IDisposable
     }
 
     [Fact]
-    public async Task Uploader_UploadsServerSaveThenPostsJsonWithLogs()
+    public async Task Uploader_PutsMetadataLogsAndServerSaveInOneMultipartRequest()
     {
         var handler = new RecordingHttpHandler();
         using var httpClient = new HttpClient(handler);
-        const string publishableKey = "test-publishable-key";
-        const string authorizationToken = "server-bound-token";
         using var uploader = new BugReportUploader(
             httpClient,
-            "https://bug-reports.example.test/api/v1/reports",
-            publishableKey,
-            authorizationToken);
+            "https://bug-reports.example.test/api/v1/reports");
         var serverLog = Compress("server diagnostic\n");
         var clientLog = Compress("client diagnostic\n");
         var serverSave = Encoding.UTF8.GetBytes("server campaign save");
@@ -391,17 +360,15 @@ public class CoopLogBugReportTests : IDisposable
         var result = await uploader.UploadAsync(report, CancellationToken.None);
 
         Assert.True(result.Uploaded);
-        Assert.Equal("application/json; charset=utf-8", handler.ContentType);
-        Assert.Equal(publishableKey, handler.ApiKey);
-        Assert.Equal("Bearer " + authorizationToken, handler.Authorization);
+        Assert.Equal(1, handler.RequestCount);
+        Assert.Equal(HttpMethod.Put, handler.Method);
+        Assert.StartsWith("multipart/form-data; boundary=", handler.ContentType);
+        Assert.Null(handler.ApiKey);
+        Assert.Null(handler.Authorization);
         Assert.Equal(report.RequestId, handler.IdempotencyKey);
+        Assert.Equal(serverLog, handler.ServerLogBody);
+        Assert.Equal(clientLog, handler.ClientLogBody);
         Assert.Equal(serverSave, handler.ServerSaveBody);
-        Assert.Equal("server-save", handler.ServerSaveArtifact);
-        Assert.Equal(report.RequestId, handler.ServerSaveReportId);
-        Assert.Equal("coop_bug_report.sav", handler.ServerSaveFileName);
-        Assert.Equal(publishableKey, handler.ServerSaveApiKey);
-        Assert.Equal("Bearer " + authorizationToken, handler.ServerSaveAuthorization);
-        Assert.Equal(report.RequestId + "-server-save", handler.ServerSaveIdempotencyKey);
         using var json = JsonDocument.Parse(handler.Body);
         var root = json.RootElement;
         Assert.Equal("network-client-1", root.GetProperty("reportingClientNetworkId").GetString());
@@ -409,27 +376,25 @@ public class CoopLogBugReportTests : IDisposable
         Assert.Equal(ModInformation.Version.ToString(), root.GetProperty("moduleVersion").GetString());
         Assert.Equal(ModInformation.Commit, root.GetProperty("commit").GetString());
         Assert.Equal(ModInformation.BuildVersion, root.GetProperty("buildVersion").GetString());
-        Assert.Equal(
-            Convert.ToBase64String(serverLog),
-            root.GetProperty("serverLog").GetProperty("data").GetString());
-        Assert.Equal(
-            Convert.ToBase64String(clientLog),
-            root.GetProperty("clientLogs")[0].GetProperty("data").GetString());
-        Assert.Equal(2, root.GetProperty("schemaVersion").GetInt32());
+        Assert.Equal(3, root.GetProperty("schemaVersion").GetInt32());
+        Assert.Equal("gzip", root.GetProperty("serverLog").GetProperty("contentEncoding").GetString());
+        Assert.Equal(serverLog.Length, root.GetProperty("serverLog").GetProperty("compressedLength").GetInt32());
+        Assert.False(root.GetProperty("serverLog").TryGetProperty("data", out _));
+        Assert.Equal("gzip", root.GetProperty("clientLogs")[0].GetProperty("contentEncoding").GetString());
+        Assert.Equal(clientLog.Length, root.GetProperty("clientLogs")[0].GetProperty("compressedLength").GetInt32());
+        Assert.False(root.GetProperty("clientLogs")[0].TryGetProperty("data", out _));
         Assert.Equal("server-save", root.GetProperty("serverSave").GetProperty("artifact").GetString());
         Assert.Equal(serverSave.Length, root.GetProperty("serverSave").GetProperty("length").GetInt64());
     }
 
     [Fact]
-    public async Task Uploader_DoesNotPostReportWhenServerSaveUploadFails()
+    public async Task Uploader_ReturnsFailureWhenMultipartPutFails()
     {
-        var handler = new RecordingHttpHandler { FailServerSaveUpload = true };
+        var handler = new RecordingHttpHandler { FailUpload = true };
         using var httpClient = new HttpClient(handler);
         using var uploader = new BugReportUploader(
             httpClient,
-            "https://bug-reports.example.test/api/v1/reports",
-            "test-publishable-key",
-            "server-bound-token");
+            "https://bug-reports.example.test/api/v1/reports");
         var report = new BugReportArchiveContents(
             Guid.NewGuid().ToString("N"),
             "network-client-1",
@@ -449,32 +414,32 @@ public class CoopLogBugReportTests : IDisposable
         var result = await uploader.UploadAsync(report, CancellationToken.None);
 
         Assert.False(result.Uploaded);
-        Assert.Null(handler.Body);
+        Assert.Equal(1, handler.RequestCount);
+        Assert.NotNull(handler.Body);
         Assert.NotNull(handler.ServerSaveBody);
     }
 
     [Fact]
-    public void Uploader_DefaultConfigurationIsDisabled()
+    public void Uploader_DefaultConfigurationUsesPublicEdgeFunction()
     {
         using var httpClient = new HttpClient(new RecordingHttpHandler());
         using var uploader = new BugReportUploader(httpClient);
 
-        Assert.False(uploader.IsConfigured);
-        Assert.EndsWith(".invalid/api/v1/reports", BugReportUploader.Endpoint);
+        Assert.True(uploader.IsConfigured);
+        Assert.Equal(
+            "https://wfvqnijwuyqjibhlcrhz.supabase.co/functions/v1/create-github-issue-bug-report",
+            BugReportUploader.Endpoint);
     }
 
     [Fact]
-    public void Uploader_DoesNotTreatPublishableKeyAsServerAuthorization()
+    public void Uploader_AnonymousEndpointDoesNotRequireCredentials()
     {
         using var httpClient = new HttpClient(new RecordingHttpHandler());
-        const string publishableKey = "test-publishable-key";
         using var uploader = new BugReportUploader(
             httpClient,
-            "https://bug-reports.example.test/api/v1/reports",
-            publishableKey,
-            publishableKey);
+            "https://bug-reports.example.test/api/v1/reports");
 
-        Assert.False(uploader.IsConfigured);
+        Assert.True(uploader.IsConfigured);
     }
 
     [Fact]
@@ -542,61 +507,45 @@ public class CoopLogBugReportTests : IDisposable
 
     private sealed class RecordingHttpHandler : HttpMessageHandler
     {
+        public int RequestCount { get; private set; }
+        public HttpMethod Method { get; private set; }
         public string Body { get; private set; }
         public string ContentType { get; private set; }
         public string ApiKey { get; private set; }
         public string Authorization { get; private set; }
         public string IdempotencyKey { get; private set; }
+        public byte[] ServerLogBody { get; private set; }
+        public byte[] ClientLogBody { get; private set; }
         public byte[] ServerSaveBody { get; private set; }
-        public string ServerSaveArtifact { get; private set; }
-        public string ServerSaveReportId { get; private set; }
-        public string ServerSaveFileName { get; private set; }
-        public string ServerSaveApiKey { get; private set; }
-        public string ServerSaveAuthorization { get; private set; }
-        public string ServerSaveIdempotencyKey { get; private set; }
-        public bool FailServerSaveUpload { get; set; }
+        public bool FailUpload { get; set; }
 
         protected override async Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request,
             CancellationToken cancellationToken)
         {
-            if (request.Method == HttpMethod.Put)
+            RequestCount++;
+            Method = request.Method;
+            ContentType = request.Content.Headers.ContentType.ToString();
+            ApiKey = request.Headers.TryGetValues("apikey", out var apiKeys)
+                ? string.Join(string.Empty, apiKeys)
+                : null;
+            Authorization = request.Headers.Authorization?.ToString();
+            IdempotencyKey = string.Join(string.Empty, request.Headers.GetValues("Idempotency-Key"));
+
+            var multipart = Assert.IsType<MultipartFormDataContent>(request.Content);
+            foreach (var part in multipart)
             {
-                ServerSaveBody = await request.Content.ReadAsByteArrayAsync();
-                ServerSaveArtifact = string.Join(
-                    string.Empty,
-                    request.Headers.GetValues("X-Bug-Report-Artifact"));
-                ServerSaveReportId = string.Join(
-                    string.Empty,
-                    request.Headers.GetValues("X-Bug-Report-Id"));
-                ServerSaveFileName = string.Join(
-                    string.Empty,
-                    request.Headers.GetValues("X-Bug-Report-File-Name"));
-                ServerSaveApiKey = string.Join(string.Empty, request.Headers.GetValues("apikey"));
-                ServerSaveAuthorization = request.Headers.Authorization?.ToString();
-                ServerSaveIdempotencyKey = string.Join(
-                    string.Empty,
-                    request.Headers.GetValues("Idempotency-Key"));
-                if (FailServerSaveUpload)
-                {
-                    return new HttpResponseMessage(HttpStatusCode.BadRequest)
-                    {
-                        Content = new StringContent("save rejected"),
-                    };
-                }
-            }
-            else
-            {
-                ContentType = request.Content.Headers.ContentType.ToString();
-                ApiKey = string.Join(string.Empty, request.Headers.GetValues("apikey"));
-                Authorization = request.Headers.Authorization?.ToString();
-                IdempotencyKey = string.Join(string.Empty, request.Headers.GetValues("Idempotency-Key"));
-                Body = await request.Content.ReadAsStringAsync();
+                var name = part.Headers.ContentDisposition.Name.Trim('"');
+                if (name == "report") Body = await part.ReadAsStringAsync();
+                else if (name == "serverLog") ServerLogBody = await part.ReadAsByteArrayAsync();
+                else if (name == "serverSave") ServerSaveBody = await part.ReadAsByteArrayAsync();
+                else if (name == BugReportUploader.GetClientLogPartName(1))
+                    ClientLogBody = await part.ReadAsByteArrayAsync();
             }
 
-            return new HttpResponseMessage(HttpStatusCode.OK)
+            return new HttpResponseMessage(FailUpload ? HttpStatusCode.BadRequest : HttpStatusCode.OK)
             {
-                Content = new StringContent("accepted"),
+                Content = new StringContent(FailUpload ? "report rejected" : "accepted"),
             };
         }
     }
