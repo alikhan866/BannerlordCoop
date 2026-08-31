@@ -1224,6 +1224,9 @@ public class VillageHostileActionTests : MapEventTestBase
             (int)BattleStartMode.Mission,
             mapEventId!,
             playerMobilePartyId)), MapEventDisabledMethods);
+        // The server holds a mission start while participating players choose how their troops are
+        // supplied. Answer it the way a client does, so what is asserted is the start rather than the hold.
+        TestEnvironment.ReleaseTroopPreference(mapEventId!);
 
         Assert.Equal(mapEventId, Server.NetworkSentMessages.GetMessages<NetworkStartAttackMission>().Single().MapEventId);
 
@@ -1962,6 +1965,9 @@ public class VillageHostileActionTests : MapEventTestBase
                 (int)BattleStartMode.Mission,
                 raidMapEventId!,
                 joinerMobilePartyId)), MapEventDisabledMethods);
+            // The server holds a mission start while participating players choose how their troops are
+            // supplied. Answer it the way a client does, so what is asserted is the start rather than the hold.
+            TestEnvironment.ReleaseTroopPreference(raidMapEventId!);
 
             Assert.True(Server.NetworkSentMessages.GetMessages<NetworkBattleStartReply>().Single().Accepted);
             Assert.Equal(raidMapEventId, Server.NetworkSentMessages.GetMessages<NetworkStartAttackMission>().Single().MapEventId);
@@ -2190,6 +2196,10 @@ public class VillageHostileActionTests : MapEventTestBase
                 raidMapEventId!,
                 joinerMobilePartyId)), MapEventDisabledMethods);
 
+            // The server holds a mission start while participating players choose how their troops are
+            // supplied. Answer it the way a client does, so what is asserted is the start, not the hold.
+            TestEnvironment.ReleaseTroopPreference(raidMapEventId!);
+
             Assert.True(Server.NetworkSentMessages.GetMessages<NetworkBattleStartReply>().Single().Accepted);
             Assert.Equal(
                 raidMapEventId,
@@ -2220,6 +2230,10 @@ public class VillageHostileActionTests : MapEventTestBase
             hostileAction.MapEventId,
             hostileAction.AttackerMobilePartyId)), MapEventDisabledMethods);
 
+        // The server holds a mission start while participating players choose how their troops are
+        // supplied. Answer it the way a client does, so what is asserted is the start rather than the hold.
+        TestEnvironment.ReleaseTroopPreference(hostileAction.MapEventId);
+
         var start = Server.NetworkSentMessages.GetMessages<NetworkStartAttackMission>().Single();
         Assert.Equal(hostileAction.MapEventId, start.MapEventId);
 
@@ -2246,6 +2260,10 @@ public class VillageHostileActionTests : MapEventTestBase
             (int)BattleStartMode.Mission,
             hostileAction.MapEventId,
             hostileAction.AttackerMobilePartyId)), MapEventDisabledMethods);
+
+        // The server holds a mission start while participating players choose how their troops are
+        // supplied. Answer it the way a client does, so what is asserted is the start rather than the hold.
+        TestEnvironment.ReleaseTroopPreference(hostileAction.MapEventId);
 
         var starts = Server.NetworkSentMessages.GetMessages<NetworkStartAttackMission>().ToArray();
         Assert.Equal(2, starts.Length);
@@ -2302,6 +2320,10 @@ public class VillageHostileActionTests : MapEventTestBase
             (int)BattleStartMode.Mission,
             hostileAction.MapEventId,
             hostileAction.AttackerMobilePartyId)), MapEventDisabledMethods);
+
+        // The server holds a mission start while participating players choose how their troops are
+        // supplied. Answer it the way a client does, so what is asserted is the start rather than the hold.
+        TestEnvironment.ReleaseTroopPreference(hostileAction.MapEventId);
 
         var left = Server.NetworkSentMessages.GetMessages<NetworkPartyLeftBattle>().Single();
         Assert.Equal(woundedPartyId, left.PartyId);
@@ -2360,6 +2382,11 @@ public class VillageHostileActionTests : MapEventTestBase
                 (int)BattleStartMode.Mission,
                 hostileAction.MapEventId,
                 firstPlayerMobilePartyId!)), MapEventDisabledMethods);
+
+            // The server holds a mission start while participating players choose how their troops are
+            // supplied. Answer it the way a client does, so what is asserted is the start, not the hold.
+            TestEnvironment.ReleaseTroopPreference(hostileAction.MapEventId);
+
             Assert.True(Server.NetworkSentMessages.GetMessages<NetworkBattleStartReply>().Single().Accepted);
             Assert.Equal(2, Server.NetworkSentMessages.GetMessages<NetworkStartAttackMission>().Count());
 
@@ -2382,7 +2409,13 @@ public class VillageHostileActionTests : MapEventTestBase
                 secondPlayerMobilePartyId!)), MapEventDisabledMethods);
 
             Assert.True(Server.NetworkSentMessages.GetMessages<NetworkBattleStartReply>().Single().Accepted);
-            Assert.Equal(2, Server.NetworkSentMessages.GetMessages<NetworkStartAttackMission>().Count());
+
+            // Nobody is sent a second start: both players are already in this mission from the request
+            // above. Re-sending one tore a mid-battle client out of its mission and dropped it back on the
+            // encounter menu, which is what this test's name - keeping the existing player in the battle -
+            // is really about. That the wounded player STAYS is asserted below, by nobody leaving and both
+            // parties still being present.
+            Assert.Empty(Server.NetworkSentMessages.GetMessages<NetworkStartAttackMission>());
             Assert.Empty(Server.NetworkSentMessages.GetMessages<NetworkPartyLeftBattle>());
             AssertHostileActionJoinerPresent(Server, hostileAction.MapEventId, firstPlayerPartyId!);
             AssertHostileActionJoinerPresent(Server, hostileAction.MapEventId, secondPlayerPartyId!);

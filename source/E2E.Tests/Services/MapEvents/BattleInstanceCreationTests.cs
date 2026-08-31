@@ -111,6 +111,9 @@ public class BattleInstanceCreationTests : MissionTestEnvironment
                 (int)BattleStartMode.Mission,
                 mapEventId,
                 partyIds[0])), MapEventDisabledMethods);
+            // The server holds a mission start while participating players choose how their troops are
+            // supplied. Answer it the way a client does, so what is asserted is the start, not the hold.
+            ReleaseTroopPreference(mapEventId);
 
             // The server hands the mission to each authoritative participant, carrying the battle's unique
             // map-event id (BR-104), rather than opening a mission itself (BR-002 para 2).

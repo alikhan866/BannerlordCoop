@@ -138,6 +138,9 @@ public class BattleEligibilityTests : MissionTestEnvironment
                 (int)BattleStartMode.Mission,
                 mapEventId,
                 partyIds[0])), MapEventDisabledMethods);
+            // The server holds a mission start while participating players choose how their troops are
+            // supplied. Answer it the way a client does, so what is asserted is the start, not the hold.
+            ReleaseTroopPreference(mapEventId);
 
             Assert.True(Server.NetworkSentMessages.GetMessages<NetworkBattleStartReply>().Single().Accepted);
             Assert.Equal(2, Server.NetworkSentMessages.GetMessages<NetworkStartAttackMission>().Count());

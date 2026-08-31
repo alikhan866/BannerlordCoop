@@ -172,6 +172,10 @@ public class SiegeInteractionBattleTests : MissionTestEnvironment
                 battle.MapEventId,
                 battle.AttackerPlayerPartyId)), MapEventDisabledMethods);
 
+        // The server holds a mission start while participating players choose how their troops are
+        // supplied. Answer it the way a client does, so what is asserted is the start, not the hold.
+        ReleaseTroopPreference(battle.MapEventId);
+
         var starts = Server.NetworkSentMessages.GetMessages<NetworkStartAttackMission>().ToArray();
         Assert.Equal(2, starts.Length);
         Assert.All(starts, start => Assert.Equal(battle.MapEventId, start.MapEventId));
@@ -220,6 +224,10 @@ public class SiegeInteractionBattleTests : MissionTestEnvironment
                 (int)BattleStartMode.Mission,
                 battle.MapEventId,
                 battle.AttackerPlayerPartyId)), MapEventDisabledMethods);
+
+        // The server holds a mission start while participating players choose how their troops are
+        // supplied. Answer it the way a client does, so what is asserted is the start, not the hold.
+        ReleaseTroopPreference(battle.MapEventId);
 
         var starts = Server.NetworkSentMessages.GetMessages<NetworkStartSiegeMission>().ToArray();
         Assert.Equal(2, starts.Length);

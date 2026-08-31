@@ -14,6 +14,7 @@ using E2E.Tests.Util;
 using GameInterface;
 using GameInterface.AutoSync;
 using GameInterface.Services.MapEvents;
+using GameInterface.Services.MapEvents.Messages.Start;
 using GameInterface.Services.MapEvents.PlayerPartyInteractions;
 using GameInterface.Services.Players;
 using GameInterface.Tests.Bootstrap;
@@ -436,6 +437,32 @@ public class E2ETestEnvironment : IDisposable
     public void FlushCoalescer()
     {
         Server.Call(() => Server.Resolve<ISendCoalescer>().Flush(Server.Resolve<INetwork>()));
+    }
+
+    /// <summary>
+    /// Answers the troop-preference barrier for every client, releasing a held mission start.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A multiplayer mission start is not broadcast the moment it is requested. The server holds it while
+    /// each participating player chooses how their troops are supplied, and releases it once everyone has
+    /// answered or the timeout expires. A test that asserts on the start therefore has to answer first, or
+    /// it observes the hold rather than the start and sees nothing sent.
+    /// </para>
+    /// <para>
+    /// This sends exactly what a real client sends - <c>NetworkTroopPreferenceChosen</c> - rather than
+    /// reaching into the handler, so the barrier is exercised rather than bypassed. It is safe to call when
+    /// no battle is held: an acknowledgement for an unknown map event is ignored.
+    /// </para>
+    /// </remarks>
+    public void ReleaseTroopPreference(string mapEventId)
+    {
+        foreach (var client in Clients)
+        {
+            var instance = client;
+            instance.Call(() => instance.Resolve<INetwork>().SendAll(
+                new NetworkTroopPreferenceChosen(mapEventId)));
+        }
     }
 
     /// <summary>
