@@ -1,3 +1,4 @@
+﻿using Common;
 using Common.Messaging;
 using GameInterface.Services.Inventory.Data;
 using GameInterface.Services.MapEvents.Messages.Conversation;
@@ -7,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using TaleWorlds.CampaignSystem;
 using TaleWorlds.CampaignSystem.BarterSystem.Barterables;
 using TaleWorlds.CampaignSystem.Inventory;
@@ -36,6 +38,26 @@ internal static class PlayerPartyTradeContext
 
     private static readonly HashSet<BarterItemVM> scratchItems = new HashSet<BarterItemVM>();
 
+    /// <summary>
+    /// Smallest gap between two offer updates leaving this client.
+    /// </summary>
+    /// <remarks>
+    /// An offer change is published once per UNIT the player moves a slider, because
+    /// <c>BarterItemVM.CurrentOfferedAmount</c>'s setter calls <c>BarterVM.OnOfferedAmountChange</c> ->
+    /// <c>SendOffer</c> on every step. Dragging a gold slider therefore emitted an update per frame, and
+    /// each one cost a server broadcast to EVERY player. The offer is a last-write-wins snapshot - only
+    /// its final value means anything - so the intermediate ones are pure waste.
+    ///
+    /// 150 ms is chosen to sit under human reaction time, so a player who drags and stops sees the other
+    /// side agree almost at once, while a drag lasting a second costs about seven updates instead of sixty.
+    /// </remarks>
+    private static readonly TimeSpan OfferPublishInterval = TimeSpan.FromMilliseconds(150);
+
+    private static readonly object offerPublishGate = new object();
+    private static DateTime lastOfferPublishUtc = DateTime.MinValue;
+    private static object pendingOfferSource;
+    private static System.Threading.Timer offerPublishTimer;
+
     public static void Begin(string sessionId, PartyBase localParty = null)
     {
         SessionId = sessionId;
@@ -44,6 +66,7 @@ internal static class PlayerPartyTradeContext
         RemoteAccepted = false;
         activeBarterVM = null;
         resetButton = null;
+        ClearPendingOffer();
     }
 
     public static void End(string sessionId = null, PlayerPartyInteractionOutcomeType outcomeType = PlayerPartyInteractionOutcomeType.None)
@@ -58,6 +81,7 @@ internal static class PlayerPartyTradeContext
         RemoteAccepted = false;
         activeBarterVM = null;
         resetButton = null;
+        ClearPendingOffer();
 
         try
         {
@@ -119,11 +143,27 @@ internal static class PlayerPartyTradeContext
         return CanOffer(barterable);
     }
 
+    /// <summary>Accepting again while an acceptance stands is a no-op, so the button is held closed.</summary>
     public static bool CanAccept()
         => !IsActive || !LocalAccepted;
 
+    /// <summary>
+    /// Leaving a trade is ALWAYS allowed - including after this player has accepted.
+    /// </summary>
+    /// <remarks>
+    /// This used to be the same condition as <see cref="CanAccept"/>, which meant accepting closed the only
+    /// two doors out of the screen at once: Accept was refused because an acceptance already stood, and
+    /// Cancel was refused for the identical reason. Recovery then depended entirely on a later server state
+    /// message clearing the acceptance; if that never arrived - the other player sat on the screen, the
+    /// session ended in a way this client did not see, or the message queued behind a flood of offer updates
+    /// - the player was left in a modal barter screen with no working control and had to restart the game.
+    ///
+    /// A late leave is safe on the server: it either ends a session that is still open, or names a session
+    /// already removed, which ProcessSubmittedOption ignores and logs. So there is no state this can corrupt,
+    /// and refusing it only ever traps the player.
+    /// </remarks>
     public static bool CanCancel()
-        => !IsActive || !LocalAccepted;
+        => true;
 
     public static bool CanReset()
         => !IsActive;
@@ -173,27 +213,118 @@ internal static class PlayerPartyTradeContext
     }
 
     public static void PublishOfferChanged(InventoryLogic inventoryLogic)
-    {
-        if (!IsActive) return;
-        if (isApplyingServerOffer || !CanModifyOffer()) return;
-
-        ResetAcceptance();
-        MessageBroker.Instance.Publish(inventoryLogic, new PlayerPartyTradeOfferChanged(SessionId, inventoryLogic));
-    }
+        => PublishOfferChanged((object)inventoryLogic);
 
     public static void PublishOfferChanged(BarterVM barterVM)
+        => PublishOfferChanged((object)barterVM);
+
+    /// <summary>
+    /// Publishes an offer change, at most one per <see cref="OfferPublishInterval"/>.
+    /// </summary>
+    /// <remarks>
+    /// Acceptance is cleared IMMEDIATELY on every change, throttled or not: that is local UI state
+    /// costing nothing, and letting an acceptance stand against an offer the player has already altered
+    /// is exactly the confusion this screen must not create.
+    ///
+    /// A change arriving inside the interval is remembered rather than dropped, and a one-shot timer
+    /// publishes it once the interval passes. Dropping it would leave the other player looking at a stale
+    /// offer for as long as the dragger sat still, which is worse than the traffic.
+    /// </remarks>
+    private static void PublishOfferChanged(object source)
     {
         if (!IsActive) return;
         if (isApplyingServerOffer || !CanModifyOffer()) return;
 
         ResetAcceptance();
-        MessageBroker.Instance.Publish(barterVM, new PlayerPartyTradeOfferChanged(SessionId, barterVM));
+
+        lock (offerPublishGate)
+        {
+            DateTime nowUtc = DateTime.UtcNow;
+            TimeSpan sinceLast = nowUtc - lastOfferPublishUtc;
+
+            // A clock that stepped backwards must not hold an offer off the wire indefinitely.
+            if (sinceLast >= OfferPublishInterval || sinceLast < TimeSpan.Zero)
+            {
+                lastOfferPublishUtc = nowUtc;
+                pendingOfferSource = null;
+                PublishOfferNow(source);
+                return;
+            }
+
+            pendingOfferSource = source;
+            ArmOfferPublishTimer(OfferPublishInterval - sinceLast);
+        }
+    }
+
+    /// <summary>Sends whatever the throttle is still holding, if anything.</summary>
+    /// <remarks>
+    /// Called before accepting, so the server can never apply a trade against an offer one step older
+    /// than the one the player is looking at.
+    /// </remarks>
+    public static void FlushPendingOffer()
+    {
+        object source;
+        lock (offerPublishGate)
+        {
+            source = pendingOfferSource;
+            pendingOfferSource = null;
+            if (source == null) return;
+
+            lastOfferPublishUtc = DateTime.UtcNow;
+        }
+
+        if (!IsActive) return;
+        PublishOfferNow(source);
+    }
+
+    private static void PublishOfferNow(object source)
+    {
+        if (source is InventoryLogic inventoryLogic)
+        {
+            MessageBroker.Instance.Publish(
+                inventoryLogic, new PlayerPartyTradeOfferChanged(SessionId, inventoryLogic));
+            return;
+        }
+
+        if (source is BarterVM barterVM)
+            MessageBroker.Instance.Publish(barterVM, new PlayerPartyTradeOfferChanged(SessionId, barterVM));
+    }
+
+    /// <remarks>
+    /// The timer thread only marshals: reading the barter view model to build the offer has to happen on
+    /// the game loop thread, where the UI lives, so the work is queued rather than done here.
+    /// </remarks>
+    private static void ArmOfferPublishTimer(TimeSpan delay)
+    {
+        if (offerPublishTimer == null)
+        {
+            offerPublishTimer = new System.Threading.Timer(
+                _ => GameThread.EnqueueSafe(FlushPendingOffer, context: "Flush player-party trade offer"),
+                null,
+                Timeout.InfiniteTimeSpan,
+                Timeout.InfiniteTimeSpan);
+        }
+
+        offerPublishTimer.Change(delay, Timeout.InfiniteTimeSpan);
+    }
+
+    private static void ClearPendingOffer()
+    {
+        lock (offerPublishGate)
+        {
+            pendingOfferSource = null;
+            lastOfferPublishUtc = DateTime.MinValue;
+            offerPublishTimer?.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        }
     }
 
     public static void PublishAccept(bool accepted)
     {
         if (!IsActive) return;
         if (!CanAccept()) return;
+
+        // Reliable-ordered, so a held offer lands before the acceptance it belongs to.
+        FlushPendingOffer();
 
         if (accepted)
         {
@@ -334,6 +465,23 @@ internal static class PlayerPartyTradeContext
         foreach (var item in GetAllBarterItems(activeBarterVM))
         {
             if (!IsOwnedByParty(item, message.PartyId, objectManager)) continue;
+
+            // A stack of ordinary prisoners mirrors its COUNT; a captured lord is present or absent.
+            if (item.Barterable is PlayerPartyPrisonerBarterable prisonerBarterable)
+            {
+                if (!TryGetCharacterKey(
+                        prisonerBarterable.PrisonerRosterElement.Character,
+                        objectManager,
+                        out var stackKey))
+                {
+                    continue;
+                }
+
+                offeredPrisoners.TryGetValue(stackKey, out var offeredStack);
+                ApplyOfferedAmount(item, offeredStack);
+                continue;
+            }
+
             if (!(item.Barterable is TransferPrisonerBarterable transferPrisonerBarterable)) continue;
             if (!(PrisonerCharacterField?.GetValue(transferPrisonerBarterable) is Hero prisonerHero)) continue;
             if (!TryGetCharacterKey(prisonerHero.CharacterObject, objectManager, out var prisonerKey)) continue;

@@ -61,6 +61,14 @@ internal class PlayerPartyInteractionHandler : IHandler
     private readonly HashSet<string> openedConversationSessionIds = new HashSet<string>();
     private readonly HashSet<string> endedInteractionSessionIds = new HashSet<string>();
     private readonly HashSet<string> hostileEncounterSessionIds = new HashSet<string>();
+
+    /// <summary>Sessions this client has already stepped out of the encounter menu for.</summary>
+    /// <remarks>
+    /// The retry runs once per MAP FRAME, so without this the exit would be attempted every frame for as
+    /// long as any menu remained - and GameMenu.ExitToLast pops to the PREVIOUS menu, so a repeated call
+    /// would walk back through the player's whole menu stack instead of leaving one encounter.
+    /// </remarks>
+    private readonly HashSet<string> encounterMenuExitedSessionIds = new HashSet<string>();
     private readonly HashSet<string> closedHostileEncounterPartyIds = new HashSet<string>();
     private bool presentationTickRegistered;
 
@@ -99,8 +107,11 @@ internal class PlayerPartyInteractionHandler : IHandler
 
     public void Dispose()
     {
-        if (presentationTickRegistered && Campaign.Current != null)
-            CampaignEvents.TickEvent.ClearListeners(this);
+        if (presentationTickRegistered)
+        {
+            PlayerPartyInteractionMapTickPatch.MapTicked -= TryOpenPendingMapConversation;
+            presentationTickRegistered = false;
+        }
 
         messageBroker.Unsubscribe<NetworkPlayerPartyInteractionStarted>(Handle_NetworkPlayerPartyInteractionStarted);
         messageBroker.Unsubscribe<NetworkPlayerPartyInteractionState>(Handle_NetworkPlayerPartyInteractionState);
@@ -299,6 +310,7 @@ internal class PlayerPartyInteractionHandler : IHandler
             if (!isLocalInteraction && !IsCurrentLocalInteractionSession(message.SessionId)) return;
 
             endedInteractionSessionIds.Add(message.SessionId);
+            encounterMenuExitedSessionIds.Remove(message.SessionId);
             PlayerPartyInteractionDialogState.Clear(message.SessionId);
             PlayerPartyTradeContext.End(message.SessionId, message.OutcomeType);
             PlayerPartyTradeOverlay.Instance.Hide(message.SessionId);
@@ -431,7 +443,7 @@ internal class PlayerPartyInteractionHandler : IHandler
             message.OfferedFiefs,
             message.OfferedPrisoners,
             offeredPeace));
-        SendTradeStates(session, false);
+        SendTradeStates(session, sendOffers: false, opensTrade: false);
     }
 
     private bool CanOfferPeace(PlayerPartyInteractionSession session, string partyId)
@@ -619,7 +631,7 @@ internal class PlayerPartyInteractionHandler : IHandler
         {
             session.InitiatorAcceptedTrade = false;
             session.ResponderAcceptedTrade = false;
-            SendTradeStates(session);
+            SendTradeStates(session, sendOffers: true, opensTrade: true);
             return;
         }
 
@@ -643,12 +655,38 @@ internal class PlayerPartyInteractionHandler : IHandler
     }
 
     private void SendTradeStates(PlayerPartyInteractionSession session)
-        => SendTradeStates(session, true);
+        => SendTradeStates(session, true, opensTrade: false);
 
-    private void SendTradeStates(PlayerPartyInteractionSession session, bool sendOffers)
+    /// <summary>
+    /// Pushes the trade phase to both peers.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="opensTrade"/> decides whether both parties' FULL item rosters ride along, and only
+    /// the call that first enters the trade passes true. The client consumes those rosters in
+    /// <c>ApplyTradeItemSnapshots</c>, which is reached only from <c>OpenTrade</c>, and <c>OpenTrade</c>
+    /// returns immediately once a trade is already active - so on every later state message the receiver
+    /// threw the inventories away unread.
+    ///
+    /// That mattered because this fires on every offer change, and an offer changes once per UNIT dragged
+    /// on a gold or amount slider: BarterItemVM.CurrentOfferedAmount's setter calls
+    /// BarterVM.OnOfferedAmountChange -> SendOffer on each step. Two inventories per state message, two
+    /// state messages per change, tens of changes a second, broadcast to every player - which is what put
+    /// the reliable queue into the state OverloadedPeerManager reports as "clients are catching up".
+    /// </remarks>
+    private void SendTradeStates(PlayerPartyInteractionSession session, bool sendOffers, bool opensTrade)
     {
-        SendInitiatorState(session, PlayerPartyInteractionPhase.TradeActive, session.Proposal, Array.Empty<PlayerPartyInteractionOption>());
-        SendResponderState(session, PlayerPartyInteractionPhase.TradeActive, session.Proposal, Array.Empty<PlayerPartyInteractionOption>());
+        SendInitiatorState(
+            session,
+            PlayerPartyInteractionPhase.TradeActive,
+            session.Proposal,
+            Array.Empty<PlayerPartyInteractionOption>(),
+            includeItems: opensTrade);
+        SendResponderState(
+            session,
+            PlayerPartyInteractionPhase.TradeActive,
+            session.Proposal,
+            Array.Empty<PlayerPartyInteractionOption>(),
+            includeItems: opensTrade);
 
         if (sendOffers)
             SendTradeOffers(session);
@@ -682,12 +720,14 @@ internal class PlayerPartyInteractionHandler : IHandler
         PlayerPartyInteractionPhase phase,
         PlayerPartyInteractionProposal proposal,
         PlayerPartyInteractionOption[] options,
-        PlayerPartyInteractionOption[] enabledOptions = null)
+        PlayerPartyInteractionOption[] enabledOptions = null,
+        bool includeItems = false)
     {
-        var partyItems = phase == PlayerPartyInteractionPhase.TradeActive
+        var sendItems = includeItems && phase == PlayerPartyInteractionPhase.TradeActive;
+        var partyItems = sendItems
             ? ResolvePartyItemIds(session.InitiatorPartyId)
             : Array.Empty<ItemRosterElementData>();
-        var otherPartyItems = phase == PlayerPartyInteractionPhase.TradeActive
+        var otherPartyItems = sendItems
             ? ResolvePartyItemIds(session.ResponderPartyId)
             : Array.Empty<ItemRosterElementData>();
 
@@ -714,12 +754,14 @@ internal class PlayerPartyInteractionHandler : IHandler
         PlayerPartyInteractionPhase phase,
         PlayerPartyInteractionProposal proposal,
         PlayerPartyInteractionOption[] options,
-        PlayerPartyInteractionOption[] enabledOptions = null)
+        PlayerPartyInteractionOption[] enabledOptions = null,
+        bool includeItems = false)
     {
-        var partyItems = phase == PlayerPartyInteractionPhase.TradeActive
+        var sendItems = includeItems && phase == PlayerPartyInteractionPhase.TradeActive;
+        var partyItems = sendItems
             ? ResolvePartyItemIds(session.ResponderPartyId)
             : Array.Empty<ItemRosterElementData>();
-        var otherPartyItems = phase == PlayerPartyInteractionPhase.TradeActive
+        var otherPartyItems = sendItems
             ? ResolvePartyItemIds(session.InitiatorPartyId)
             : Array.Empty<ItemRosterElementData>();
 
@@ -1130,11 +1172,25 @@ internal class PlayerPartyInteractionHandler : IHandler
         => PlayerPartyInteractionDialogState.SessionId == sessionId ||
            PlayerPartyTradeContext.SessionId == sessionId;
 
+    /// <summary>
+    /// Starts retrying the pending map conversation until the map will accept it.
+    /// </summary>
+    /// <remarks>
+    /// Driven by the MAP tick rather than the campaign tick. The campaign tick stops dead while the game
+    /// is paused (Campaign.Tick only dispatches when _dt > 0, and a stopped clock leaves _dt at zero), so
+    /// a player who opened a conversation while paused never got their own dialog: the open is refused
+    /// while they sit at the encounter menu they clicked from, and the retry that would follow the menu
+    /// closing never ran. The other player, not being at a menu, opened first time and was left waiting on
+    /// a proposal that could not arrive.
+    ///
+    /// The map tick is also the more precise source: it only fires while the map state is active, which is
+    /// exactly what CanOpenMapConversation requires anyway.
+    /// </remarks>
     private void EnsurePresentationTickListener()
     {
-        if (presentationTickRegistered || Campaign.Current == null) return;
+        if (presentationTickRegistered) return;
 
-        CampaignEvents.TickEvent.AddNonSerializedListener(this, _ => TryOpenPendingMapConversation());
+        PlayerPartyInteractionMapTickPatch.MapTicked += TryOpenPendingMapConversation;
         presentationTickRegistered = true;
     }
 
@@ -1146,6 +1202,50 @@ internal class PlayerPartyInteractionHandler : IHandler
         if (endedInteractionSessionIds.Contains(sessionId)) return;
 
         TryOpenMapConversation(sessionId, PlayerPartyInteractionDialogState.PartyId, PlayerPartyInteractionDialogState.OtherPartyId);
+    }
+
+    /// <summary>
+    /// Steps out of the encounter menu that is holding this conversation closed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The player who STARTS a conversation is, by definition, standing in the encounter menu they clicked
+    /// "Talk to army leader" in - and <see cref="CanOpenMapConversation"/> refuses to open a map
+    /// conversation while the map state is at a menu. In single player the click would have run
+    /// <c>PlayerEncounter.RestartPlayerEncounter</c>, which replaces the menu; in co-op that call is held
+    /// back until the server approves, so the menu simply stays put.
+    /// </para>
+    /// <para>
+    /// Unpausing used to clear it, because <c>EncounterManager.Tick</c> runs from <c>Campaign.Tick</c>
+    /// under <c>_dt &gt; 0f</c> and a stopped clock leaves <c>_dt</c> at zero. So with the game paused the
+    /// menu never closed, the conversation never opened, and the other player - who is not at a menu, and
+    /// so opened first time - sat on "Awaiting proposal from ...". That is why barter appeared to need the
+    /// clock running.
+    /// </para>
+    /// <para>
+    /// Only the vanilla <c>"encounter"</c> menu is left, and only while this client has a live interaction
+    /// waiting to be shown. Any other menu is somewhere the player chose to be - a settlement, a village,
+    /// a wait menu - and closing one of those out from under them would be a worse bug than the one being
+    /// fixed.
+    /// </para>
+    /// </remarks>
+    private static void LeaveEncounterMenuBlockingConversation()
+    {
+        if (!(GameStateManager.Current?.ActiveState is MapState mapState) || !mapState.AtMenu) return;
+        if (Campaign.Current?.CurrentMenuContext?.GameMenu?.StringId != "encounter") return;
+
+        // A wait menu is doing something on the player's behalf (besieging, waiting out an hour); yanking
+        // them out of it would cancel that.
+        if (mapState.MenuContext?.GameMenu?.IsWaitActive == true) return;
+
+        try
+        {
+            GameMenu.ExitToLast();
+        }
+        catch (Exception e)
+        {
+            Logger.Warning(e, "Unable to leave the encounter menu for a player-party conversation");
+        }
     }
 
     private static bool CanOpenMapConversation()
@@ -1197,7 +1297,13 @@ internal class PlayerPartyInteractionHandler : IHandler
     {
         if (openedConversationSessionIds.Contains(sessionId)) return;
         if (endedInteractionSessionIds.Contains(sessionId)) return;
-        if (!CanOpenMapConversation()) return;
+
+        if (!CanOpenMapConversation())
+        {
+            if (encounterMenuExitedSessionIds.Add(sessionId))
+                LeaveEncounterMenuBlockingConversation();
+            return;
+        }
 
         if (!objectManager.TryGetObject<PartyBase>(myPartyId, out var myParty)) return;
         if (!objectManager.TryGetObject<PartyBase>(otherPartyId, out var otherParty)) return;
@@ -1395,6 +1501,46 @@ internal class PlayerPartyInteractionHandler : IHandler
                 new TransferPrisonerBarterable(prisoner.HeroObject, ownerHero, ownerParty, otherHero, otherParty),
                 false);
         }
+
+        // Captured lords are the only prisoners vanilla can represent, because TransferPrisonerBarterable
+        // takes a Hero. Everything else in a prison roster - which is nearly all of it - had no barterable
+        // and so could not be offered at all.
+        foreach (var prisoner in GetOrdinaryPrisoners(ownerParty))
+        {
+            barterData.AddBarterable<PrisonerBarterGroup>(
+                new PlayerPartyPrisonerBarterable(ownerHero, otherHero, ownerParty, otherParty, prisoner),
+                false);
+        }
+    }
+
+    /// <summary>Prisoner stacks that are not captured heroes.</summary>
+    /// <remarks>
+    /// Heroes are excluded because vanilla already lists them through TransferPrisonerBarterable; including
+    /// them here would show every captured lord twice.
+    /// </remarks>
+    private static IEnumerable<TroopRosterElement> GetOrdinaryPrisoners(PartyBase party)
+    {
+        var result = new List<TroopRosterElement>();
+
+        try
+        {
+            var prisonRoster = party.PrisonRoster;
+            if (prisonRoster == null) return result;
+
+            foreach (var element in prisonRoster.GetTroopRoster())
+            {
+                if (element.Character == null || element.Character.IsHero) continue;
+                if (element.Number <= 0) continue;
+
+                result.Add(element);
+            }
+        }
+        catch (NullReferenceException)
+        {
+            return result;
+        }
+
+        return result;
     }
 
     private static IEnumerable<CharacterObject> GetPrisonerHeroes(PartyBase party)
@@ -1667,6 +1813,19 @@ internal class PlayerPartyInteractionHandler : IHandler
         foreach (var offeredItem in offeredItems)
         {
             if (!PlayerPartyTradeContext.CanOffer(offeredItem.Barterable)) continue;
+
+            // An ordinary prisoner stack carries a count; a captured lord is always exactly one.
+            if (offeredItem.Barterable is PlayerPartyPrisonerBarterable prisonerBarterable)
+            {
+                var prisonerCount = Math.Min(
+                    offeredItem.Barterable.CurrentAmount,
+                    prisonerBarterable.PrisonerRosterElement.Number);
+                if (prisonerCount <= 0) continue;
+
+                result.Add((prisonerBarterable.PrisonerRosterElement.Character, prisonerCount));
+                continue;
+            }
+
             if (!(offeredItem.Barterable is TransferPrisonerBarterable transferPrisonerBarterable)) continue;
             if (!(PrisonerCharacterField?.GetValue(transferPrisonerBarterable) is Hero prisonerHero)) continue;
 
