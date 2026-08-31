@@ -1,4 +1,4 @@
-﻿using Common;
+using Common;
 using Common.Logging;
 using Common.Messaging;
 using Common.PacketHandlers;
@@ -1220,8 +1220,11 @@ public class AgentMovementHandler : IAgentMovementHandler
         }
 
         // Identity is structural - a horse changing its network id or scope is a re-registration, not
-        // motion - so it must never wait behind a rate limit.
-        if ((change & MountChange.Identity) != 0)
+        // motion - so it must never wait behind a rate limit. The synthetic turn EDGE joins it because a
+        // stationary turn only exists on the peer if the packet that starts it arrives: delaying that by up
+        // to the rate-limit interval leaves a horse that visibly snaps into its turn instead of playing it,
+        // and the edge fires once per turn rather than per tick, so exempting it costs almost nothing.
+        if ((change & (MountChange.Identity | MountChange.SyntheticTurnEdge)) != 0)
         {
             masterlessTriggeredSends++;
             return true;
@@ -1272,7 +1275,8 @@ public class AgentMovementHandler : IAgentMovementHandler
         if ((change & MountChange.Input) != 0) mountChangeInput++;
         if ((change & MountChange.Speed) != 0) mountChangeSpeed++;
         if ((change & MountChange.Action) != 0) mountChangeAction++;
-        if ((change & MountChange.SyntheticTurn) != 0) mountChangeSynthetic++;
+        if ((change & (MountChange.SyntheticTurn | MountChange.SyntheticTurnEdge)) != 0)
+            mountChangeSynthetic++;
         if ((change & MountChange.Identity) != 0) mountChangeIdentity++;
     }
 
@@ -1362,6 +1366,9 @@ public class AgentMovementHandler : IAgentMovementHandler
         Action = 16,
         SyntheticTurn = 32,
         Identity = 64,
+
+        /// <summary>A synthetic turn starting, stopping or reversing - an edge, not a stream.</summary>
+        SyntheticTurnEdge = 128,
     }
 
     /// <summary>
@@ -1379,7 +1386,8 @@ public class AgentMovementHandler : IAgentMovementHandler
     /// 0.57-degree direction threshold they were firing a packet on essentially every tick.
     /// </remarks>
     private const MountChange MasterlessSendTriggers =
-        MountChange.Position | MountChange.Identity | MountChange.SyntheticTurn;
+        MountChange.Position | MountChange.Identity | MountChange.SyntheticTurn |
+        MountChange.SyntheticTurnEdge;
 
     private static MountChange ClassifyMountChange(AgentMountData previous, AgentMountData current)
     {
@@ -1409,10 +1417,19 @@ public class AgentMovementHandler : IAgentMovementHandler
             current.MountAction1Flag != previous.MountAction1Flag)
             change |= MountChange.Action;
 
+        // Split deliberately: the START, STOP or REVERSAL of a synthetic turn is an edge that happens
+        // once, while its PROGRESS advances every single tick for as long as the turn runs. Only the edge
+        // is exempt from the masterless rate limit; lumping them together would have let an ongoing turn
+        // send on every tick again, which is the traffic this was built to remove.
         if (current.MountAction0IsSyntheticTurn != previous.MountAction0IsSyntheticTurn ||
             (current.MountAction0IsSyntheticTurn &&
-                Math.Abs(current.MountAction0Progress - previous.MountAction0Progress) >
-                    AnimationProgressDeltaThreshold))
+                (current.MountAction0TurnDirection != previous.MountAction0TurnDirection ||
+                    current.MountAction0TurnActionIndex != previous.MountAction0TurnActionIndex)))
+            change |= MountChange.SyntheticTurnEdge;
+
+        if (current.MountAction0IsSyntheticTurn &&
+            Math.Abs(current.MountAction0Progress - previous.MountAction0Progress) >
+                AnimationProgressDeltaThreshold)
             change |= MountChange.SyntheticTurn;
 
         if (current.MountMovementId != previous.MountMovementId ||
