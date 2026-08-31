@@ -17,7 +17,16 @@ namespace Common.Logging;
 /// one actually sent over the wire, counted with its serialized byte size. A <see cref="MessagePacket"/>
 /// is broken out by the message type it wraps (e.g. <c>MessagePacket:NetworkTroopRosterElementBatch</c>).
 /// The accumulated stats are dumped on a fixed wall-clock interval. Only the server profiles traffic
-/// (see <see cref="ModInformation.IsServer"/>).
+/// (see <see cref="ModInformation.IsServer"/>) unless the instance opts in with
+/// <c>profileOnClient</c>.
+/// </remarks>
+/// <remarks>
+/// The client opt-in exists for the mission P2P mesh (<c>LiteNetP2PClient</c>), which is the ONLY carrier
+/// of per-agent battle traffic — agent movement, spawns, deaths — and which the server never sees. With the
+/// default server-only guard, that traffic is completely unmeasured on both sides, so a battle that stutters
+/// gives a healthy server profile and no evidence at all. A mesh profiler is fed from the client, so it has
+/// to be allowed to record there; the guard stays the default so the server pipe is not suddenly profiled on
+/// every client too.
 /// </remarks>
 public sealed class PacketProfiler : IDisposable
 {
@@ -36,23 +45,36 @@ public sealed class PacketProfiler : IDisposable
     /// </summary>
     public Func<string> ExtraStatsProvider { get; set; }
 
+    /// <summary>Prefixes each dump so several profilers in one process stay tellable apart. Empty for the
+    /// server pipe, which keeps its original wording so existing log readers still match.</summary>
+    private readonly string scopePrefix;
+
+    /// <summary>When true this profiler records on a client too; see the class remarks.</summary>
+    private readonly bool profileOnClient;
+
     /// <summary>
     /// Constructs a PacketProfiler.
     /// </summary>
     /// <param name="dumpInterval">How often to dump the accumulated stats to the log.</param>
-    public PacketProfiler(TimeSpan dumpInterval)
+    /// <param name="scope">Short name for the pipe being profiled (e.g. <c>"Mesh"</c>), or null for the
+    /// server pipe. Rendered as a leading <c>[scope] </c> tag on every dump.</param>
+    /// <param name="profileOnClient">Allows recording on a client. Only the mission mesh wants this.</param>
+    public PacketProfiler(TimeSpan dumpInterval, string scope = null, bool profileOnClient = false)
     {
+        scopePrefix = string.IsNullOrEmpty(scope) ? string.Empty : $"[{scope}] ";
+        this.profileOnClient = profileOnClient;
         poller = new Poller(Poll, dumpInterval);
         poller.Start();
     }
 
     /// <summary>
-    /// Records one packet sent over the network and its serialized size in bytes. No-op off the server.
+    /// Records one packet sent over the network and its serialized size in bytes. No-op off the server
+    /// unless this profiler opted in with <c>profileOnClient</c>.
     /// </summary>
     public void Record(IPacket packet, int byteSize)
     {
-        // Only the server profiles network traffic.
-        if (ModInformation.IsClient) return;
+        // Only the server profiles network traffic, unless this profiler owns a client-side pipe.
+        if (!profileOnClient && ModInformation.IsClient) return;
 
         var packetName = GetPacketName(packet);
 
@@ -86,9 +108,10 @@ public sealed class PacketProfiler : IDisposable
         var seconds = dt.TotalSeconds;
         var bytesPerSecond = seconds > 0 ? totalBytes / seconds : 0;
 
+        // "Packet profile over" is kept verbatim so readers written against the server dump match both.
         Logger.Information(
-            "Packet profile over {Seconds:0.#} seconds ({BytesPerSecond:N0} bytes/sec avg): {@PacketProfile}{ExtraStats}",
-            seconds, bytesPerSecond, ordered, GetExtraStats());
+            "{ScopePrefix}Packet profile over {Seconds:0.#} seconds ({BytesPerSecond:N0} bytes/sec avg): {@PacketProfile}{ExtraStats}",
+            scopePrefix, seconds, bytesPerSecond, ordered, GetExtraStats());
     }
 
     // Never let a faulty provider kill the dump; the profile itself is the primary payload.
@@ -105,17 +128,37 @@ public sealed class PacketProfiler : IDisposable
         }
     }
 
+    /// <summary>
+    /// Formatted names by (packet type, wrapped message type). The pair is invariant, so the string is
+    /// built once instead of per packet.
+    /// </summary>
+    /// <remarks>
+    /// A cache rather than a micro-optimisation: the mission mesh profiler calls this on the per-recipient
+    /// send funnel, which is the highest-frequency path in a battle. Formatting a fresh name per packet
+    /// would add steady GC pressure to the exact path being profiled for stutter, and a profiler that
+    /// changes what it measures is worse than none.
+    /// </remarks>
+    private static readonly ConcurrentDictionary<(Type Packet, Type Message), string> PacketNames =
+        new ConcurrentDictionary<(Type, Type), string>();
+
+    internal static string GetPacketNameForTest(IPacket packet) => GetPacketName(packet);
+
+    /// <summary>How many distinct packet names the current window has recorded. Test seam: the only other
+    /// evidence a packet was recorded is the periodic log dump.</summary>
+    internal int RecordedTypeCountForTest => stats.Count;
+
     private static string GetPacketName(IPacket packet)
     {
-        var packetName = packet.GetType().Name;
+        var packetType = packet.GetType();
 
         // Break MessagePacket out by the message type it wraps so it is not one opaque bucket.
-        if (packet is MessagePacket messagePacket && messagePacket.MessageType != null)
-        {
-            packetName += $":{GetFriendlyTypeName(messagePacket.MessageType)}";
-        }
+        // Pattern matching, not `as`: MessagePacket is a struct.
+        if (packet is not MessagePacket messagePacket || messagePacket.MessageType == null)
+            return packetType.Name;
 
-        return packetName;
+        return PacketNames.GetOrAdd(
+            (packetType, messagePacket.MessageType),
+            key => $"{key.Packet.Name}:{GetFriendlyTypeName(key.Message)}");
     }
 
     private static string GetFriendlyTypeName(Type type)

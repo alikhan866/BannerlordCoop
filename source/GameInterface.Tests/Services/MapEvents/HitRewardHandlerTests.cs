@@ -25,11 +25,11 @@ public class HitRewardHandlerTests
     {
         Assert.Null(Mission.Current);
 
-        Action<MessagePayload<NetworkUpdateScoreboardAfterUpgrades>>? subscriber = null;
+        Action<MessagePayload<NetworkUpdateScoreboardAfterUpgradesBatch>>? subscriber = null;
         var messageBroker = new Mock<IMessageBroker>();
         messageBroker
-            .Setup(b => b.Subscribe(It.IsAny<Action<MessagePayload<NetworkUpdateScoreboardAfterUpgrades>>>()!))
-            .Callback<Action<MessagePayload<NetworkUpdateScoreboardAfterUpgrades>>>(handler => subscriber = handler);
+            .Setup(b => b.Subscribe(It.IsAny<Action<MessagePayload<NetworkUpdateScoreboardAfterUpgradesBatch>>>()!))
+            .Callback<Action<MessagePayload<NetworkUpdateScoreboardAfterUpgradesBatch>>>(handler => subscriber = handler);
         var objectManager = new Mock<IObjectManager>();
 
         using var handler = new HitRewardHandler(
@@ -38,14 +38,14 @@ public class HitRewardHandlerTests
             new Mock<INetwork>().Object);
 
         Assert.NotNull(subscriber);
-        subscriber(new MessagePayload<NetworkUpdateScoreboardAfterUpgrades>(
+        subscriber(new MessagePayload<NetworkUpdateScoreboardAfterUpgradesBatch>(
             this,
-            new NetworkUpdateScoreboardAfterUpgrades(
+            new NetworkUpdateScoreboardAfterUpgradesBatch(
                 "map-event",
-                "character",
-                "party",
-                BattleSideEnum.Attacker,
-                1)));
+                new[]
+                {
+                    new ScoreboardUpgradeEntry("character", "party", BattleSideEnum.Attacker, 1),
+                })));
         GameThread.Run(() => { }, blocking: true);
 
         objectManager.VerifyNoOtherCalls();

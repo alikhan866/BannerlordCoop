@@ -50,8 +50,30 @@ public readonly struct ModOptions
     public readonly float MaximumLootersMultiplier { get; } = 1f;
     [ProtoMember(15)]
     public readonly float LooterPartySizeMultiplier { get; } = 1f;
+    /// <summary>
+    /// How long a lord remembers being asked to defect.
+    /// </summary>
+    /// <remarks>
+    /// AlwaysRetry rather than Vanilla, because vanilla's rule is a poor fit for co-op and reads as a bug.
+    /// The blocker is <c>conversation_lord_from_ruling_clan_on_condition</c>, whose predicate is
+    /// <c>Any(a =&gt; a.PersuadedHero == OneToOneConversationHero)</c> - it checks neither AGE nor SUCCESS. So a
+    /// lord you already persuaded, whose barter then failed for an unrelated reason, answers "You have tried
+    /// to persuade me before" and stays shut for an in-game YEAR, which is the only thing that prunes the
+    /// record.
+    ///
+    /// In singleplayer that is survivable: one player, one conversation, and a barter that does not fail
+    /// underneath you. In co-op the barter can be refused by the SERVER - a stale conversation context, a
+    /// price check - and each refusal still leaves the attempt recorded, so lords burn out of reach through
+    /// no decision of the player's.
+    ///
+    /// AlwaysRetry clears that lord's records at the start of each conversation. It does not make persuasion
+    /// easier: a fresh attempt still rolls, and can still fail. It only makes him askable again.
+    ///
+    /// The shipped mod-config.default.json carries the same value, and
+    /// <c>ModConfigTests.ShippedTemplate_ModOptions_AllBind_AndAreTheDefaults</c> holds the two together.
+    /// </remarks>
     [ProtoMember(16)]
-    public readonly LordDefectionRetryMode LordDefectionRetries { get; } = LordDefectionRetryMode.Vanilla;
+    public readonly LordDefectionRetryMode LordDefectionRetries { get; } = LordDefectionRetryMode.AlwaysRetry;
     [ProtoMember(17)]
     public readonly bool EnableHeroExecutions { get; } = true;
     [ProtoMember(18)]

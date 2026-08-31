@@ -87,9 +87,14 @@ internal class MapEventPatches
         if (!isPlayerJoin && !InteractionPatches.IsWithinAiJoinWindow(__instance))
             return;
 
+        // The FULL involved-party list, deliberately, even for an AI join: the client's ApplyInvolvedParties
+        // clears TroopUpgradeTracker._mapEventParties and rebuilds it from this message, so an incremental
+        // list would shrink the tracker to whoever just arrived. What must not be repeated for an AI join is
+        // the per-party ROSTER push that BattleHandler does from this message - see IsPlayerJoin.
         var message = new MapEventInvolvedPartiesAdded(
             __instance,
-            __instance._sides.SelectMany(side => side.Parties).ToList());
+            __instance._sides.SelectMany(side => side.Parties).ToList(),
+            isPlayerJoin);
         MessageBroker.Instance.Publish(__instance, message);
 
         if (isPlayerJoin && !InteractionPatches.IsInitializingPlayerBattle(__instance))

@@ -1,4 +1,4 @@
-{
+﻿{
   // Bannerlord Coop gameplay configuration — owned by the Coop mod itself and
   // applied wherever the coop server runs (dedicated server or player-hosted
   // session). Settings for how a dedicated server PROCESS runs (save name,
@@ -174,7 +174,7 @@
     // (Default) "Vanilla":     a refusal blocks that lord for one in-game year, as in singleplayer.
     // "NeverExpire": a refusal blocks that lord for the rest of the session.
     // "AlwaysRetry": a refusal never blocks; you can ask the same lord again straight away.
-    "lordDefectionRetries": "Vanilla",
+    "lordDefectionRetries": "AlwaysRetry",
 
     // Whether a besieged town's militia join the garrison when it sallies out.
     // Vanilla keeps militia on the walls during a sally-out. That also keeps them out of the

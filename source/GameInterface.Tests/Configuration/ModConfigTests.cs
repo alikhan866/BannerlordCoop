@@ -301,7 +301,10 @@ public class ModConfigTests : IDisposable
         Assert.True(options.SmithingStaminaRecoveryOutsideSettlements);
         Assert.Equal(0.1f, options.SmithingStaminaRecoveryMultiplier);
         Assert.Equal(1f, options.MaximumLootersMultiplier);
-        Assert.Equal(LordDefectionRetryMode.Vanilla, options.LordDefectionRetries);
+        // AlwaysRetry, not Vanilla: vanilla's pre-gate refuses on ANY prior attempt regardless of age
+        // or success, so a co-op barter refused by the server still locks that lord out for an in-game
+        // year. See the remarks on ModConfigProvider.LordDefectionRetries.
+        Assert.Equal(LordDefectionRetryMode.AlwaysRetry, options.LordDefectionRetries);
         Assert.True(options.ShowPlayerNameplates);
     }
 

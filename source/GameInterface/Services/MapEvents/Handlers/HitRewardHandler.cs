@@ -6,7 +6,9 @@ using Common.Network.Coalescing;
 using GameInterface.Services.MapEvents.Messages;
 using GameInterface.Services.ObjectManager;
 using Serilog;
+using System;
 using System.Collections.Generic;
+using System.Linq;
 using TaleWorlds.CampaignSystem;
 using TaleWorlds.CampaignSystem.CharacterDevelopment;
 using TaleWorlds.CampaignSystem.ComponentInterfaces;
@@ -20,6 +22,18 @@ namespace GameInterface.Services.MapEvents.Handlers;
 public class HitRewardHandler : IHandler
 {
     private const string UpgradedTroopsScoreboardRefreshChannel = "UpgradedTroopsScoreboardRefreshChannel";
+
+    /// <summary>
+    /// How often scoreboard upgrades are allowed onto the wire.
+    /// </summary>
+    /// <remarks>
+    /// 200ms rather than the 25ms network poll. Coalescing alone could not help here: the flush runs every
+    /// poll, so the channel emitted ~700 messages per 10 seconds across ~400 flushes however well each one
+    /// merged. At 200ms that ceiling becomes 50 per 10 seconds, with every upgrade in the window arriving
+    /// together in one message. The cost is a scoreboard that settles up to a fifth of a second late, which
+    /// is invisible; the gain is paid straight back into the reliable queue that was dropping players.
+    /// </remarks>
+    private static readonly TimeSpan ScoreboardFlushInterval = TimeSpan.FromMilliseconds(200);
 
     private static readonly ILogger Logger = LogManager.GetLogger<HitRewardHandler>();
 
@@ -39,6 +53,12 @@ public class HitRewardHandler : IHandler
         this.network = network;
         this.coalescer = coalescer;
 
+        // The scoreboard is a readout, not gameplay: nobody can see that a kill tally settled a fifth of a
+        // second late, and holding it back lets a whole flush window's upgrades ride in one message instead
+        // of ~2. This channel was the single largest contributor to the reliable-queue backlog that reached
+        // 12,926 messages and dropped a player, so its message rate is what has to come down.
+        coalescer?.SetChannelInterval(UpgradedTroopsScoreboardRefreshChannel, ScoreboardFlushInterval);
+
         messageBroker.Subscribe<TrackTroopForUpgrades>(Handle_TrackTroopForUpgrades);
         messageBroker.Subscribe<NetworkTrackTroopForUpgrades>(Handle_NetworkTrackTroopForUpgrades);
 
@@ -48,7 +68,7 @@ public class HitRewardHandler : IHandler
         messageBroker.Subscribe<CheckUpgradeAfterAgentRemoved>(Handle_CheckUpgradeAfterAgentRemoved);
         messageBroker.Subscribe<NetworkCheckUpgradeAfterAgentRemoved>(Handle_NetworkCheckUpgradeAfterAgentRemoved);
 
-        messageBroker.Subscribe<NetworkUpdateScoreboardAfterUpgrades>(Handle_NetworkUpdateScoreboardAfterUpgrades);
+        messageBroker.Subscribe<NetworkUpdateScoreboardAfterUpgradesBatch>(Handle_NetworkUpdateScoreboardAfterUpgrades);
     }
 
     public void Dispose()
@@ -62,7 +82,7 @@ public class HitRewardHandler : IHandler
         messageBroker.Unsubscribe<CheckUpgradeAfterAgentRemoved>(Handle_CheckUpgradeAfterAgentRemoved);
         messageBroker.Unsubscribe<NetworkCheckUpgradeAfterAgentRemoved>(Handle_NetworkCheckUpgradeAfterAgentRemoved);
 
-        messageBroker.Unsubscribe<NetworkUpdateScoreboardAfterUpgrades>(Handle_NetworkUpdateScoreboardAfterUpgrades);
+        messageBroker.Unsubscribe<NetworkUpdateScoreboardAfterUpgradesBatch>(Handle_NetworkUpdateScoreboardAfterUpgrades);
     }
 
     private void Handle_TrackTroopForUpgrades(MessagePayload<TrackTroopForUpgrades> obj)
@@ -178,8 +198,8 @@ public class HitRewardHandler : IHandler
             upgradedCount = mapEvent.TroopUpgradeTracker.CheckUpgradedCount(affectorParty, affectorCharacter);
 
             // Update scoreboard for clients
-            var key = new CoalesceKey(UpgradedTroopsScoreboardRefreshChannel, data.AffectorPartyId + data.AffectorCharacterId);
-            coalescer.Enqueue(key, new LatestWinsPayload(new NetworkUpdateScoreboardAfterUpgrades(data.MapEventId, data.AffectorCharacterId, data.AffectorPartyId, data.AffectorAgentSide, upgradedCount)));
+            EnqueueScoreboardUpgrade(
+                data.MapEventId, data.AffectorPartyId, data.AffectorCharacterId, data.AffectorAgentSide, upgradedCount);
         });
     }
 
@@ -217,14 +237,45 @@ public class HitRewardHandler : IHandler
             var upgradedCount = mapEvent.TroopUpgradeTracker.CheckUpgradedCount(party, character);
 
             // Update scoreboard for clients
-            var key = new CoalesceKey(UpgradedTroopsScoreboardRefreshChannel, data.PartyId + data.CharacterObjectId);
-            coalescer.Enqueue(key, new LatestWinsPayload(new NetworkUpdateScoreboardAfterUpgrades(data.MapEventId, data.CharacterObjectId, data.PartyId, data.Side, upgradedCount)));
+            EnqueueScoreboardUpgrade(
+                data.MapEventId, data.PartyId, data.CharacterObjectId, data.Side, upgradedCount);
         });
     }
 
-    private void Handle_NetworkUpdateScoreboardAfterUpgrades(MessagePayload<NetworkUpdateScoreboardAfterUpgrades> obj)
+    /// <summary>
+    /// [Server] Queue one scoreboard upgrade for the batch belonging to <paramref name="mapEventId"/>.
+    /// </summary>
+    /// <remarks>
+    /// Coalesced by MAP EVENT, with the entries keyed by party+troop-type inside the batch. Keying the
+    /// coalescer itself by party+troop-type — as this did before — deduplicated each pair perfectly but
+    /// still cost one message per pair per flush, because <c>SendCoalescer.Flush</c> sends each key
+    /// separately. In a live siege that came to 21,004 messages and 2.03 MB, the largest recurring
+    /// consumer on the server pipe, most of it the same map event id and party id written over and over.
+    /// </remarks>
+    private void EnqueueScoreboardUpgrade(
+        string mapEventId,
+        string partyId,
+        string characterId,
+        BattleSideEnum side,
+        int upgradedCount)
+    {
+        if (string.IsNullOrEmpty(mapEventId)) return;
+
+        var key = new CoalesceKey(UpgradedTroopsScoreboardRefreshChannel, mapEventId);
+        var entry = new ScoreboardUpgradeEntry(characterId, partyId, side, upgradedCount);
+
+        coalescer.Enqueue(key, new KeyedBatchPayload<ScoreboardUpgradeEntry>(
+            partyId + characterId,
+            entry,
+            entries => new NetworkUpdateScoreboardAfterUpgradesBatch(
+                mapEventId,
+                entries.ToArray())));
+    }
+
+    private void Handle_NetworkUpdateScoreboardAfterUpgrades(MessagePayload<NetworkUpdateScoreboardAfterUpgradesBatch> obj)
     {
         var data = obj.What;
+        if (data.Entries == null || data.Entries.Length == 0) return;
 
         GameThread.RunSafe(() =>
         {
@@ -232,34 +283,49 @@ public class HitRewardHandler : IHandler
             if (mission == null) return;
 
             if (!objectManager.TryGetObjectWithLogging<MapEvent>(data.MapEventId, out var mapEvent)) return;
-            if (!objectManager.TryGetObjectWithLogging<CharacterObject>(data.AffectorCharacterId, out var affectorCharacter)) return;
-            if (!objectManager.TryGetObjectWithLogging<PartyBase>(data.AffectorPartyId, out var affectorParty)) return;
 
-            // Skip update if the client is not in this map event
+            // Skip update if the client is not in this map event. Checked once for the whole batch, and
+            // before any per-entry lookup: entries for a battle this client is not watching cost nothing.
             if (MapEvent.PlayerMapEvent != mapEvent) return;
 
             BattleObserverMissionLogic battleObserverMissionLogic = mission.GetMissionBehavior<BattleObserverMissionLogic>();
             if ((battleObserverMissionLogic?.BattleObserver) == null) return;
 
             TroopUpgradeTracker troopUpgradeTracker = mapEvent.TroopUpgradeTracker;
-            if (affectorCharacter.IsHero)
-            {
-                Hero heroObject = affectorCharacter.HeroObject;
-                using (IEnumerator<SkillObject> enumerator = troopUpgradeTracker.CheckSkillUpgrades(heroObject).GetEnumerator())
-                {
-                    while (enumerator.MoveNext())
-                    {
-                        SkillObject skill = enumerator.Current;
-                        battleObserverMissionLogic.BattleObserver.HeroSkillIncreased(data.AffectorAgentSide, affectorParty, affectorCharacter, skill);
-                    }
-                    return;
-                }
-            }
 
-            if (data.UpgradedCount != 0)
+            foreach (var entry in data.Entries)
             {
-                battleObserverMissionLogic.BattleObserver.TroopNumberChanged(data.AffectorAgentSide, affectorParty, affectorCharacter, 0, 0, 0, 0, 0, data.UpgradedCount);
+                ApplyScoreboardUpgrade(battleObserverMissionLogic, troopUpgradeTracker, entry);
             }
         });
+    }
+
+    /// <summary>[Client, game thread] Apply one entry of a scoreboard batch. A missing character or party
+    /// skips only its own entry, so one unresolvable id cannot discard the rest of the batch.</summary>
+    private void ApplyScoreboardUpgrade(
+        BattleObserverMissionLogic battleObserverMissionLogic,
+        TroopUpgradeTracker troopUpgradeTracker,
+        ScoreboardUpgradeEntry entry)
+    {
+        if (!objectManager.TryGetObjectWithLogging<CharacterObject>(entry.AffectorCharacterId, out var affectorCharacter)) return;
+        if (!objectManager.TryGetObjectWithLogging<PartyBase>(entry.AffectorPartyId, out var affectorParty)) return;
+
+        if (affectorCharacter.IsHero)
+        {
+            Hero heroObject = affectorCharacter.HeroObject;
+            foreach (SkillObject skill in troopUpgradeTracker.CheckSkillUpgrades(heroObject))
+            {
+                battleObserverMissionLogic.BattleObserver.HeroSkillIncreased(
+                    entry.AffectorAgentSide, affectorParty, affectorCharacter, skill);
+            }
+
+            return;
+        }
+
+        if (entry.UpgradedCount != 0)
+        {
+            battleObserverMissionLogic.BattleObserver.TroopNumberChanged(
+                entry.AffectorAgentSide, affectorParty, affectorCharacter, 0, 0, 0, 0, 0, entry.UpgradedCount);
+        }
     }
 }

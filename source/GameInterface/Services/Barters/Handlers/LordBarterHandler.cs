@@ -664,6 +664,10 @@ internal sealed partial class LordBarterHandler : IHandler
                 reason = "The lord conversation is no longer active.";
                 return IsLocationConversationLive(peer, request, targetHero, ref reason);
 
+            case PeaceConversationContext.Prisoner:
+                reason = "That lord is not your prisoner.";
+                return IsPrisonerConversationLive(request, playerParty, targetHero, ref reason);
+
             default:
                 // Refused rather than validated as a settlement conversation - accepting a context we
                 // do not understand is how an unvalidated barter gets through.
@@ -710,6 +714,37 @@ internal sealed partial class LordBarterHandler : IHandler
             !conversationPartyTracker.TryGetEngagement(peer, out var engagement) ||
             engagement.PartyId != request.ContextId ||
             engagement.EngagerPartyId != playerPartyId)
+        {
+            return false;
+        }
+
+        reason = null;
+        return true;
+    }
+
+    /// <summary>
+    /// A conversation with the requester's own prisoner, verified by CUSTODY.
+    /// </summary>
+    /// <remarks>
+    /// There is no hold to check and no co-location to require: a captive can be spoken to from a dungeon,
+    /// a settlement menu or the party screen, and none of those acquire an engagement. What makes the claim
+    /// safe is that custody is exclusive - only one party can hold a given lord, so proving he is in the
+    /// REQUESTER's party proves nobody else could be having this conversation. That is stronger than the
+    /// settlement case, where several players may legitimately stand in the same town.
+    ///
+    /// Re-derived from the server's own state rather than trusted from the request: the party the client
+    /// named must be the party the server itself finds holding him, so a forged or stale context id cannot
+    /// authorise a barter with somebody else's captive.
+    /// </remarks>
+    private bool IsPrisonerConversationLive(
+        NetworkRequestLordBarter request, PartyBase playerParty, Hero targetHero, ref string reason)
+    {
+        var captor = targetHero?.PartyBelongedToAsPrisoner;
+        if (captor == null ||
+            playerParty == null ||
+            captor != playerParty ||
+            !objectManager.TryGetId(captor, out var captorId) ||
+            captorId != request.ContextId)
         {
             return false;
         }

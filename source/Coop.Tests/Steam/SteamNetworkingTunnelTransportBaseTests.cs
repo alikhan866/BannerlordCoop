@@ -12,10 +12,20 @@ namespace Coop.Tests.Steam
 {
     public class SteamNetworkingTunnelTransportBaseTests
     {
+        /// <summary>
+        /// The floor is 8 MiB/s, raised from 4 MiB/s.
+        /// </summary>
+        /// <remarks>
+        /// Steam's bandwidth estimator ramps a connection up from its floor, and on a LAN session it was
+        /// settling far below what a battle needs: a second player accumulated 5,320,697 bytes of
+        /// pendingReliable with ping at 80ms while the estimate sat pinned at the old 4 MiB/s floor.
+        /// Raising it cleared the backlog outright - pendingReliable 0, ping 1ms, sendRate 8388608 - which
+        /// is why this is asserted rather than left as an untested constant.
+        /// </remarks>
         [Fact]
-        public void SendRateFloor_IsFourMiBPerSecond()
+        public void SendRateFloor_IsEightMiBPerSecond()
         {
-            Assert.Equal(4 * 1024 * 1024, SteamTunnel.SendRateMinBytesPerSecond);
+            Assert.Equal(8 * 1024 * 1024, SteamTunnel.SendRateMinBytesPerSecond);
         }
 
         [Fact]

@@ -22,6 +22,12 @@ internal class MapEventPartyHandler : IHandler
     private readonly INetwork network;
     private readonly IObjectManager objectManager;
 
+    /// <summary>Keeps unchanged rosters off the wire; see <see cref="RosterBroadcastGate"/>.</summary>
+    private readonly RosterBroadcastGate rosterBroadcastGate = new RosterBroadcastGate();
+
+    private const double RosterReportIntervalSeconds = 60d;
+    private DateTime lastRosterReportUtc = DateTime.MinValue;
+
     public MapEventPartyHandler(IMessageBroker messageBroker, INetwork network, IObjectManager objectManager)
     {
         this.messageBroker = messageBroker;
@@ -101,8 +107,42 @@ internal class MapEventPartyHandler : IHandler
 
         var flattenedTroops = FlattenedTroopSerializer.Serialize(obj.Roster, objectManager);
 
+        // Vanilla re-runs MapEventParty.Update for EVERY party on both sides once per simulation round, so
+        // this fires for rosters in which nothing changed - measured at 600 packets / 3.2 MB in ten seconds,
+        // enough to put 5.3 MB into an 8 MB reliable buffer and take a 1 ms peer to 80 ms of queueing.
+        // The receiver replaces the roster wholesale, so an identical snapshot is a no-op and skipping it is
+        // indistinguishable from sending it. See RosterBroadcastGate for the keyframe that bounds staleness.
+        var now = DateTime.UtcNow;
+        if (!rosterBroadcastGate.ShouldBroadcast(mapEventPartyId, flattenedTroops, now))
+            return;
+
+        ReportRosterBroadcastSavings(now);
+
         var message = new NetworkUpdateMapEventParty(mapEventPartyId, flattenedTroops);
         network.SendAll(message);
+    }
+
+    /// <summary>
+    /// Says once a minute how much of this traffic the gate is removing.
+    /// </summary>
+    /// <remarks>
+    /// The saving is the whole point of the gate and is invisible from the outside - a battle that runs well
+    /// looks identical to one that never had the problem. Printing sent-versus-suppressed makes it possible to
+    /// answer "did that help" from a log after the fact, rather than by reproducing the battle.
+    /// </remarks>
+    private void ReportRosterBroadcastSavings(DateTime nowUtc)
+    {
+        if ((nowUtc - lastRosterReportUtc).TotalSeconds < RosterReportIntervalSeconds) return;
+        lastRosterReportUtc = nowUtc;
+
+        long sent = rosterBroadcastGate.Sent;
+        long suppressed = rosterBroadcastGate.Suppressed;
+        long total = sent + suppressed;
+        if (total <= 0) return;
+
+        Logger.Information(
+            "[RosterTraffic] map-event roster broadcasts: {Sent} sent, {Suppressed} suppressed ({Percent:F1}% removed)",
+            sent, suppressed, 100d * suppressed / total);
     }
 
     private void Handle_NetworkUpdateMapEventParty(MessagePayload<NetworkUpdateMapEventParty> payload)

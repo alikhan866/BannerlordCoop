@@ -47,6 +47,18 @@ internal class BattleHandler : IHandler
     private readonly IMessageBroker messageBroker;
     private readonly IObjectManager objectManager;
     private readonly INetwork network;
+
+    /// <summary>
+    /// Keeps an AI reinforcement join from re-sending rosters every client already has.
+    /// </summary>
+    /// <remarks>
+    /// Its own instance rather than one shared with <c>MapEventPartyHandler</c>. The two paths answer
+    /// different questions - "has this roster changed since the last simulation round" versus "has this
+    /// roster already gone out during this battle's assembly" - and sharing state would let one path's
+    /// keyframe silently satisfy the other's. Duplicating a send between the two paths costs one message;
+    /// entangling them costs a debugging session.
+    /// </remarks>
+    private readonly RosterBroadcastGate rosterBroadcastGate = new RosterBroadcastGate();
     private readonly IMapEventLogger mapEventLogger;
     private readonly IPlayerManager playerRegistry;
     private readonly ITimeControlInterface timeControlInterface;
@@ -181,6 +193,20 @@ internal class BattleHandler : IHandler
                 continue;
 
             var flattenedTroops = FlattenedTroopSerializer.Serialize(addedParty._roster, objectManager);
+
+            // The producer hands us the FULL involved-party list every time a party joins, because the
+            // client rebuilds TroopUpgradeTracker from it. For an AI reinforcement that means re-sending
+            // rosters every client already has, once per party already present - so a battle assembling out
+            // of 43 parties costs 1+2+...+43 sends. Measured live: 910 packets, 4,678,956 bytes in ten
+            // seconds, which is the burst that filled the reliable send buffer and stalled a peer.
+            //
+            // A PLAYER join is forced through: the gate tracks what was last SENT, not what each peer
+            // RECEIVED, so it cannot tell that a roster broadcast moments ago never reached the newcomer.
+            // Forcing still records, so the AI joins that follow suppress against it.
+            if (!rosterBroadcastGate.ShouldBroadcast(
+                    mapEventPartyId, flattenedTroops, DateTime.UtcNow, force: message.IsPlayerJoin))
+                continue;
+
             network.SendAll(new NetworkUpdateMapEventParty(mapEventPartyId, flattenedTroops));
         }
 

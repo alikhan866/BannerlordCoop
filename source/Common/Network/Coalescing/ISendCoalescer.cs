@@ -26,6 +26,19 @@ public interface ISendCoalescer
     /// Buffers an update for <paramref name="key"/>, merging it into any update already pending for that
     /// key via the payload's strategy.
     /// </summary>
+    /// <summary>
+    /// Limits a channel to at most one flush per <paramref name="minInterval"/>, letting its updates keep
+    /// coalescing in between. Channels that never call this flush on every poll, as before.
+    /// </summary>
+    /// <remarks>
+    /// Coalescing cannot beat the flush rate on its own: flushes are driven by the 25ms network poll, so a
+    /// channel emits up to 40 messages a second however well each merges. The reliable queue is bounded by
+    /// PACKET count, not bytes - it reached 12,926 entries at only 11 KB/s before a player was dropped - so
+    /// the message rate itself is what has to come down. Opt-in, because only the caller knows whether its
+    /// data can arrive a fraction of a second late.
+    /// </remarks>
+    void SetChannelInterval(string channel, System.TimeSpan minInterval);
+
     void Enqueue(CoalesceKey key, ICoalescedPayload payload);
 
     /// <summary>

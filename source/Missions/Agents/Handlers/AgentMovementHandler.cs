@@ -86,6 +86,34 @@ public class AgentMovementHandler : IAgentMovementHandler
     private const float SpeedDeltaThreshold = 0.01f;
     private const float AnimationProgressDeltaThreshold = 0.001f;
     private const float ForcedSyncIntervalSeconds = 0.25f;
+
+    /// <summary>
+    /// Shortest gap between movement sends for a masterless horse.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Masterless horses are about half of all mission-mesh packets - 21,425 of roughly 43,000 in a
+    /// ten-second window - and the per-field counter showed why nothing else worked: position changed on
+    /// 138,611 of 138,575 evaluations, so a bolting horse clears the one-centimetre threshold on every
+    /// single tick. Suppressing on facing, input or animation removed under 3% because those changes almost
+    /// always arrived alongside a position change that would have sent anyway. Position is the only lever,
+    /// and this limits its RATE rather than its accuracy.
+    /// </para>
+    /// <para>
+    /// A time interval, not a tick divisor, because the bulk rate is adaptive - it was observed running
+    /// anywhere from 10 to 20 Hz - and a divisor would silently mean different things on different machines
+    /// and at different moments in the same battle.
+    /// </para>
+    /// <para>
+    /// 0.2s spaces a galloping horse's updates about 1.4m apart. That is far inside the 12m
+    /// <c>MountSnapDistance</c> at which a puppet is teleported instead of walked, and the interpolator
+    /// steers with <c>SetTargetPositionAndDirection</c> - real locomotion toward a point slightly ahead -
+    /// so the horse keeps moving naturally rather than hopping between samples. Kept deliberately
+    /// conservative: a longer gap saves more but risks a horse reaching its target and pausing before the
+    /// next one lands.
+    /// </para>
+    /// </remarks>
+    private const float MasterlessMinSendIntervalSeconds = 0.2f;
     private const float PopulationSampleIntervalSeconds = 1f;
     private const float CadenceEpsilonSeconds = 0.0001f;
 
@@ -109,6 +137,10 @@ public class AgentMovementHandler : IAgentMovementHandler
 
     // Vanilla can rotate a stopped AI mount's facing without selecting a turn action.
     private readonly Dictionary<Agent, Vec2> _lastMountDirections = new Dictionary<Agent, Vec2>();
+    // Reused scratch for the sweep in RemoveDeadMountDirections, so pruning a leak does not allocate.
+    private readonly List<Agent> _deadMountDirections = new List<Agent>();
+
+
     private readonly Dictionary<Agent, SyntheticMountTurnState> _syntheticMountTurns =
         new Dictionary<Agent, SyntheticMountTurnState>();
     private readonly List<Agent> _completedSyntheticMountTurns =
@@ -784,13 +816,27 @@ public class AgentMovementHandler : IAgentMovementHandler
 
                 if (!lastEquipment.TryGetValue(agentInfo.AgentId, out var previousEquipment))
                 {
+                    // Send the first observation for EVERY agent, battle spawns included.
+                    //
+                    // This used to skip battle agents (MovementId != 0) on the belief that "battle
+                    // spawn/catch-up records already carry the current wield state". They do not. A spawn
+                    // record carries MissionEquipmentData, which is a list of WEAPON SLOTS and holds no
+                    // wielded index, and nothing on the receiving side wields anything at spawn -
+                    // SetWieldedItemIndexAsClient is reached only from AgentEquipmentData.Apply, i.e. only
+                    // when an equipment packet arrives.
+                    //
+                    // So the puppet spawned with its weapons sheathed while the sender seeded this cache and
+                    // sent nothing, leaving both sides permanently disagreeing: no further update could
+                    // follow, because the next poll compares against the seeded value and finds no change.
+                    // Peers saw troops throwing punches while taking spear hits, since damage is resolved
+                    // authoritatively by the owner, who has the weapon drawn. Only agents that happened to
+                    // switch weapons later ever corrected themselves - which is why some enemies looked
+                    // armed and others never did.
+                    //
+                    // The cost this skip was avoiding is one equipment update per agent, once, on the poll
+                    // that first sees it; every later poll still early-outs on the unchanged comparison
+                    // below. Against the movement traffic sharing this path that is negligible.
                     lastEquipment[agentInfo.AgentId] = equipment;
-
-                    // Battle spawn/catch-up records already carry the current wield state. Compact ids are
-                    // battle-only, so seeding their cache here avoids immediately resending every agent's
-                    // equipment on the first 40 Hz poll. Legacy Guid registrations still need an initial update.
-                    if (agentInfo.MovementId != 0)
-                        continue;
                 }
                 else if (previousEquipment.Equals(equipment))
                 {
@@ -1140,6 +1186,19 @@ public class AgentMovementHandler : IAgentMovementHandler
         return false;
     }
 
+    /// <summary>
+    /// Whether a masterless horse's movement is worth a packet.
+    /// </summary>
+    /// <remarks>
+    /// This overload is reached only for horses with no active rider - <see cref="ShouldBroadcastMovement"/>
+    /// refuses to broadcast a mount whose rider is alive, and a ridden horse travels inside its rider's
+    /// AgentData instead. So relaxing the rule here cannot affect a horse anybody is riding.
+    ///
+    /// Measured on a live siege, masterless horses were roughly half of all mission-mesh packets
+    /// (MountMovementPacket: 18,459 of ~37,000 in a ten-second window) and their share grew as the battle
+    /// ran, because every cavalry death adds one. They defeat the existing suppression completely: bolting
+    /// clears the 0.57-degree direction threshold on every tick even when nothing meaningful has changed.
+    /// </remarks>
     private bool ShouldSendMovement(
         RecipientMovementState recipient,
         Guid agentId,
@@ -1148,12 +1207,73 @@ public class AgentMovementHandler : IAgentMovementHandler
         if (!recipient.LastSentMovement.TryGetValue(agentId, out var lastState))
             return true;
 
-        if (!lastState.IsMount ||
-            HasMountMovementChanged(lastState.MountData, current) ||
-            IsHeartbeatDue(lastState))
+        if (!lastState.IsMount)
             return true;
 
+        MountChange change = ClassifyMountChange(lastState.MountData, current);
+        RecordMountChange(change);
+
+        if (IsHeartbeatDue(lastState))
+        {
+            masterlessHeartbeatSends++;
+            return true;
+        }
+
+        // Identity is structural - a horse changing its network id or scope is a re-registration, not
+        // motion - so it must never wait behind a rate limit.
+        if ((change & MountChange.Identity) != 0)
+        {
+            masterlessTriggeredSends++;
+            return true;
+        }
+
+        if (totalSimulationTime - lastState.LastSentTime < MasterlessMinSendIntervalSeconds)
+        {
+            masterlessRateLimitedSends++;
+            return false;
+        }
+
+        if ((change & MasterlessSendTriggers) != 0)
+        {
+            masterlessTriggeredSends++;
+            return true;
+        }
+
+        masterlessSuppressedSends++;
         return false;
+    }
+
+    // Per-window tallies of what masterless horses actually did, reported by the census. Written only from
+    // the movement poll, which is single-threaded per handler.
+    private long masterlessTriggeredSends;
+    private long masterlessHeartbeatSends;
+    private long masterlessSuppressedSends;
+    private long masterlessRateLimitedSends;
+    private long mountChangePosition;
+    private long mountChangeFacing;
+    private long mountChangeInput;
+    private long mountChangeSpeed;
+    private long mountChangeAction;
+    private long mountChangeSynthetic;
+    private long mountChangeIdentity;
+
+    /// <summary>
+    /// Tallies which fields differed, so the census can name what drives masterless-horse traffic.
+    /// </summary>
+    /// <remarks>
+    /// Counted for every comparison, including the ones that end in a suppressed send, because the question
+    /// this answers is "what is changing", not "what did we transmit". Three attempts at this problem were
+    /// built on an unverified guess about which field fires; this replaces the guessing.
+    /// </remarks>
+    private void RecordMountChange(MountChange change)
+    {
+        if ((change & MountChange.Position) != 0) mountChangePosition++;
+        if ((change & MountChange.Facing) != 0) mountChangeFacing++;
+        if ((change & MountChange.Input) != 0) mountChangeInput++;
+        if ((change & MountChange.Speed) != 0) mountChangeSpeed++;
+        if ((change & MountChange.Action) != 0) mountChangeAction++;
+        if ((change & MountChange.SyntheticTurn) != 0) mountChangeSynthetic++;
+        if ((change & MountChange.Identity) != 0) mountChangeIdentity++;
     }
 
     private void RecordSentMovement(
@@ -1225,36 +1345,223 @@ public class AgentMovementHandler : IAgentMovementHandler
                HasMountMovementChanged(previous.MountData, current.MountData);
     }
 
-    private static bool HasMountMovementChanged(AgentMountData previous, AgentMountData current)
+    /// <summary>What actually differs between two samples of a masterless horse.</summary>
+    /// <remarks>
+    /// Split into categories so the decision to send and the diagnosis of WHY can use the same comparison.
+    /// Three separate attempts to cut masterless-horse traffic were built on a guess about which of these
+    /// fields fires every tick; this makes the answer a measurement instead.
+    /// </remarks>
+    [Flags]
+    private enum MountChange
+    {
+        None = 0,
+        Position = 1,
+        Facing = 2,
+        Input = 4,
+        Speed = 8,
+        Action = 16,
+        SyntheticTurn = 32,
+        Identity = 64,
+    }
+
+    /// <summary>
+    /// The changes that justify sending a masterless horse.
+    /// </summary>
+    /// <remarks>
+    /// Position and identity, because a horse in the wrong PLACE is the only error anybody can see on an
+    /// animal nobody is fighting - and keeping position at its normal one-centimetre threshold is what stops
+    /// this looking like a horse hopping between points. The synthetic turn stays because it is an animation
+    /// this mod generates deliberately for stationary mounts, and dropping it would leave that visibly
+    /// unfinished.
+    ///
+    /// Facing, input vector, speed and the raw action indices are excluded: a loose horse's heading and
+    /// animation state are cosmetic, they ride along inside the next position packet anyway, and at the
+    /// 0.57-degree direction threshold they were firing a packet on essentially every tick.
+    /// </remarks>
+    private const MountChange MasterlessSendTriggers =
+        MountChange.Position | MountChange.Identity | MountChange.SyntheticTurn;
+
+    private static MountChange ClassifyMountChange(AgentMountData previous, AgentMountData current)
     {
         if (previous == null || current == null)
-            return previous != current;
+            return previous != current ? MountChange.Identity : MountChange.None;
 
-        return (current.MountPosition - previous.MountPosition).LengthSquared > PositionDeltaThresholdSq ||
-               (current.MountMovementDirection - previous.MountMovementDirection).LengthSquared > DirectionDeltaThresholdSq ||
-               (current.MountInputVector - previous.MountInputVector).LengthSquared > DirectionDeltaThresholdSq ||
-               (current.MountLookDirection - previous.MountLookDirection).LengthSquared > DirectionDeltaThresholdSq ||
-               Math.Abs(current.MountSpeed - previous.MountSpeed) > SpeedDeltaThreshold ||
-               current.MountAction0Index != previous.MountAction0Index ||
-               current.MountAction0Flag != previous.MountAction0Flag ||
-               current.MountAction0TurnDirection != previous.MountAction0TurnDirection ||
-               current.MountAction0TurnActionIndex != previous.MountAction0TurnActionIndex ||
-               current.MountAction0IsSyntheticTurn != previous.MountAction0IsSyntheticTurn ||
-               (current.MountAction0IsSyntheticTurn &&
-                   Math.Abs(current.MountAction0Progress - previous.MountAction0Progress) >
-                       AnimationProgressDeltaThreshold) ||
-               current.MountAction1Index != previous.MountAction1Index ||
-               current.MountAction1Flag != previous.MountAction1Flag ||
-               current.MountMovementId != previous.MountMovementId ||
-               current.MountAgentId != previous.MountAgentId ||
-               !string.Equals(
-                   current.MountIdentityScopeId,
-                   previous.MountIdentityScopeId,
-                   StringComparison.Ordinal);
+        MountChange change = MountChange.None;
+
+        if ((current.MountPosition - previous.MountPosition).LengthSquared > PositionDeltaThresholdSq)
+            change |= MountChange.Position;
+
+        if ((current.MountMovementDirection - previous.MountMovementDirection).LengthSquared > DirectionDeltaThresholdSq ||
+            (current.MountLookDirection - previous.MountLookDirection).LengthSquared > DirectionDeltaThresholdSq)
+            change |= MountChange.Facing;
+
+        if ((current.MountInputVector - previous.MountInputVector).LengthSquared > DirectionDeltaThresholdSq)
+            change |= MountChange.Input;
+
+        if (Math.Abs(current.MountSpeed - previous.MountSpeed) > SpeedDeltaThreshold)
+            change |= MountChange.Speed;
+
+        if (current.MountAction0Index != previous.MountAction0Index ||
+            current.MountAction0Flag != previous.MountAction0Flag ||
+            current.MountAction0TurnDirection != previous.MountAction0TurnDirection ||
+            current.MountAction0TurnActionIndex != previous.MountAction0TurnActionIndex ||
+            current.MountAction1Index != previous.MountAction1Index ||
+            current.MountAction1Flag != previous.MountAction1Flag)
+            change |= MountChange.Action;
+
+        if (current.MountAction0IsSyntheticTurn != previous.MountAction0IsSyntheticTurn ||
+            (current.MountAction0IsSyntheticTurn &&
+                Math.Abs(current.MountAction0Progress - previous.MountAction0Progress) >
+                    AnimationProgressDeltaThreshold))
+            change |= MountChange.SyntheticTurn;
+
+        if (current.MountMovementId != previous.MountMovementId ||
+            current.MountAgentId != previous.MountAgentId ||
+            !string.Equals(
+                current.MountIdentityScopeId,
+                previous.MountIdentityScopeId,
+                StringComparison.Ordinal))
+            change |= MountChange.Identity;
+
+        return change;
     }
+
+    /// <summary>Unchanged meaning for the RIDDEN path: a rider's mount data still sends on any difference.</summary>
+    private static bool HasMountMovementChanged(AgentMountData previous, AgentMountData current) =>
+        ClassifyMountChange(previous, current) != MountChange.None;
+
+    /// <summary>
+    /// Drops remembered mount facings for horses that are gone.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="_lastMountDirections"/> was the one map in this class with no per-agent removal — every
+    /// sibling (<see cref="_dismountedHorses"/>, <see cref="_syntheticMountTurns"/>,
+    /// <see cref="_remoteSyntheticMountTurns"/>, <see cref="resolvedMountIdentities"/>) drops its entry when
+    /// the agent goes, but this one was only emptied by <c>Dispose</c>, at mission end.
+    /// </para>
+    /// <para>
+    /// That made it grow for the whole battle: one entry per horse that ever moved, each holding a strong
+    /// reference to a native-backed <see cref="Agent"/>. A long battle spawns thousands of cavalry across
+    /// its reinforcement waves, so the dictionary kept every dead one alive — memory climbing all battle,
+    /// GC working harder for it, and frame times decaying as it went. That is the shape of the report this
+    /// fixes: a client whose FPS falls the longer a battle runs, and which eventually dies outright.
+    /// </para>
+    /// <para>
+    /// Swept rather than removed at the death site because the entries are keyed by <see cref="Agent"/>,
+    /// not by network id, so there is no single death hook that sees them. This mirrors
+    /// <c>AgentPositionInterpolator.Tick</c>, which evicts the same way and for the same reason. The sweep
+    /// is O(live mounts) once the backlog is gone, because it is what stops the backlog existing.
+    /// </para>
+    /// </remarks>
+    private void RemoveDeadMountDirections()
+    {
+        if (_lastMountDirections.Count == 0) return;
+
+        _deadMountDirections.Clear();
+        foreach (Agent mount in _lastMountDirections.Keys)
+        {
+            if (mount == null || !mount.IsActive())
+                _deadMountDirections.Add(mount);
+        }
+
+        foreach (Agent mount in _deadMountDirections)
+            _lastMountDirections.Remove(mount);
+
+        _deadMountDirections.Clear();
+
+    }
+
+    /// <summary>How often the per-agent bookkeeping census is written to the log.</summary>
+    private static readonly TimeSpan CensusInterval = TimeSpan.FromSeconds(30);
+    private DateTime lastCensusUtc = DateTime.MinValue;
+
+    /// <summary>
+    /// Periodically records how large this handler's per-agent tables have grown.
+    /// </summary>
+    /// <remarks>
+    /// A player reported frame rate decaying the longer a battle ran, ending in a crash — the signature of
+    /// something accumulating per agent — but by the time it was reported the logs were gone and there was
+    /// nothing to read. Every table here should track LIVE agents, so each count rising steadily while the
+    /// battle continues names the offender directly. Cheap: a handful of Count reads twice a minute.
+    /// </remarks>
+    private void LogAgentBookkeepingCensus()
+    {
+        var nowUtc = DateTime.UtcNow;
+        if (nowUtc - lastCensusUtc < CensusInterval) return;
+        lastCensusUtc = nowUtc;
+
+        int recipientTracked = 0;
+        foreach (RecipientMovementState recipient in recipientMovementStates.Values)
+            recipientTracked += recipient.LastSentMovement.Count + recipient.MovementPendingSince.Count;
+
+        Logger.Information(
+            "[BattleCensus] mountDirections={MountDirections} dismountedHorses={DismountedHorses} " +
+            "syntheticTurns={SyntheticTurns} remoteSyntheticTurns={RemoteSyntheticTurns} " +
+            "mountIdentities={MountIdentities} lastEquipment={LastEquipment} " +
+            "recipientMovementEntries={RecipientEntries} liveAgents={LiveAgents} " +
+            "riderlessMountsRepaired={RiderlessMountsRepaired} | " +
+            "masterlessSends: triggered={MasterlessTriggered} heartbeat={MasterlessHeartbeat} " +
+            "suppressed={MasterlessSuppressed} rateLimited={MasterlessRateLimited} | " +
+            "mountChanges: pos={ChangePosition} facing={ChangeFacing} " +
+            "input={ChangeInput} speed={ChangeSpeed} action={ChangeAction} synth={ChangeSynthetic} " +
+            "identity={ChangeIdentity}",
+            _lastMountDirections.Count,
+            _dismountedHorses.Count,
+            _syntheticMountTurns.Count,
+            _remoteSyntheticMountTurns.Count,
+            resolvedMountIdentities.Count,
+            lastEquipment.Count,
+            recipientTracked,
+            Mission.Current?.Agents?.Count ?? -1,
+            riderlessMountsRepaired,
+            masterlessTriggeredSends,
+            masterlessHeartbeatSends,
+            masterlessSuppressedSends,
+            masterlessRateLimitedSends,
+            mountChangePosition,
+            mountChangeFacing,
+            mountChangeInput,
+            mountChangeSpeed,
+            mountChangeAction,
+            mountChangeSynthetic,
+            mountChangeIdentity);
+
+        // Reported per window, so a non-zero value names an active source of the crash rather than a
+        // historical total.
+        riderlessMountsRepaired = 0;
+
+        // Per window for the same reason: these answer "what is happening right now", and a running total
+        // would hide a rate that changed halfway through a battle.
+        masterlessTriggeredSends = 0;
+        masterlessHeartbeatSends = 0;
+        masterlessSuppressedSends = 0;
+        masterlessRateLimitedSends = 0;
+        mountChangePosition = 0;
+        mountChangeFacing = 0;
+        mountChangeInput = 0;
+        mountChangeSpeed = 0;
+        mountChangeAction = 0;
+        mountChangeSynthetic = 0;
+        mountChangeIdentity = 0;
+    }
+
+    /// <summary>Riderless mounts repaired since the last census, for the census line.</summary>
+    private int riderlessMountsRepaired;
 
     private void RemoveStaleLocalState(HashSet<Guid> broadcastAgentIds)
     {
+        RemoveDeadMountDirections();
+
+        // Restore the engine invariant that every riderless mount carries a CommonAIComponent. Without it
+        // HumanAIComponent.FindClosestMountAvailable throws a NullReferenceException inside the native
+        // Mission.TickAgentsAndTeams callback, which kills the game thread with nothing in the log - the
+        // client simply stops. Swept here rather than trusted to each controller-change site, because the
+        // component is removed by the engine on any transition away from AI control.
+        riderlessMountsRepaired += puppetMountStateRepairer.EnsureRiderlessMountsHaveAi(Mission.Current);
+
+        LogAgentBookkeepingCensus();
+
         foreach (RecipientMovementState recipient in recipientMovementStates.Values)
         {
             var staleRecipientAgentIds = new HashSet<Guid>();

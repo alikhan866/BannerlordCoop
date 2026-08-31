@@ -1244,8 +1244,24 @@ public class MovementTrafficTests : MissionTestEnvironment
         Assert.Equal(safePayload, relayPacket.Payload);
     }
 
+    /// <summary>
+    /// The first poll must publish every battle agent's wield state, and later polls must stay quiet until
+    /// it changes.
+    /// </summary>
+    /// <remarks>
+    /// This test previously asserted the opposite for the first poll - that a battle agent's initial
+    /// equipment was seeded silently, because a spawn record was believed to carry the wield state. It does
+    /// not: MissionEquipmentData is a list of weapon SLOTS with no wielded index, and on the receiving side
+    /// only AgentEquipmentData.Apply ever calls SetWieldedItemIndexAsClient, so nothing wields at spawn
+    /// (the tournament spawner calls WieldInitialWeapons explicitly; the battle puppet spawner does not).
+    ///
+    /// The silent seed therefore left both sides permanently disagreeing, because the next poll compared
+    /// against the seeded value and found nothing to send. Players saw enemy troops throwing punches while
+    /// taking spear hits - damage is resolved by the owner, who has the weapon drawn - and only agents that
+    /// happened to switch weapons later ever corrected themselves.
+    /// </remarks>
     [Fact]
-    public void PollMovement_SeedsSpawnEquipmentAndOnlySendsChanges()
+    public void PollMovement_SendsInitialEquipmentThenOnlySendsChanges()
     {
         using var fixture = new MissionEngineFixture();
         var peer = Clients.First();
@@ -1262,10 +1278,14 @@ public class MovementTrafficTests : MissionTestEnvironment
             Assert.True(registry.TryRegisterAgent(
                 "peer", Guid.NewGuid(), 1, agent));
 
+            // First sight: the peer has never been told what this agent is holding, so it must be told.
             component.AgentMovementHandler.PollMovement(0f);
-            Assert.Empty(
+            var initial = Assert.Single(
                 network.NetworkSentPackets.GetPackets<AgentEquipmentPacket>());
+            Assert.Equal("peer", initial.IdentityScopeId);
+            Assert.Equal(new ushort[] { 1 }, initial.AgentIds);
 
+            // Nothing changed, so the 40 Hz poll must not keep resending it.
             network.NetworkSentPackets.Packets.Clear();
             component.AgentMovementHandler.PollMovement(0.025f);
             Assert.Empty(

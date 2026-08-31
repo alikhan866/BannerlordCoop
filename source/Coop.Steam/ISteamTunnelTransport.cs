@@ -31,7 +31,23 @@ public static class SteamTunnel
     /// Effective send-rate floor. This Steam build stays near its minimum while saturated, so the
     /// elevated floor keeps large join saves from taking minutes.
     /// </summary>
-    public const int SendRateMinBytesPerSecond = 4 * 1024 * 1024;
+    /// <remarks>
+    /// Raised from 4 MiB/s to 8 MiB/s on measurement, not on principle. Because Steam parks at the minimum
+    /// (the sentence above, confirmed live), this constant IS the operative send rate rather than a lower
+    /// bound on one: <c>SteamNetConnectionRealTimeStatus_t.m_nSendRateBytesPerSecond</c> read exactly
+    /// 4,194,304 on every sample of a link whose ping was 1 ms and whose quality was 1.00 - it never once
+    /// climbed toward <see cref="SendRateMaxBytesPerSecond"/>.
+    ///
+    /// Against that ceiling a single battle burst measured out=3,495,220 B/s - 83% of it - and parked
+    /// 5,320,697 bytes in the 8 MiB <see cref="SendBufferBytes"/>, taking that same 1 ms peer to 80 ms of
+    /// pure queueing delay. The bytes were the fault (see <c>RosterBroadcastGate</c>, which removes most of
+    /// them) but the floor is what turned a burst into a stall.
+    ///
+    /// Deliberately a moderate step, and still far below the 20 MiB/s ceiling already sanctioned here. It is
+    /// a floor Steam is not allowed to throttle beneath, so a genuinely poor link is now forced to carry more
+    /// before congestion control can back off - which is the reason not to simply set it to the maximum.
+    /// </remarks>
+    public const int SendRateMinBytesPerSecond = 8 * 1024 * 1024;
 
     /// <summary>Ceiling for Steam's send pacing, headroom above the floor.</summary>
     public const int SendRateMaxBytesPerSecond = 20 * 1024 * 1024;

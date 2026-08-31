@@ -400,7 +400,7 @@ public class CoopBattleMissionSpawnHandler : SandBoxMissionSpawnHandler
                 MissionSpawnSettings.InitialSpawnMethod.FreeAllocation,
                 settings.ReinforcementTroopsTimingMethod,
                 settings.ReinforcementTroopsSpawnMethod,
-                settings.GlobalReinforcementInterval,
+                CoopReinforcementPacing.Interval(settings.GlobalReinforcementInterval),
                 settings.ReinforcementBatchPercentage,
                 settings.DesiredReinforcementPercentage,
                 settings.ReinforcementWavePercentage,

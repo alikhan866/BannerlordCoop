@@ -353,6 +353,24 @@ internal static class LordBarterPatch
 
     internal static bool TryGetConversationContext(BarterData barterData, IObjectManager manager, out PeaceConversationContext context, out string contextId)
     {
+        // PRISONER FIRST, and the order is the fix. A captive can be spoken to from a dungeon location, from a
+        // settlement menu or straight from the party screen, so every other branch below can claim him - and
+        // each claims him wrongly. His OtherParty is the CAPTOR's party, which is the requester's own and is
+        // active, so he fell through to MapParty and the server went looking for a map engagement that talking
+        // to your own prisoner never creates. Live, that was five straight refusals of "The lord conversation
+        // is no longer active" against a lord sitting in the requester's own party.
+        //
+        // Custody outranks all three because it is not a place: wherever the conversation is being held, the
+        // party holding him is the only one that can be holding it.
+        var captor = barterData.OtherHero?.PartyBelongedToAsPrisoner;
+        if (captor != null &&
+            captor == barterData.OffererParty &&
+            manager.TryGetId(captor, out contextId))
+        {
+            context = PeaceConversationContext.Prisoner;
+            return true;
+        }
+
         var location = CampaignMission.Current?.Location;
         if (location != null && manager.TryGetId(location, out contextId))
         {

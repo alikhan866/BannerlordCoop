@@ -29,6 +29,25 @@ internal enum PeaceConversationContext
     /// Appended, never reordered: the value travels as an int on the wire.
     /// </remarks>
     Settlement,
+
+    /// <summary>
+    /// A conversation with a lord the requesting player is holding PRISONER.
+    /// </summary>
+    /// <remarks>
+    /// None of the other three describe this, and the fallback order made that a silent rejection. A
+    /// prisoner's <c>OtherParty</c> is his CAPTOR's party - the requesting player's own - and that party is
+    /// active, so the request went out as <see cref="MapParty"/>. The server then looked for a map engagement
+    /// between two parties, which talking to your own captive never creates, and refused with "The lord
+    /// conversation is no longer active." Measured live: five consecutive rejections against Hero_lord_1_54
+    /// while he sat in the requester's own party.
+    ///
+    /// Authority here is CUSTODY rather than a hold or co-location. If the target is your prisoner you are
+    /// necessarily the one who can speak to him, and no other player can - which is a stronger claim than the
+    /// settlement case gets from co-location, where several players may stand in the same town.
+    ///
+    /// Appended, never reordered: the value travels as an int on the wire.
+    /// </remarks>
+    Prisoner,
 }
 
 [ProtoContract(SkipConstructor = true)]

@@ -51,6 +51,43 @@ public sealed class SendCoalescer : ISendCoalescer
     private readonly List<CoalesceKey> order = new();
     private readonly object gate = new();
 
+    /// <summary>Minimum gap between flushes for a channel that asked for one. Absent means every flush.</summary>
+    private readonly Dictionary<string, TimeSpan> channelIntervals = new();
+    private readonly Dictionary<string, DateTime> channelLastFlushUtc = new();
+    private readonly List<CoalesceKey> retained = new();
+
+    /// <summary>
+    /// Holds a channel's sends back to at most one flush per <paramref name="minInterval"/>, letting its
+    /// updates keep coalescing in between.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Coalescing alone cannot beat the flush rate. <c>Flush</c> is driven by the network poll every 25ms,
+    /// so a channel can emit 40 messages a second no matter how well each one merges — measured on a live
+    /// siege, scoreboard updates cost ~700 messages per 10 seconds across ~400 flushes, barely two merged
+    /// entries each. The binding constraint is the reliable queue's PACKET count (it reached 12,926 with
+    /// throughput at only 11 KB/s before the peer was dropped), so what has to come down is the number of
+    /// messages, not their size.
+    /// </para>
+    /// <para>
+    /// Opt-in per channel, because the right interval is a gameplay judgement, not a transport one: a
+    /// scoreboard or an xp bar can lag a fraction of a second unnoticed, whereas a barter or a mission
+    /// handshake cannot. Channels that never call this keep flushing on every poll exactly as before.
+    /// Instance-scoped flushes (<see cref="FlushInstance"/>) ignore the throttle — they exist precisely to
+    /// force pending state out ahead of dependent traffic.
+    /// </para>
+    /// </remarks>
+    public void SetChannelInterval(string channel, TimeSpan minInterval)
+    {
+        if (string.IsNullOrEmpty(channel)) throw new ArgumentNullException(nameof(channel));
+
+        lock (gate)
+        {
+            if (minInterval <= TimeSpan.Zero) channelIntervals.Remove(channel);
+            else channelIntervals[channel] = minInterval;
+        }
+    }
+
     public bool HasPending
     {
         get
@@ -102,7 +139,10 @@ public sealed class SendCoalescer : ISendCoalescer
         }
     }
 
-    public void Flush(INetwork network)
+    public void Flush(INetwork network) => Flush(network, DateTime.UtcNow);
+
+    /// <summary>Flush at an explicit instant. Test seam for the per-channel interval.</summary>
+    internal void Flush(INetwork network, DateTime nowUtc)
     {
         if (network == null) throw new ArgumentNullException(nameof(network));
 
@@ -111,20 +151,51 @@ public sealed class SendCoalescer : ISendCoalescer
         {
             if (pending.Count == 0) return;
 
-            toSend = new PendingSend[pending.Count];
-            for (int i = 0; i < order.Count; i++)
+            var due = new List<PendingSend>(pending.Count);
+            retained.Clear();
+
+            foreach (var key in order)
             {
-                toSend[i] = pending[order[i]];
+                if (!IsChannelDue(key.Channel, nowUtc))
+                {
+                    // Held back deliberately: its updates keep merging into the pending payload, so the
+                    // next flush carries more entries in the same single message.
+                    retained.Add(key);
+                    continue;
+                }
+
+                due.Add(pending[key]);
+                pending.Remove(key);
+                channelLastFlushUtc[key.Channel] = nowUtc;
             }
 
-            pending.Clear();
+            if (due.Count == 0) return;
+
             order.Clear();
+            order.AddRange(retained);
+            retained.Clear();
+
+            toSend = due.ToArray();
         }
 
         foreach (var pendingSend in toSend)
         {
             pendingSend.Send(network);
         }
+    }
+
+    // Caller holds the gate.
+    private bool IsChannelDue(string channel, DateTime nowUtc)
+    {
+        if (channel == null || !channelIntervals.TryGetValue(channel, out var interval))
+            return true;
+
+        if (!channelLastFlushUtc.TryGetValue(channel, out var last))
+            return true;
+
+        var elapsed = nowUtc - last;
+        // A clock that stepped backwards must not wedge a channel shut until real time catches up.
+        return elapsed >= interval || elapsed < TimeSpan.Zero;
     }
 
     public void FlushInstance(string instanceId, INetwork network)

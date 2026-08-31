@@ -72,6 +72,21 @@ internal class BattleMissionStartHandler : IHandler
     /// <summary>
     /// Battles held at the starting line while their players choose how their troops deploy.
     /// </summary>
+    /// <summary>
+    /// Controllers already sent into each battle's mission, so a later barrier never waits on them.
+    /// </summary>
+    /// <remarks>
+    /// A late joiner opens a SECOND preference barrier for a battle that is already running, and the roster
+    /// was built from every participant - including the players currently fighting in it. Their clients are
+    /// in a mission, not on the map, so no inquiry can be shown and no answer can come back; the barrier
+    /// then waited out its full timeout while the joiner sat behind a "Waiting for other players" panel
+    /// naming someone who had been in the battle for half a minute. Asking a player who is already deployed
+    /// is meaningless anyway: their troops are on the field and the choice only shapes future waves, which
+    /// they keep from their existing preference.
+    /// </remarks>
+    private readonly ConcurrentDictionary<string, HashSet<string>> missionStartedControllers =
+        new ConcurrentDictionary<string, HashSet<string>>();
+
     private readonly ConcurrentDictionary<string, HeldMissionStart> heldMissionStarts =
         new ConcurrentDictionary<string, HeldMissionStart>();
 
@@ -142,6 +157,7 @@ internal class BattleMissionStartHandler : IHandler
         {
             mapEventMissionInitializers.TryRemove(mapEventId, out _);
             siegeMissionSnapshots.TryRemove(mapEventId, out _);
+            missionStartedControllers.TryRemove(mapEventId, out _);
             if (heldMissionStarts.TryRemove(mapEventId, out var held)) held.Dispose();
         }
     }
@@ -391,9 +407,15 @@ internal class BattleMissionStartHandler : IHandler
         IReadOnlyList<MissionParticipant> participants,
         IMessage missionStartMessage)
     {
+        missionStartedControllers.TryGetValue(mapEventId, out var alreadyDeployed);
+
         var heroIds = new List<string>();
         foreach (var participant in participants)
         {
+            // Already in the mission: their client cannot show an inquiry and cannot answer, so including
+            // them guarantees the barrier runs to its timeout and strands everyone who did answer.
+            if (alreadyDeployed != null && alreadyDeployed.Contains(participant.ControllerId)) continue;
+
             if (playerManager.TryGetPlayer(participant.ControllerId, out var player) &&
                 !string.IsNullOrEmpty(player.HeroId))
             {
@@ -422,7 +444,12 @@ internal class BattleMissionStartHandler : IHandler
 
         var roster = heroIds.ToArray();
         foreach (var participant in participants)
+        {
+            // Deployed players are not on the roster, so they must not be prompted either - an inquiry
+            // raised over a running mission is the modal that cannot be dismissed.
+            if (alreadyDeployed != null && alreadyDeployed.Contains(participant.ControllerId)) continue;
             network.Send(participant.Peer, new NetworkTroopPreferenceRequest(mapEventId, roster));
+        }
 
         held.Expiry = new System.Threading.Timer(
             _ => GameThread.RunSafe(() => ReleaseHold(mapEventId, "timed out"), context: nameof(ReleaseHold)),
@@ -491,6 +518,18 @@ internal class BattleMissionStartHandler : IHandler
     private string answeredPreferenceForMapEventId;
 
     /// <summary>
+    /// The battle whose deployment-preference inquiry is currently on screen, or null.
+    /// </summary>
+    /// <remarks>
+    /// Tracked so the inquiry can be taken down if the battle starts without this player answering. The
+    /// server gives up after <see cref="TroopPreferenceTimeout"/> and starts anyway, but nothing used to
+    /// close the dialog: it stayed up over the running mission, modal and unanswerable, because the choice
+    /// it was waiting for no longer existed. Dismissing the WAIT overlay was not enough - that is a
+    /// different panel, shown only after a player has already chosen.
+    /// </remarks>
+    private string preferenceInquiryMapEventId;
+
+    /// <summary>
     /// The server is holding a battle open for this player to choose how their troops deploy.
     /// </summary>
     /// <remarks>
@@ -516,6 +555,7 @@ internal class BattleMissionStartHandler : IHandler
         GameThread.RunSafe(() =>
         {
             bool mineIsCurrent = LocalTroopDeploymentPreference.Current == TroopDeploymentPreference.MyTroopsFirst;
+            preferenceInquiryMapEventId = mapEventId;
             InformationManager.ShowInquiry(new InquiryData(
                 "Deployment Preference",
                 "Which of your troops should fill this battle first?\n\n" +
@@ -538,6 +578,7 @@ internal class BattleMissionStartHandler : IHandler
     {
         LocalTroopDeploymentPreference.Current = choice;
         answeredPreferenceForMapEventId = mapEventId;
+        preferenceInquiryMapEventId = null;
         network.SendAll(new NetworkTroopPreferenceChosen(mapEventId));
 
         Logger.Information("[TroopPreference] {MapEventId}: chose {Choice}; waiting for the others", mapEventId, choice);
@@ -564,12 +605,33 @@ internal class BattleMissionStartHandler : IHandler
                 !string.Equals(answeredPreferenceForMapEventId, payload.What.MapEventId, StringComparison.Ordinal))
             {
                 if (outstanding.Length == 0) answeredPreferenceForMapEventId = null;
+                DismissPreferenceInquiry(payload.What.MapEventId);
                 TroopPreferenceWaitOverlay.HideIfShown();
                 return;
             }
 
             TroopPreferenceWaitOverlay.ShowWaitingFor(DescribeHeroes(outstanding));
         }, context: nameof(Handle_NetworkTroopPreferenceProgress));
+    }
+
+    /// <summary>
+    /// Closes the deployment-preference inquiry if it is still on screen for this battle.
+    /// </summary>
+    /// <remarks>
+    /// Scoped to the battle it was raised for, so a progress message about some other map event cannot
+    /// close a dialog the player is still reading. Leaving the local preference untouched is deliberate:
+    /// the player never chose, so whatever they had stays in force.
+    /// </remarks>
+    private void DismissPreferenceInquiry(string mapEventId)
+    {
+        if (preferenceInquiryMapEventId == null) return;
+        if (!string.Equals(preferenceInquiryMapEventId, mapEventId, StringComparison.Ordinal)) return;
+
+        preferenceInquiryMapEventId = null;
+        Logger.Information(
+            "[TroopPreference] {MapEventId}: battle started without an answer here; closing the prompt",
+            mapEventId);
+        InformationManager.HideInquiry();
     }
 
     private bool IsLocalHero(string heroId) =>
@@ -601,8 +663,41 @@ internal class BattleMissionStartHandler : IHandler
                 participants.Count);
         }
 
+        // Pattern matching, not `as`: both start messages are structs. Siege included, because a late
+        // joiner opens a fresh barrier for a running siege exactly as it does for a field battle.
+        string startedMapEventId =
+            message is NetworkStartAttackMission attackStart ? attackStart.MapEventId
+            : message is NetworkStartSiegeMission siegeStart ? siegeStart.MapEventId
+            : null;
+
         foreach (var participant in participants)
         {
+            // Do not start a mission for someone already in it.
+            //
+            // A late joiner re-runs this whole path for a battle that is already running, and the
+            // participant list is everyone, not just the newcomer. Re-sending the start to a client that is
+            // mid-battle tore it out of its mission and dropped it back on the encounter menu, which then
+            // read as the two players' battles diverging: one fought on, the other sat at "You have
+            // encountered..." with the fight continuing without them.
+            if (startedMapEventId != null)
+            {
+                var deployed = missionStartedControllers.GetOrAdd(
+                    startedMapEventId, _ => new HashSet<string>(StringComparer.Ordinal));
+
+                bool alreadyStarted;
+                lock (deployed) alreadyStarted = !deployed.Add(participant.ControllerId);
+
+                if (alreadyStarted)
+                {
+                    Logger.Information(
+                        "[BattleMissionLifecycle] {MapEventId}: {ControllerId} is already in this mission; " +
+                        "not re-sending its start",
+                        startedMapEventId,
+                        participant.ControllerId);
+                    continue;
+                }
+            }
+
             // Replay the recipient's authoritative membership first. The ordered channel and
             // idempotent client attachment make it present before the mission-start guard runs.
             network.Send(participant.Peer, new NetworkAddBattleParty(

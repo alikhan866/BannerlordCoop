@@ -746,6 +746,23 @@ public class CoopTroopSupplier : IMissionTroopSupplier
             : WaveQuota.Proportional(remaining, target);
 
         GuaranteeReceiverPlayerATroop(quota, target);
+
+        // Names, per wave, what the deployment preference actually did. "Prefer All Party Troops" can look
+        // ignored for a legitimate reason - a supplier holding only the player's own party has nothing to
+        // share a wave WITH, so both preferences produce the same men - and that is indistinguishable from a
+        // broken option without seeing the party list. partyCount=1 means the option had no room to act;
+        // partyCount>1 with an own-party-heavy quota means it genuinely did not apply.
+        Logger.Information(
+            "[TroopPreference] wave: preference={Preference} ownFirst={OwnFirst} usesSupplyOrder={Ranked} " +
+            "partyCount={PartyCount} target={Target} quota=[{Quota}] remaining=[{Remaining}]",
+            LocalTroopDeploymentPreference.Current,
+            ownFirst,
+            usesSupplyOrder,
+            parties.Count,
+            target,
+            string.Join(",", quota),
+            string.Join(",", remaining));
+
         return quota;
     }
 

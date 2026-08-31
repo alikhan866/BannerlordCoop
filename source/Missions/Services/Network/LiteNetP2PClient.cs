@@ -51,6 +51,19 @@ public class LiteNetP2PClient : INatPunchListener, INetEventListener, IUpdateabl
     private readonly IReliableMessageBatcher<string> reliableMessageBatcher;
     private readonly Poller poller;
 
+    /// <summary>
+    /// Outbound profile of the mission mesh, dumped as <c>[Mesh] Packet profile over ...</c>.
+    /// </summary>
+    /// <remarks>
+    /// This mesh is the only carrier of per-agent battle traffic (movement, spawns, deaths); the server pipe
+    /// never sees it. Without this, a stuttering battle produced a perfectly healthy server profile and no
+    /// evidence whatsoever — the traffic that actually scales with battle size was invisible on both sides.
+    /// Fed from the single per-recipient funnel, so a broadcast counts once per recipient, matching what
+    /// <c>CoopNetworkBase</c> records for the server pipe.
+    /// </remarks>
+    private readonly PacketProfiler meshProfiler =
+        new PacketProfiler(TimeSpan.FromSeconds(10), scope: "Mesh", profileOnClient: true);
+
     private readonly object peerGate = new();
     private readonly Dictionary<string, ulong> controllerSteamIds = new();
     private readonly Dictionary<NetPeer, string> pendingPeerControllers = new();
@@ -125,6 +138,33 @@ public class LiteNetP2PClient : INatPunchListener, INetEventListener, IUpdateabl
         messageBroker.Subscribe<MissionPeerLeft>(Handle_MissionPeerLeft);
         messageBroker.Subscribe<MissionPeerDisconnected>(Handle_MissionPeerDisconnected);
         steamBridge.PeerDisconnected += Handle_SteamPeerDisconnected;
+
+        meshProfiler.ExtraStatsProvider = DescribeMeshRoutes;
+    }
+
+    /// <summary>
+    /// One line of per-controller mesh route state appended to each profile dump: whether this peer is
+    /// reached DIRECTLY or has fallen back to the server RELAY, and its round-trip time.
+    /// </summary>
+    /// <remarks>
+    /// The route matters as much as the byte count. A controller with no direct peer has every packet
+    /// wrapped in a <c>RelayPacket</c> and bounced through the server (see <c>SendPacketToController</c>),
+    /// which doubles the hop count for traffic already on the critical path — and nothing in either log
+    /// said which route was in use.
+    /// </remarks>
+    private string DescribeMeshRoutes()
+    {
+        var routes = new List<string>();
+
+        foreach (var controllerId in missionContext.ControllersInMission)
+        {
+            if (missionContext.TryGetPeer(controllerId, out NetPeer peer) && peer != null)
+                routes.Add($"{controllerId} DIRECT ping={peer.Ping}ms");
+            else
+                routes.Add($"{controllerId} RELAY");
+        }
+
+        return routes.Count == 0 ? "mesh routes: none" : $"mesh routes: {string.Join(", ", routes)}";
     }
 
     public void Dispose()
@@ -136,6 +176,9 @@ public class LiteNetP2PClient : INatPunchListener, INetEventListener, IUpdateabl
         messageBroker.Unsubscribe<MissionPeerLeft>(Handle_MissionPeerLeft);
         messageBroker.Unsubscribe<MissionPeerDisconnected>(Handle_MissionPeerDisconnected);
         steamBridge.PeerDisconnected -= Handle_SteamPeerDisconnected;
+        // Before Stop(): the provider reads mission peer state, which teardown is about to take apart.
+        meshProfiler.ExtraStatsProvider = null;
+        meshProfiler.Dispose();
         Stop();
     }
 
@@ -660,6 +703,11 @@ public class LiteNetP2PClient : INatPunchListener, INetEventListener, IUpdateabl
 
     public void Send(string controllerId, IPacket packet, byte[] data)
     {
+        // Recorded here, the one funnel every overload passes through, and BEFORE batching or the
+        // direct/relay routing choice below - so the profile counts logical sends per recipient exactly as
+        // the server pipe's profile does, whichever route the packet ends up taking.
+        meshProfiler.Record(packet, data?.Length ?? 0);
+
         if (packet is MessagePacket messagePacket)
         {
             reliableMessageBatcher.Send(
