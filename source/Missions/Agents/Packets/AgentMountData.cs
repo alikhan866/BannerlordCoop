@@ -37,7 +37,7 @@ namespace Missions.Agents.Packets
             float? mountAction0TurnProgress = null,
             bool? mountAction0IsSyntheticTurn = null)
         {
-            MountInputVector = mountAgent.MovementInputVector;
+            mountInputVectorPacked = MovementQuantizer.PackVec2(mountAgent.MovementInputVector);
             MountAction0Index = mountAgent.GetCurrentAction(0).Index;
             bool syntheticStationaryTurn =
                 mountAction0IsSyntheticTurn
@@ -52,7 +52,8 @@ namespace Missions.Agents.Packets
             MountAction0Progress = syntheticStationaryTurn
                 ? mountAction0TurnProgress ?? 0f
                 : mountAgent.GetCurrentActionProgress(0);
-            MountSpeed = mountAgent.GetRealGlobalVelocity().AsVec2.Length;
+            mountSpeedRaw = MovementQuantizer.EncodeSpeed(
+                mountAgent.GetRealGlobalVelocity().AsVec2.Length);
             string renderedAction0Animation = null;
             float renderedAction0Speed = 1f;
             if (MountSpeed <= StationarySpeedThreshold)
@@ -65,8 +66,9 @@ namespace Missions.Agents.Packets
             MountAction1Flag = (ulong)mountAgent.GetCurrentAnimationFlag(1);
             MountAction1Progress = mountAgent.GetCurrentActionProgress(1);
             MountAction1Index = mountAgent.GetCurrentAction(1).Index;
-            MountLookDirection = mountAgent.LookDirection;
-            MountMovementDirection = mountAgent.GetMovementDirection();
+            mountLookDirectionPacked = MovementQuantizer.PackVec3(mountAgent.LookDirection);
+            mountMovementDirectionPacked = MovementQuantizer.PackVec2(
+                mountAgent.GetMovementDirection());
             MountPosition = mountAgent.Position;
             MountMovementFlag = (uint)AgentData.GetLocomotionMovementFlags(
                 mountAgent.MovementFlags);
@@ -495,18 +497,30 @@ namespace Missions.Agents.Packets
             public bool IsStationary { get; }
         }
 
-        [ProtoMember(1)]
-        public Vec2 MountInputVector { get; }
+        // Quantised for the same reason as AgentData's own vectors, and it matters MORE here: a ridden
+        // mount's data travels nested inside its rider's AgentData, so in a cavalry battle almost every
+        // agent pays for both. See MovementQuantizer for the precision argument.
+        [ProtoMember(1, DataFormat = DataFormat.FixedSize)]
+        private uint mountInputVectorPacked;
+        [ProtoMember(5, DataFormat = DataFormat.FixedSize)]
+        private ulong mountLookDirectionPacked;
+        [ProtoMember(6, DataFormat = DataFormat.FixedSize)]
+        private uint mountMovementDirectionPacked;
+        [ProtoMember(12)]
+        private ushort mountSpeedRaw;
+
+        public Vec2 MountInputVector => MovementQuantizer.UnpackVec2(mountInputVectorPacked);
+        public Vec3 MountLookDirection => MovementQuantizer.UnpackVec3(mountLookDirectionPacked);
+        public Vec2 MountMovementDirection =>
+            MovementQuantizer.UnpackVec2(mountMovementDirectionPacked);
+        public float MountSpeed => MovementQuantizer.DecodeSpeed(mountSpeedRaw);
         [ProtoMember(2)]
         public ulong MountAction1Flag { get; }
         [ProtoMember(3)]
         public float MountAction1Progress { get; }
         [ProtoMember(4)]
         public int MountAction1Index { get; }
-        [ProtoMember(5)]
-        public Vec3 MountLookDirection { get; }
-        [ProtoMember(6)]
-        public Vec2 MountMovementDirection { get; }
+
         [ProtoMember(7)]
         public Vec3 MountPosition { get; }
         /// <summary>The mount's owner-scoped movement id, or zero when the horse is unregistered.</summary>
@@ -519,8 +533,7 @@ namespace Missions.Agents.Packets
         [ProtoMember(11)]
         public int MountAction0Index { get; }
         /// <summary>The owner's horizontal mount speed, used as the puppet's absolute native speed limit.</summary>
-        [ProtoMember(12)]
-        public float MountSpeed { get; }
+
         /// <summary>Only populated when the mount's original owner differs from the rider's identity scope.</summary>
         [ProtoMember(13)]
         public string MountIdentityScopeId { get; }

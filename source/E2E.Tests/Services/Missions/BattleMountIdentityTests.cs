@@ -668,15 +668,21 @@ public class BattleMountIdentityTests : MissionTestEnvironment
             remoteMirror.InputVector = new Vec2(0.3f, 0.7f);
             remoteMirror.RealGlobalVelocity = new Vec3(3f, 4f, 0f);
 
-            var packet = new MountMovementPacket(new[] { horseId }, new[] { new AgentMountData(remoteHorse) });
+            var mountData = new AgentMountData(remoteHorse);
+            var packet = new MountMovementPacket(new[] { horseId }, new[] { mountData });
             component.AgentMovementHandler.MountMovementApplier.HandlePacket(null, packet);
 
             // The packet's movement input landed on the puppet horse (position itself is reconciled per-frame
             // by the interpolator, which this packet also fed).
+            //
+            // Compared against what the PACKET carries rather than against the owner's raw state: the wire
+            // quantises these vectors, so the owner's 0.6 travels as 0.5999939. Asserting against the raw
+            // value would be asserting something no packet can deliver; asserting against the packet keeps
+            // the real property - that the puppet ends up holding exactly what it was sent.
             Assert.Equal(AgentControllerType.None, puppetMirror.Controller);
-            Assert.Equal(remoteMirror.LookDirection, puppetMirror.LookDirection);
-            Assert.Equal(remoteMirror.MovementDirection, puppetMirror.MovementDirection);
-            Assert.Equal(remoteMirror.InputVector, puppetMirror.InputVector);
+            Assert.Equal(mountData.MountLookDirection, puppetMirror.LookDirection);
+            Assert.Equal(mountData.MountMovementDirection, puppetMirror.MovementDirection);
+            Assert.Equal(mountData.MountInputVector, puppetMirror.InputVector);
         });
     }
 

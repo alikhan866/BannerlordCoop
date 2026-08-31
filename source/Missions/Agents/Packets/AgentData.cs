@@ -83,10 +83,10 @@ namespace Missions.Agents.Packets
             bool? mountAction0IsSyntheticTurn = null)
         {
             Position = agent.Position;
-            MovementDirection = agent.GetMovementDirection();
-            LookDirection = agent.LookDirection;
-            InputVector = agent.MovementInputVector;
-            Speed = agent.GetRealGlobalVelocity().AsVec2.Length;
+            movementDirectionPacked = MovementQuantizer.PackVec2(agent.GetMovementDirection());
+            lookDirectionPacked = MovementQuantizer.PackVec3(agent.LookDirection);
+            inputVectorPacked = MovementQuantizer.PackVec2(agent.MovementInputVector);
+            speedRaw = MovementQuantizer.EncodeSpeed(agent.GetRealGlobalVelocity().AsVec2.Length);
             MovementFlag = (uint)GetLocomotionMovementFlags(
                 agent.MovementFlags);
 
@@ -116,6 +116,34 @@ namespace Missions.Agents.Packets
         public AgentData(Agent agent, System.Guid mountAgentId)
             : this(agent, 0, null, mountAgentId)
         {
+        }
+
+        /// <summary>
+        /// Builds the packet from explicit values rather than from a live agent.
+        /// </summary>
+        /// <remarks>
+        /// For tests, which need to describe a movement update without a native agent behind it. It exists
+        /// because the alternative they used - reflecting into auto-property backing fields - silently
+        /// depended on this struct storing its state as plain properties, and broke the moment the wire form
+        /// was quantised. Going through the same quantiser the real constructor uses also means a test
+        /// observes exactly what a peer would receive, rather than a value no packet could ever carry.
+        /// </remarks>
+        internal AgentData(
+            Vec3 position,
+            Vec2 movementDirection,
+            Vec3 lookDirection,
+            Vec2 inputVector,
+            float speed,
+            AgentMountData mountData = null,
+            uint movementFlag = 0)
+        {
+            Position = position;
+            movementDirectionPacked = MovementQuantizer.PackVec2(movementDirection);
+            lookDirectionPacked = MovementQuantizer.PackVec3(lookDirection);
+            inputVectorPacked = MovementQuantizer.PackVec2(inputVector);
+            speedRaw = MovementQuantizer.EncodeSpeed(speed);
+            MountData = mountData;
+            MovementFlag = movementFlag;
         }
 
         public void Apply(Agent agent)
@@ -171,19 +199,33 @@ namespace Missions.Agents.Packets
 
         [ProtoMember(1)]
         public Vec3 Position { get; }
-        [ProtoMember(2)]
-        public Vec2 InputVector { get; }
-        [ProtoMember(3)]
-        public Vec3 LookDirection { get; }
-        [ProtoMember(4)]
-        public Vec2 MovementDirection { get; }
+
+        // The four members below are stored quantised and exposed as vectors, so callers and tests are
+        // unchanged while the wire carries a third fewer bytes. See MovementQuantizer for the precision
+        // argument: a step is ~0.002 degrees against a sender that will not transmit a change under 0.57.
+        //
+        // FixedSize is deliberate. A packed direction with negative components sets its high bits, so a
+        // varint would cost MORE for an agent facing away from the origin than towards it - a wire whose
+        // size depends on which way a soldier is looking is not one worth reasoning about.
+        [ProtoMember(2, DataFormat = DataFormat.FixedSize)]
+        private uint inputVectorPacked;
+        [ProtoMember(3, DataFormat = DataFormat.FixedSize)]
+        private ulong lookDirectionPacked;
+        [ProtoMember(4, DataFormat = DataFormat.FixedSize)]
+        private uint movementDirectionPacked;
+        [ProtoMember(10)]
+        private ushort speedRaw;
+
+        public Vec2 InputVector => MovementQuantizer.UnpackVec2(inputVectorPacked);
+        public Vec3 LookDirection => MovementQuantizer.UnpackVec3(lookDirectionPacked);
+        public Vec2 MovementDirection => MovementQuantizer.UnpackVec2(movementDirectionPacked);
         // 5 was AgentEquipmentData — wield state moved to reliable on-change updates.
         // 6 was ActionData — actions moved to the event-driven AgentActionHandler.
         [ProtoMember(7)]
         public AgentMountData MountData { get; }
         /// <summary>The owner's real ground speed, m/s — drives the on-foot puppet's locomotion throttle.</summary>
-        [ProtoMember(8)]
-        public float Speed { get; }
+        /// <summary>The owner's real ground speed, m/s - quantised to a millimetre per second.</summary>
+        public float Speed => MovementQuantizer.DecodeSpeed(speedRaw);
         /// <summary>The owner's current translation and turn inputs.</summary>
         [ProtoMember(9)]
         public uint MovementFlag { get; }

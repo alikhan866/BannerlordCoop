@@ -53,7 +53,12 @@ public class SettlementAgentReplicationTests : SettlementTestEnvironment
         Assert.Equal(AgentControllerType.AI, ownedState.Controller);
         Assert.Equal(AgentControllerType.None, receivedState.Controller);
         Assert.Equal(spawnPosition, receivedState.Position);
-        Assert.Equal(spawnDirection, receivedState.MovementDirection);
+        // Movement vectors are quantised on the wire, so the expected value is put through the same
+        // encoding rather than the assertion being loosened to a tolerance. This stays an exact
+        // comparison - it just compares against a value a packet can actually carry.
+        Assert.Equal(
+            MovementQuantizer.UnpackVec2(MovementQuantizer.PackVec2(spawnDirection)),
+            receivedState.MovementDirection);
         Assert.Equal(3, owner.Mission.Agents.Count);
         Assert.Equal(3, receiver.Mission.Agents.Count);
         Assert.Empty(receiver.Mesh.NetworkSentMessages.OfType<NetworkSpawnLocationAgents>());
@@ -74,14 +79,29 @@ public class SettlementAgentReplicationTests : SettlementTestEnvironment
         Assert.True(AdvanceNetwork(TimeSpan.FromMilliseconds(1)) > 0);
         receiver.Tick(0.05f);
 
-        Assert.Equal(movedDirection, receivedState.MovementDirection);
-        Assert.Equal(new Vec3(movedDirection.x, movedDirection.y, 0f), receivedState.LookDirection);
+        // Through the wire encoding, for the same reason as the spawn direction above.
+        Assert.Equal(
+            MovementQuantizer.UnpackVec2(MovementQuantizer.PackVec2(movedDirection)),
+            receivedState.MovementDirection);
+        Assert.Equal(
+            MovementQuantizer.UnpackVec3(
+                MovementQuantizer.PackVec3(new Vec3(movedDirection.x, movedDirection.y, 0f))),
+            receivedState.LookDirection);
         Assert.Equal(Agent.MovementControlFlag.Forward, receivedState.MovementFlags & Agent.MovementControlFlag.MoveMask);
         Assert.True(receivedState.SetMovementDirectionCalls > movementWritesBeforeDelivery);
         Assert.True(receivedState.SetMovementInputCalls > 0);
         Assert.True(receivedState.SetTargetPositionAndDirectionCalls > 0);
         Assert.Equal(movedPosition.AsVec2, receivedState.LastTargetPosition);
-        Assert.Equal(new Vec3(movedDirection.x, movedDirection.y, 0f), receivedState.LastTargetDirection);
+        // Tolerance, not an exact match, and deliberately so. This value is the quantised direction after
+        // the locomotion path NORMALISES it: a packed (-0.8, 0.6) is a hair over unit length, so
+        // normalising lands on -0.80000734 rather than the -0.800012 the wire carried. Reconstructing that
+        // in the test would mean duplicating production maths here, which would pass whether or not the
+        // production maths was right. The property actually worth holding is that the puppet is aimed
+        // where the owner aimed, to within the wire's precision - so that is what is asserted.
+        Assert.True(
+            (receivedState.LastTargetDirection - new Vec3(movedDirection.x, movedDirection.y, 0f)).Length
+                <= MovementQuantizer.UnitTolerance,
+            $"target direction {receivedState.LastTargetDirection} strayed from {movedDirection}");
 
         const int actionIndex = 231;
         const float actionProgress = 0.37f;

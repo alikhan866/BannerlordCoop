@@ -312,13 +312,18 @@ public class MountedPuppetMovementTests : MissionTestEnvironment
             sourceMirror.MovementFlags =
                 Agent.MovementControlFlag.Forward |
                 Agent.MovementControlFlag.TurnRight;
-            puppetMirror.MovementDirection = sourceMirror.MovementDirection;
-            puppetMirror.LookDirection = sourceMirror.LookDirection;
-            puppetMirror.InputVector = sourceMirror.InputVector;
+            // Seeded from the PACKET, not from the owner's raw state. The wire quantises these vectors, so a
+            // puppet in production always holds the quantised form - it got there by applying a packet. Seeding
+            // from the raw source would describe a puppet that cannot exist, and the no-op guard would be
+            // asked to match two values that never match on the wire.
+            var mountData = new AgentMountData(sourceHorse);
+            puppetMirror.MovementDirection = mountData.MountMovementDirection;
+            puppetMirror.LookDirection = mountData.MountLookDirection;
+            puppetMirror.InputVector = mountData.MountInputVector;
             puppetMirror.MaximumSpeedLimit = 5f;
             puppetMirror.MovementFlags = sourceMirror.MovementFlags;
 
-            new AgentMountData(sourceHorse).ApplyMount(puppetHorse);
+            mountData.ApplyMount(puppetHorse);
 
             Assert.Equal(0, puppetMirror.SetMovementDirectionCalls);
             Assert.Equal(0, puppetMirror.SetLookDirectionCalls);
@@ -477,7 +482,10 @@ public class MountedPuppetMovementTests : MissionTestEnvironment
             Assert.Equal(1f, mountData.MountAction0Speed);
             Assert.False(mountData.MountAction0IsLocomotion);
             Assert.True(mountData.MountAction0IsSyntheticTurn);
-            Assert.Equal(sourceHorseMirror.InputVector, puppetHorseMirror.InputVector);
+            // Against the packet, not the owner's raw state: the wire quantises this vector, so 0.4
+            // arrives as 0.40000612. The property worth asserting is that the puppet holds exactly what
+            // it was sent.
+            Assert.Equal(mountData.MountInputVector, puppetHorseMirror.InputVector);
             Assert.Equal(
                 Agent.MovementControlFlag.None,
                 puppetHorseMirror.MovementFlags);
@@ -2352,25 +2360,15 @@ public class MountedPuppetMovementTests : MissionTestEnvironment
         AgentMountData mountData,
         Vec3? riderLookDirection = null)
     {
-        object boxed = default(AgentData);
-        SetBackingField(boxed, nameof(AgentData.Position), riderPosition);
-        SetBackingField(boxed, nameof(AgentData.MovementDirection), riderDirection);
-        SetBackingField(
-            boxed,
-            nameof(AgentData.LookDirection),
-            riderLookDirection ?? new Vec3(riderDirection.X, riderDirection.Y, 0f));
-        SetBackingField(boxed, nameof(AgentData.InputVector), riderDirection);
-        SetBackingField(boxed, nameof(AgentData.MountData), mountData);
-        SetBackingField(boxed, nameof(AgentData.Speed), ownerSpeed);
-        return (AgentData)boxed;
-    }
-
-    private static void SetBackingField(object boxed, string propertyName, object value)
-    {
-        FieldInfo field = typeof(AgentData).GetField(
-            $"<{propertyName}>k__BackingField",
-            BindingFlags.Instance | BindingFlags.NonPublic);
-        if (field == null) throw new MissingFieldException(typeof(AgentData).FullName, propertyName);
-        field.SetValue(boxed, value);
+        // Built through the packet's own constructor, so what a test sees is what a peer would receive -
+        // including the wire quantisation. This used to reflect into auto-property backing fields, which
+        // tied the tests to private storage and broke as soon as that storage changed.
+        return new AgentData(
+            riderPosition,
+            riderDirection,
+            riderLookDirection ?? new Vec3(riderDirection.X, riderDirection.Y, 0f),
+            riderDirection,
+            ownerSpeed,
+            mountData);
     }
 }
