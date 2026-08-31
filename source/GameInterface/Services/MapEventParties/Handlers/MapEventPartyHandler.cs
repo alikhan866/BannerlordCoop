@@ -118,7 +118,9 @@ internal class MapEventPartyHandler : IHandler
 
         ReportRosterBroadcastSavings(now);
 
-        var message = new NetworkUpdateMapEventParty(mapEventPartyId, flattenedTroops);
+        var message = new NetworkUpdateMapEventParty(
+            mapEventPartyId,
+            FlattenedTroopPayload.Compress(flattenedTroops));
         network.SendAll(message);
     }
 
@@ -140,14 +142,53 @@ internal class MapEventPartyHandler : IHandler
         long total = sent + suppressed;
         if (total <= 0) return;
 
+        long rosters = FlattenedTroopPayload.TotalPayloads;
+        long rawBytes = FlattenedTroopPayload.TotalRawBytes;
+        long wireBytes = FlattenedTroopPayload.TotalCompressedBytes;
+
+        // The average matters more than the total here: the batcher refuses anything at or above 1200
+        // bytes, so an average that sits under it is the evidence that these rosters are sharing
+        // datagrams again instead of fragmenting into several apiece.
         Logger.Information(
-            "[RosterTraffic] map-event roster broadcasts: {Sent} sent, {Suppressed} suppressed ({Percent:F1}% removed)",
-            sent, suppressed, 100d * suppressed / total);
+            "[RosterTraffic] map-event roster broadcasts: {Sent} sent, {Suppressed} suppressed ({Percent:F1}% removed) | payloads: {Rosters} rosters, {RawBytes} -> {WireBytes} bytes ({Saved:F1}% smaller, avg {AverageBytes} bytes/roster)",
+            sent,
+            suppressed,
+            100d * suppressed / total,
+            rosters,
+            rawBytes,
+            wireBytes,
+            rawBytes > 0 ? 100d * (rawBytes - wireBytes) / rawBytes : 0d,
+            rosters > 0 ? wireBytes / rosters : 0L);
     }
 
+    /// <summary>
+    /// Applies a roster snapshot, decoding it BEFORE the game thread is asked to do anything.
+    /// </summary>
+    /// <remarks>
+    /// Inflating the payload touches no game state - only bytes and protobuf - so it is deliberately kept
+    /// outside <see cref="GameThread.Run"/>. Rebuilding the roster itself cannot be: it resolves every troop
+    /// through the object manager and writes to a live map-event party. Splitting them keeps the frame
+    /// thread doing only the part that genuinely belongs to it, which matters because the client applying
+    /// these updates is the machine already struggling in a large battle.
+    ///
+    /// A payload that will not decode is dropped here, before any game work is scheduled. The roster then
+    /// keeps its previous value rather than being replaced by a plausible-looking empty one, and the next
+    /// snapshot - or the gate keyframe - corrects it.
+    /// </remarks>
     private void Handle_NetworkUpdateMapEventParty(MessagePayload<NetworkUpdateMapEventParty> payload)
     {
         var obj = payload.What;
+
+        FlattenedTroop[] troops;
+        try
+        {
+            troops = FlattenedTroopPayload.Decompress(obj.CompressedTroops);
+        }
+        catch (Exception e)
+        {
+            Logger.Error(e, "Failed to decode {Message}", nameof(NetworkUpdateMapEventParty));
+            return;
+        }
 
         GameThread.Run(() =>
         {
@@ -156,7 +197,7 @@ internal class MapEventPartyHandler : IHandler
                 if (!objectManager.TryGetObjectWithLogging<MapEventParty>(obj.MapEventPartyId, out var mapEventParty))
                     return;
 
-                mapEventParty._roster = FlattenedTroopSerializer.Deserialize(obj.FlattenedTroops, objectManager);
+                mapEventParty._roster = FlattenedTroopSerializer.Deserialize(troops, objectManager);
 
                 messageBroker.Publish(this, new MapEventTroopsUpdated(mapEventParty));
             }

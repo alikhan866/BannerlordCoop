@@ -1,4 +1,4 @@
-using Common.Messaging;
+﻿using Common.Messaging;
 using Common.Network;
 using Common.Util;
 using Coop.Core.Server.Services.MobileParties.Messages;
@@ -8,6 +8,7 @@ using GameInterface.Services.Barters;
 using GameInterface.Services.Hideouts.Handlers;
 using GameInterface.Services.Hideouts.Messages;
 using GameInterface.Services.MobileParties.Extensions;
+using GameInterface.Services.MapEventParties;
 using GameInterface.Services.MapEventParties.Messages;
 using GameInterface.Services.MapEvents.Messages;
 using GameInterface.Services.Players;
@@ -107,7 +108,7 @@ public class HideoutMapEventTests : MapEventTestBase
         var attackerRoster = Assert.Single(
             Server.NetworkSentMessages.GetMessages<NetworkUpdateMapEventParty>(),
             message => message.MapEventPartyId == attackerMapEventPartyId);
-        Assert.NotEmpty(attackerRoster.FlattenedTroops);
+        Assert.NotEmpty(FlattenedTroopPayload.Decompress(attackerRoster.CompressedTroops));
     }
 
     [Fact]

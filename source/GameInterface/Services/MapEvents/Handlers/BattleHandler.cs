@@ -207,7 +207,9 @@ internal class BattleHandler : IHandler
                     mapEventPartyId, flattenedTroops, DateTime.UtcNow, force: message.IsPlayerJoin))
                 continue;
 
-            network.SendAll(new NetworkUpdateMapEventParty(mapEventPartyId, flattenedTroops));
+            network.SendAll(new NetworkUpdateMapEventParty(
+                mapEventPartyId,
+                FlattenedTroopPayload.Compress(flattenedTroops)));
         }
 
         network.SendAll(new NetworkAddInvolvedParties(
