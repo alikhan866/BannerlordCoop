@@ -589,28 +589,91 @@ internal class BattleMissionStartHandler : IHandler
         if (!string.IsNullOrEmpty(others)) TroopPreferenceWaitOverlay.ShowWaitingFor(others);
     }
 
+    /// <summary>What a progress broadcast means for THIS client's prompt.</summary>
+    internal enum PreferenceProgressAction
+    {
+        /// <summary>This client still owes an answer - leave its prompt exactly where it is.</summary>
+        KeepPrompt,
+
+        /// <summary>Nothing more is expected here - take the prompt and any notice down.</summary>
+        Dismiss,
+
+        /// <summary>This client has answered; others have not. Show who is holding things up.</summary>
+        ShowWaiting,
+    }
+
+    /// <summary>
+    /// Decides what a progress broadcast means for the local prompt.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Pulled out as a pure function because the inline version got this wrong in a way that was invisible
+    /// until played. It filtered the local hero out of the outstanding list and then treated an EMPTY list
+    /// as 'everyone has answered'. For the one player everybody else is waiting on, those are the same
+    /// thing: the server says outstanding=[me], the client removes itself, sees nothing left, and closes
+    /// its own prompt.
+    /// </para>
+    /// <para>
+    /// Observed live: two players, Omar answered two seconds in, and the progress broadcast that announced
+    /// it closed the other player's prompt before he could choose. The barrier then waited out its full
+    /// thirty seconds for an answer that could no longer be given, and the other player's attack button did
+    /// nothing the whole time because the battle was held.
+    /// </para>
+    /// <para>
+    /// The fix is to ask the RAW list whether this client is still on it, before any filtering.
+    /// </para>
+    /// </remarks>
+    internal static PreferenceProgressAction DecidePreferenceProgressAction(
+        IReadOnlyList<string> outstandingHeroIds,
+        Func<string, bool> isLocalHero,
+        bool answeredThisBattle)
+    {
+        int count = outstandingHeroIds?.Count ?? 0;
+
+        for (int i = 0; i < count; i++)
+        {
+            // Still named by the server, so this client has not answered yet whatever it believes.
+            if (isLocalHero(outstandingHeroIds[i])) return PreferenceProgressAction.KeepPrompt;
+        }
+
+        if (count == 0) return PreferenceProgressAction.Dismiss;
+
+        return answeredThisBattle
+            ? PreferenceProgressAction.ShowWaiting
+            : PreferenceProgressAction.Dismiss;
+    }
+
     private void Handle_NetworkTroopPreferenceProgress(MessagePayload<NetworkTroopPreferenceProgress> payload)
     {
         if (ModInformation.IsServer) return;
 
-        var outstanding = (payload.What.OutstandingHeroIds ?? Array.Empty<string>())
-            .Where(id => !IsLocalHero(id))
-            .ToArray();
+        var raw = payload.What.OutstandingHeroIds ?? Array.Empty<string>();
+        var others = raw.Where(id => !IsLocalHero(id)).ToArray();
 
         GameThread.RunSafe(() =>
         {
-            // Empty means the wait is over - either everyone chose or the server ran out of patience. Either
-            // way the mission start is on its way and the notice must go.
-            if (outstanding.Length == 0 ||
-                !string.Equals(answeredPreferenceForMapEventId, payload.What.MapEventId, StringComparison.Ordinal))
-            {
-                if (outstanding.Length == 0) answeredPreferenceForMapEventId = null;
-                DismissPreferenceInquiry(payload.What.MapEventId);
-                TroopPreferenceWaitOverlay.HideIfShown();
-                return;
-            }
+            bool answeredThisBattle = string.Equals(
+                answeredPreferenceForMapEventId,
+                payload.What.MapEventId,
+                StringComparison.Ordinal);
 
-            TroopPreferenceWaitOverlay.ShowWaitingFor(DescribeHeroes(outstanding));
+            switch (DecidePreferenceProgressAction(raw, IsLocalHero, answeredThisBattle))
+            {
+                case PreferenceProgressAction.KeepPrompt:
+                    // Someone else answered and we have not. Leave the prompt up - closing it here is what
+                    // stranded the last player to choose and burned the whole timeout.
+                    return;
+
+                case PreferenceProgressAction.ShowWaiting:
+                    TroopPreferenceWaitOverlay.ShowWaitingFor(DescribeHeroes(others));
+                    return;
+
+                default:
+                    if (raw.Length == 0) answeredPreferenceForMapEventId = null;
+                    DismissPreferenceInquiry(payload.What.MapEventId);
+                    TroopPreferenceWaitOverlay.HideIfShown();
+                    return;
+            }
         }, context: nameof(Handle_NetworkTroopPreferenceProgress));
     }
 

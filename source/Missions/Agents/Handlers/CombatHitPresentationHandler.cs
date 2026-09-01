@@ -134,8 +134,18 @@ public class CombatHitPresentationHandler : ICombatHitPresentationHandler
     private void SendPresentation(MeleeHitPresentation presentation)
     {
         if (!TryCreateNetworkPresentation(presentation, out NetworkMeleeHitPresentation message))
+        {
+#if DEBUG
+            if (presentation.Kind == MeleeHitPresentationKind.ShieldImpact)
+                Diagnostics.ShieldImpactDiagnostics.SendFailedNoIdentity();
+#endif
             return;
+        }
 
+#if DEBUG
+        if (presentation.Kind == MeleeHitPresentationKind.ShieldImpact)
+            Diagnostics.ShieldImpactDiagnostics.Sent();
+#endif
         network.SendAll(message);
     }
 
@@ -192,13 +202,26 @@ public class CombatHitPresentationHandler : ICombatHitPresentationHandler
 
     private void Apply(NetworkMeleeHitPresentation presentation)
     {
+#if DEBUG
+        bool isShield = presentation.Kind == MeleeHitPresentationKind.ShieldImpact;
+        if (isShield) Diagnostics.ShieldImpactDiagnostics.Received();
+#endif
         if (!agentRegistry.TryGetAgentInfo(presentation.VictimAgentId, out CoopAgentInfo info))
+        {
+#if DEBUG
+            if (isShield) Diagnostics.ShieldImpactDiagnostics.DropVictimUnknown();
+#endif
             return;
-
+        }
         Agent victim = presentation.IsMount ? info.Agent?.MountAgent : info.Agent;
         Mission mission = Mission.Current;
         if (mission == null || victim == null || victim.Mission != mission || !victim.IsActive())
+        {
+#if DEBUG
+            if (isShield) Diagnostics.ShieldImpactDiagnostics.DropVictimInactive();
+#endif
             return;
+        }
 
         switch (presentation.Kind)
         {
@@ -207,6 +230,9 @@ public class CombatHitPresentationHandler : ICombatHitPresentationHandler
                 break;
             case MeleeHitPresentationKind.ShieldImpact:
                 PlayShieldImpact(mission, victim, presentation);
+#if DEBUG
+                Diagnostics.ShieldImpactDiagnostics.PlayedOk();
+#endif
                 break;
         }
     }
@@ -229,12 +255,28 @@ public class CombatHitPresentationHandler : ICombatHitPresentationHandler
         Agent victim,
         NetworkMeleeHitPresentation presentation)
     {
-        int soundIndex = SelectShieldImpactSound(
+        // Prefer the real weapon-on-shield event; fall back to the item-physics set only if it fails to
+        // resolve, so a bad lookup degrades to the old sound rather than to silence.
+        int soundIndex = SelectShieldBlockSound(
             presentation.AttackerWeaponClass,
             presentation.PhysicsMaterialIndex);
+        bool usedBlockEvent = soundIndex >= 0;
+        if (!usedBlockEvent)
+        {
+            soundIndex = SelectShieldImpactSound(
+                presentation.AttackerWeaponClass,
+                presentation.PhysicsMaterialIndex);
+        }
         Vec3 position = IsFinite(presentation.CollisionPosition)
             ? presentation.CollisionPosition
             : victim.Position;
+#if DEBUG
+        Diagnostics.ShieldImpactDiagnostics.SoundChosen(
+            soundIndex,
+            (int)presentation.AttackerWeaponClass,
+            position.Distance(victim.Position),
+            usedBlockEvent);
+#endif
         var parameter = new SoundEventParameter("Force", Clamp(presentation.Strength, 0.2f, 1f));
         mission.MakeSound(
             soundIndex,
@@ -246,6 +288,85 @@ public class CombatHitPresentationHandler : ICombatHitPresentationHandler
             ref parameter);
     }
 
+    // The real weapon-on-shield impact events, as shipped in Native/ModuleData. The engine plays these
+    // natively on the machine that owns the attacker; a client never gets that, because native does not
+    // resolve a puppet's melee collision at all, so it has to play them itself.
+    //
+    // What used to be used here was ItemPhysicsSoundContainer - the noise an item makes when DROPPED ON
+    // THE GROUND. It played reliably (measured: 1,426 published, sent, received and played, none dropped,
+    // a valid index every time) and simply sounded wrong, which is why a block against a puppet seemed to
+    // make no sound while a block against a locally owned attacker sounded right.
+    private const string EventMetalWeaponWoodShield = "event:/mission/combat/impact/metal_weapon/wood_shield";
+    private const string EventMetalWeaponMetalShield = "event:/mission/combat/impact/metal_weapon/metal_shield";
+    private const string EventWoodWeaponWoodShield = "event:/mission/combat/impact/wood_weapon/wood_shield";
+    private const string EventWoodWeaponMetalShield = "event:/mission/combat/impact/wood_weapon/metal_shield";
+    private const string EventPunchWoodShield = "event:/mission/combat/impact/punch_weapon/wood_shield";
+    private const string EventPunchMetalShield = "event:/mission/combat/impact/punch_weapon/metal_shield";
+
+    private static bool shieldSoundsResolved;
+    private static int soundMetalWood = -1;
+    private static int soundMetalMetal = -1;
+    private static int soundWoodWood = -1;
+    private static int soundWoodMetal = -1;
+    private static int soundPunchWood = -1;
+    private static int soundPunchMetal = -1;
+
+    /// <summary>Resolved once; the ids are stable for the process and the lookup is not free.</summary>
+    private static void EnsureShieldSounds()
+    {
+        if (shieldSoundsResolved) return;
+        shieldSoundsResolved = true;
+        try
+        {
+            soundMetalWood = SoundEvent.GetEventIdFromString(EventMetalWeaponWoodShield);
+            soundMetalMetal = SoundEvent.GetEventIdFromString(EventMetalWeaponMetalShield);
+            soundWoodWood = SoundEvent.GetEventIdFromString(EventWoodWeaponWoodShield);
+            soundWoodMetal = SoundEvent.GetEventIdFromString(EventWoodWeaponMetalShield);
+            soundPunchWood = SoundEvent.GetEventIdFromString(EventPunchWoodShield);
+            soundPunchMetal = SoundEvent.GetEventIdFromString(EventPunchMetalShield);
+        }
+        catch (Exception)
+        {
+            // Leave them at -1; the caller falls back to the item-physics set rather than going silent.
+        }
+    }
+
+    /// <summary>True when the struck surface is wooden, from the physics material the attacker reported.</summary>
+    private static bool IsWoodenShield(int physicsMaterialIndex)
+    {
+        if (physicsMaterialIndex < 0) return true;
+        try
+        {
+            PhysicsMaterial material = PhysicsMaterial.GetFromIndex(physicsMaterialIndex);
+            if (!material.IsValid) return true;
+            string name = material.Name;
+            if (name == null) return true;
+            if (name.Contains("metal") || name.Contains("iron") || name.Contains("steel")) return false;
+            return true;
+        }
+        catch (Exception)
+        {
+            return true;
+        }
+    }
+
+    /// <summary>The weapon-on-shield event for this blow, or -1 if none resolved.</summary>
+    internal static int SelectShieldBlockSound(WeaponClass weaponClass, int physicsMaterialIndex)
+    {
+        EnsureShieldSounds();
+        bool wood = IsWoodenShield(physicsMaterialIndex);
+        switch (weaponClass)
+        {
+            case WeaponClass.Undefined:
+                return wood ? soundPunchWood : soundPunchMetal;
+            case WeaponClass.OneHandedPolearm:
+            case WeaponClass.TwoHandedPolearm:
+            case WeaponClass.LowGripPolearm:
+                return wood ? soundWoodWood : soundWoodMetal;
+            default:
+                return wood ? soundMetalWood : soundMetalMetal;
+        }
+    }
     internal static int SelectShieldImpactSound(
         WeaponClass weaponClass,
         int physicsMaterialIndex)

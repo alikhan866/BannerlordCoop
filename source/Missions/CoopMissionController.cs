@@ -114,6 +114,7 @@ public abstract class CoopMissionController : MissionBehavior, IDisposable
 #if DEBUG
         MissionActionDiagnostics.SampleAnimations(
             coopMissionComponent.AgentRegistry);
+        AnimationTimeline.Tick(coopMissionComponent.AgentRegistry);
 #endif
     }
 
@@ -151,6 +152,26 @@ public abstract class CoopMissionController : MissionBehavior, IDisposable
 
     public override void OnEndMissionInternal()
     {
+#if DEBUG
+        // The animation trace lives in a ring buffer that dies with the mission, so a trace nobody remembered
+        // to snapshot by hand was simply lost - which is exactly what happened to the first fast-attack report.
+        // Dump it here while the buffer is still alive. Cheap: it only runs when the trace was switched on.
+        if (MissionActionDiagnostics.AnimationTraceEnabled)
+        {
+            try
+            {
+                Logger.Information(
+                    "BATTLE_ANIMATION_TRACE (mission end) {Trace}",
+                    MissionActionDiagnostics.SnapshotAnimationTrace(stop: true));
+            }
+            catch (Exception ex)
+            {
+                // Never let a diagnostic take the mission teardown down with it.
+                Logger.Warning(ex, "Failed to dump the battle animation trace at mission end");
+            }
+        }
+#endif
+
         // Detach the per-mission agent handlers FIRST, before mission state and native agents are freed. Both
         // detach deterministically here instead of leaking their packet-handler registration until the GC
         // finalizer runs.

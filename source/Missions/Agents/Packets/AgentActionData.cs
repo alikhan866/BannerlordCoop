@@ -154,6 +154,9 @@ namespace Missions.Agents.Packets
                 AnimFlags.anf_restart,
                 "mounted-guard-clear");
 #endif
+#if DEBUG
+            ActionWriteLog.Record(ActionWriteLog.Source.MountedGuardClear, 0f, restart: true);
+#endif
             agent.SetActionChannel(
                 channel,
                 ActionIndexCache.act_none,
@@ -252,6 +255,47 @@ namespace Missions.Agents.Packets
                 || IsGuardReactionAction(actionType);
         }
 
+        /// <summary>Whether this packet reports the agent mid melee swing on either channel.</summary>
+        internal static bool CarriesMeleeSwing(AgentActionData data) =>
+            data != null && (data.Action0IsMeleeSwing || data.Action1IsMeleeSwing);
+        /// <summary>A real melee swing, as opposed to the parries, blocks, reloads and drawn bows that also
+        /// live inside AttackMeleeAndRangedAllBegin..End.</summary>
+        /// <summary>
+        /// Whether a replicated action is written over the puppet's own action priority.
+        /// </summary>
+        /// <remarks>
+        /// A replicated MELEE SWING must be, or the engine arbitrates our write against the puppet's
+        /// current action and the native controller - which has no attack input for this agent, since the
+        /// attack is happening on the owner's machine - takes the channel straight back. The call still
+        /// succeeds, so nothing reports a failure; the animation is simply gone before the next frame.
+        /// Measured on two clients: the puppet rendered the owner's wind-up in 1.5-4.6% of sampled moments
+        /// before this, and 84-86% after, with the release going from 37-42% to 90-92%.
+        ///
+        /// Everything else keeps normal arbitration, so death, fall and dismount still win over a stale
+        /// swing. That is why this is not simply `true`.
+        /// </remarks>
+        internal static bool ShouldIgnorePriority(
+            bool forceGuardDirectionTransition,
+            bool incomingIsMeleeSwing) =>
+            forceGuardDirectionTransition || incomingIsMeleeSwing;
+        internal static bool IsMeleeSwingType(Agent.ActionCodeType actionType) =>
+            actionType == Agent.ActionCodeType.ReadyMelee
+            || actionType == Agent.ActionCodeType.ReleaseMelee;
+
+        /// <summary>
+        /// Whether a guard reaction should be preserved against THIS incoming action.
+        /// </summary>
+        /// <remarks>
+        /// Preserving a parry or block flinch is deliberate and correct - against other guard and defend
+        /// updates. It must not swallow an ATTACK. Measured live, 992 incoming melee swings were refused this
+        /// way in a few minutes of fighting, every one of them by the guard-reaction predicate, and the swing
+        /// then never rendered at all: no animation, no sound, and damage arriving out of nowhere. Hosts were
+        /// unaffected because locally simulated agents never take this path.
+        /// </remarks>
+        internal static bool ShouldSuppressForGuardReaction(
+            bool incomingIsMeleeSwing,
+            bool guardReactionWouldPreserve) =>
+            !incomingIsMeleeSwing && guardReactionWouldPreserve;
         internal static bool IsGuardReactionAction(
             Agent.ActionCodeType actionType)
         {
@@ -421,6 +465,8 @@ namespace Missions.Agents.Packets
             CrouchMode = agent.CrouchMode;
             GuardState = ToWireGuardState(guardMode);
 
+            Action0IsMeleeSwing = IsMeleeSwingType(agent.GetCurrentActionType(0));
+            Action1IsMeleeSwing = IsMeleeSwingType(agent.GetCurrentActionType(1));
             Action0Index = cache0.Index;
             Action0Progress = agent.GetCurrentActionProgress(0);
             Action0Flag = (ulong)agent.GetCurrentAnimationFlag(0);
@@ -494,6 +540,33 @@ namespace Missions.Agents.Packets
                 Action1Flag,
                 Action1Speed,
                 suppressMountedGuardActionTransition);
+
+#if DEBUG
+            // AFTER both channels, so this is the guard the puppet is actually left holding - the copy an
+            // attacking client would judge a block against. Compared with what THIS apply asked for.
+            if (GuardSyncDiagnostics.Enabled)
+            {
+                try
+                {
+                    // The wire's guard mode against the direction the puppet's action actually ends up on.
+                    // The first version compared GetDefendMovementFlags on both sides, which returned 0 for
+                    // every one of 68,906 observations - a 100% match rate that compared 0 to 0 and meant
+                    // nothing at all.
+                    GuardSyncDiagnostics.Record(
+                        agent.Index,
+                        (int)GuardMode,
+                        (int)GetDefendMovementFlags(movementFlags),
+                        (int)GetDefendMovementFlags(agent.MovementFlags),
+                        (int)GetGuardModeFromDefendDirection(
+                            agent.GetCurrentActionDirection(1)),
+                        (int)agent.GetCurrentActionType(1));
+                }
+                catch (Exception)
+                {
+                    // A diagnostic must never take a battle down.
+                }
+            }
+#endif
         }
 
         private void ApplyActionChannel(
@@ -506,12 +579,57 @@ namespace Missions.Agents.Packets
             float? actionSpeed,
             bool suppressMountedGuardActionTransition)
         {
-            bool suppressTransition =
-                ShouldSuppressReleasedPlayerGuardAction(channel)
-                || (suppressMountedGuardActionTransition
-                    && GuardActionChannel == channel)
-                || ShouldPreserveCurrentGuardReaction(agent, channel);
-            if (suppressTransition) return;
+#if DEBUG
+            // Puppet state captured BEFORE any decision, so every outcome reports what the puppet was doing
+            // when the call was made. The previous version read it back after SetActionChannel on the applied
+            // path, which just echoed the value it had written.
+            int tracePuppetIndex = 0;
+            float tracePuppetProgress = 0f;
+            int tracePuppetType = 0;
+            bool traceEnabled = ActionApplyTrace.Enabled;
+            if (traceEnabled)
+            {
+                try
+                {
+                    tracePuppetIndex = agent.GetCurrentAction(channel).Index;
+                    tracePuppetProgress = agent.GetCurrentActionProgress(channel);
+                    tracePuppetType = (int)agent.GetCurrentActionType(channel);
+                }
+                catch (Exception) { traceEnabled = false; }
+            }
+
+#endif
+            // Evaluated separately so the trace can name WHICH predicate refused, while keeping the exact
+            // short-circuit order the original expression had.
+            bool suppressReleasedPlayerGuard = ShouldSuppressReleasedPlayerGuardAction(channel);
+            bool suppressMountedGuard =
+                !suppressReleasedPlayerGuard
+                && suppressMountedGuardActionTransition
+                && GuardActionChannel == channel;
+            bool incomingIsMeleeSwing = channel == 0
+                ? Action0IsMeleeSwing
+                : Action1IsMeleeSwing;
+            bool suppressGuardReaction =
+                !suppressReleasedPlayerGuard
+                && !suppressMountedGuard
+                && ShouldSuppressForGuardReaction(
+                    incomingIsMeleeSwing,
+                    ShouldPreserveCurrentGuardReaction(agent, channel));
+            if (suppressReleasedPlayerGuard || suppressMountedGuard || suppressGuardReaction)
+            {
+#if DEBUG
+                ActionWriteLog.SwingArrival(IsWindupForChannel(channel), 1);
+                TraceApply(
+                    suppressReleasedPlayerGuard
+                        ? ActionApplyTrace.Outcome.SuppressedPlayerGuard
+                        : suppressMountedGuard
+                            ? ActionApplyTrace.Outcome.SuppressedMountedGuard
+                            : ActionApplyTrace.Outcome.SuppressedGuardReaction,
+                    agent, channel, actionIndex, actionProgress,
+                    traceEnabled, tracePuppetIndex, tracePuppetProgress, tracePuppetType);
+#endif
+                return;
+            }
 
             float resolvedActionSpeed = actionSpeed ?? 1f;
             if (!NeedsActionTransition(
@@ -529,6 +647,38 @@ namespace Missions.Agents.Packets
                 {
                     agent.SetCurrentActionSpeed(channel, resolvedActionSpeed);
                 }
+#if DEBUG
+                // The blind spot every earlier hypothesis was argued inside: roughly 9,300 swing-starts a
+                // battle were declined here and nothing recorded why.
+                ActionWriteLog.SwingArrival(IsWindupForChannel(channel), 2);
+                TraceApply(
+                    tracePuppetIndex == actionIndex
+                        ? ActionApplyTrace.Outcome.NoTransitionSameIndex
+                        : ActionApplyTrace.Outcome.NoTransitionPreserved,
+                    agent, channel, actionIndex, actionProgress,
+                    traceEnabled, tracePuppetIndex, tracePuppetProgress, tracePuppetType);
+                // Nothing transitioned, so the state read before the decision is still the current state.
+                if (traceEnabled
+                    && channel == 1
+                    && MeleeSwingDiagnostics.Enabled
+                    && (tracePuppetType == (int)Agent.ActionCodeType.ReadyMelee
+                        || tracePuppetType == (int)Agent.ActionCodeType.ReleaseMelee))
+                {
+                    bool readable = TryGetCurrentActionSpeed(agent, channel, out float currentSpeed);
+                    MeleeSwingDiagnostics.Record(
+                        agent.Index,
+                        channel,
+                        tracePuppetIndex,
+                        actionProgress,
+                        tracePuppetProgress,
+                        actionSpeed.HasValue,
+                        resolvedActionSpeed,
+                        currentSpeed,
+                        readable,
+                        applied: false,
+                        restartFlag: ((AnimFlags)actionFlag & AnimFlags.anf_restart) != 0);
+                }
+#endif
                 return;
             }
 
@@ -538,6 +688,13 @@ namespace Missions.Agents.Packets
                     actionIndex,
                     out ActionIndexCache action))
             {
+#if DEBUG
+                ActionWriteLog.SwingArrival(IsWindupForChannel(channel), 3);
+                TraceApply(
+                    ActionApplyTrace.Outcome.ResolveFailed,
+                    agent, channel, actionIndex, actionProgress,
+                    traceEnabled, tracePuppetIndex, tracePuppetProgress, tracePuppetType);
+#endif
                 return;
             }
 
@@ -561,16 +718,171 @@ namespace Missions.Agents.Packets
                 actionFlags,
                 "action-packet");
 #endif
+#if DEBUG
+            // Read BEFORE the set: what the puppet was doing when this attack replaced it. That is what
+            // separates 'the apply arrived late' from 'the puppet keeps falling out and re-entering the same
+            // swing', and those two want opposite fixes.
+            int previousActionIndex = agent.GetCurrentAction(channel).Index;
+#endif
+#if DEBUG
+            ActionWriteLog.Record(
+                ActionWriteLog.Source.ActionApply,
+                actionProgress,
+                ((AnimFlags)actionFlag & AnimFlags.anf_restart) != 0);
+#endif
+            // ignorePriority also has to cover a replicated MELEE SWING, not just guard transitions.
+            // Without it the engine arbitrates our write against the puppet's own action priority and the
+            // native controller - which has no attack input for this agent, because the attack is happening
+            // on the owner's machine - takes the channel straight back. The write returns successfully and
+            // the animation is gone before the next sample.
+            //
+            // That asymmetry is exactly what the measurements showed. The guard paths already pass
+            // ignorePriority: true, and guard state was reached 100% of the time (90,517 commands, 0
+            // failures) while the puppet rendered the owner's wind-up in 1.5-4.6% of sampled moments. The
+            // guard was never overwriting the swing - DESTROYED_WINDUP=0 - the swing was never there to
+            // overwrite, and 75% of arriving wind-up packets had to transition the action again because the
+            // previous one had already been dropped.
+            //
+            // The owner is authority for its own agent's animation, so local priority must not veto it.
+            // Scoped to melee swings: everything else keeps normal arbitration, so death, fall and
+            // dismount animations still win over a stale swing.
             agent.SetActionChannel(
                 channel,
                 action,
-                ignorePriority: forceGuardDirectionTransition,
+                ignorePriority: ShouldIgnorePriority(forceGuardDirectionTransition, incomingIsMeleeSwing),
                 additionalFlags: actionFlags,
                 actionSpeed: resolvedActionSpeed,
                 startProgress: actionProgress);
+
+#if DEBUG
+            ActionWriteLog.SwingArrival(IsWindupForChannel(channel), 0);
+            TraceApply(
+                ActionApplyTrace.Outcome.Applied,
+                agent, channel, actionIndex, actionProgress,
+                traceEnabled, tracePuppetIndex, tracePuppetProgress, tracePuppetType);
+
+            // Speed and progress read AFTER the set, paired with the request from THIS call. Reading before
+            // compared a new request against the previous value and reported ordinary churn as failure.
+            if (traceEnabled
+                && channel == 1
+                && MeleeSwingDiagnostics.Enabled
+                && IsMeleeSwingType(agent, channel))
+            {
+                bool readable = TryGetCurrentActionSpeed(agent, channel, out float appliedSpeed);
+                MeleeSwingDiagnostics.Record(
+                    agent.Index,
+                    channel,
+                    actionIndex,
+                    actionProgress,
+                    agent.GetCurrentActionProgress(channel),
+                    actionSpeed.HasValue,
+                    resolvedActionSpeed,
+                    appliedSpeed,
+                    readable,
+                    applied: true,
+                    restartFlag: ((AnimFlags)actionFlag & AnimFlags.anf_restart) != 0);
+            }
+            // After the set, so the agent reports the action that was just started rather than the one it
+            // replaced. This is what measures how much wind-up the defender never got to see.
+            WindupDiagnostics.RecordAppliedAction(
+                agent,
+                channel,
+                action,
+                actionProgress,
+                previousActionIndex);
+#endif
         }
 
+#if DEBUG
+        /// <summary>
+        /// Captures what the puppet was doing at the moment an apply decision was taken. Reads only
+        /// GetCurrentAction / GetCurrentActionType / GetCurrentActionProgress, all of which this path already
+        /// calls - deliberately nothing new, after a native ActionSet read crashed a live client.
+        /// </summary>
+        private static bool IsMeleeSwingType(Agent agent, int channel)
+        {
+            try
+            {
+                Agent.ActionCodeType type = agent.GetCurrentActionType(channel);
+                return type == Agent.ActionCodeType.ReadyMelee
+                    || type == Agent.ActionCodeType.ReleaseMelee;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>Whether THIS packet says the given channel carries a wind-up, read straight off the wire
+        /// rather than from a type map learned only from actions that succeeded in being applied.</summary>
+        private bool IsWindupForChannel(int channel) =>
+            channel == 0 ? Action0IsMeleeSwing : Action1IsMeleeSwing;
+
+        private static void TraceApply(
+            ActionApplyTrace.Outcome outcome,
+            Agent agent,
+            int channel,
+            int actionIndex,
+            float actionProgress,
+            bool captured,
+            int puppetActionIndex,
+            float puppetProgress,
+            int puppetActionType)
+        {
+            if (!captured || agent == null) return;
+
+            ActionApplyTrace.Record(
+                outcome,
+                agent,
+                channel,
+                actionIndex,
+                actionProgress,
+                puppetActionIndex,
+                puppetProgress,
+                puppetActionType);
+        }
+#endif
         // Agent exposes only a speed setter, so read the rendered channel through its publicized skeleton API.
+        /// <summary>
+        /// Reads the rendered animation speed, distinguishing UNREADABLE from 1.0x.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="GetCurrentActionSpeed"/> returns 1f on every failure path, so a failed read is
+        /// indistinguishable from an animation genuinely playing at normal speed. A measurement built on that
+        /// put 44% of its samples in the 1.0x bucket and concluded the puppet was playing too fast; the bucket
+        /// may simply have been the failures. Anything comparing speeds must use this instead.
+        /// </remarks>
+        internal static bool TryGetCurrentActionSpeed(
+            Agent agent,
+            int channel,
+            out float speed)
+        {
+            speed = 1f;
+            Skeleton skeleton = null;
+            try
+            {
+                MBAgentVisuals visuals = agent?.AgentVisuals;
+                if (ReferenceEquals(visuals, null) || !visuals.IsValid()) return false;
+
+                skeleton = visuals.GetSkeleton();
+                if (ReferenceEquals(skeleton, null)) return false;
+
+                float read = skeleton.GetAnimationSpeedAtChannel(channel);
+                if (float.IsNaN(read) || float.IsInfinity(read) || read < 0f) return false;
+
+                speed = read;
+                return true;
+            }
+            catch (NullReferenceException)
+            {
+                return false;
+            }
+            finally
+            {
+                if (!ReferenceEquals(skeleton, null))
+                    skeleton.ManualInvalidate();
+            }
+        }
         internal static float GetCurrentActionSpeed(Agent agent, int channel)
         {
             Skeleton skeleton = null;
@@ -778,6 +1090,29 @@ namespace Missions.Agents.Packets
         {
             get => HasFlag(16);
             private set => SetFlag(16, value);
+        }
+
+        /// <summary>
+        /// Whether this channel's action is a melee swing (ReadyMelee / ReleaseMelee).
+        /// </summary>
+        /// <remarks>
+        /// Set by the sender, which already knows the action's type. The receiver only has a bare action
+        /// index, and the one engine call that could resolve a type from an index reaches through
+        /// <c>agent.ActionSet</c> - which crashed a live client with an access violation earlier in this
+        /// investigation. Riding a spare bit of an existing byte costs nothing on the wire.
+        /// </remarks>
+        [ProtoIgnore]
+        public bool Action0IsMeleeSwing
+        {
+            get => HasFlag(32);
+            private set => SetFlag(32, value);
+        }
+
+        [ProtoIgnore]
+        public bool Action1IsMeleeSwing
+        {
+            get => HasFlag(64);
+            private set => SetFlag(64, value);
         }
 
         private bool HasFlag(byte flag) =>

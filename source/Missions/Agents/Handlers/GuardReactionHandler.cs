@@ -281,6 +281,12 @@ public class GuardReactionHandler : IGuardReactionHandler
                     "synthetic-guard-reaction");
             }
 #endif
+#if DEBUG
+            ActionWriteLog.Record(
+                ActionWriteLog.Source.SyntheticGuardReaction,
+                0f,
+                (animationFlags & AnimFlags.anf_restart) != 0);
+#endif
             return agent.SetActionChannel(
                 channel,
                 in reactionAction,
@@ -457,6 +463,13 @@ public class GuardReactionHandler : IGuardReactionHandler
                 message.Progress,
                 (AnimFlags)message.AnimationFlags,
                 "remote-guard-reaction");
+#endif
+#if DEBUG
+            // The other path that carries a progress onto a puppet, and it runs from the mission tick.
+            ActionWriteLog.Record(
+                ActionWriteLog.Source.RemoteGuardReaction,
+                message.Progress,
+                ((AnimFlags)message.AnimationFlags & AnimFlags.anf_restart) != 0);
 #endif
             applied = agent.SetActionChannel(
                 message.ReactionChannel,

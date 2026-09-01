@@ -230,6 +230,12 @@ public class BattleDamageRouter : IBattleDamageRouter
             }
             else
             {
+                // How long this blow sat in the queue. A blow applied hundreds of milliseconds late
+                // lands after its attacker has walked on, which is what "hit from far away" looks like
+                // from the receiving end: the hit itself is in contact range, but the man who threw it
+                // is no longer standing there.
+                Missions.Diagnostics.DamageAttributionDiagnostics.RecordApplyDelay(
+                    ElapsedSeconds(deferred.EnqueuedTimestamp));
                 ApplyDeferredDamage(deferred.Damage);
             }
         }

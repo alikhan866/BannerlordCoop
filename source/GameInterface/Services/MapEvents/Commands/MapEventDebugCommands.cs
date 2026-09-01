@@ -1090,6 +1090,95 @@ public class MapEventDebugCommands
 
     // coop.debug.mapevent.battle_reward_fixture_prepare testclient testclient2
     /// <summary>Closes the unfinished idle player encounter loaded by the #2308 live-test save.</summary>
+    /// <summary>
+    /// Puts one player's party onto another player's side of a battle already in progress.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// There was no generic way to do this. The battle-reward fixture can, but only for the two players it set
+    /// up itself, and only after teleporting them to Danustica with 60 and 20 troops - useless for staging an
+    /// arbitrary fight. Putting the joiner in the host's ARMY does not work either: an army member is not added
+    /// to the map event when the encounter opens, so the battle still has exactly two parties.
+    /// </para>
+    /// <para>
+    /// The mechanism is the one the fixture's late join uses - assigning <c>MapEventSide</c> is what enrolls a
+    /// party - followed by the encounter message so the joining client actually opens the battle.
+    /// </para>
+    /// </remarks>
+    [CommandLineArgumentFunction("add_player_to_battle", "coop.debug.mapevent")]
+    public static string AddPlayerToBattle(List<string> args)
+    {
+        if (ModInformation.IsClient)
+            return "Run this command on the server.";
+
+        if (args.Count != 2)
+            return "Usage: coop.debug.mapevent.add_player_to_battle <hostControllerId> <joinerControllerId>";
+
+        if (args[0] == args[1])
+            return "The host and the joiner must be different players.";
+
+        // allowActiveMapEvent: the host is BY DEFINITION already in a battle - that is the whole point of
+        // this command - and the default guard rejects exactly that case.
+        if (!TryGetPlayerParty(
+                args[0],
+                requireReady: true,
+                out var objectManager,
+                out var hostParty,
+                out var error,
+                allowActiveMapEvent: true))
+            return error;
+
+        if (!TryGetPlayerParty(args[1], requireReady: true, out _, out var joinerParty, out error))
+            return error;
+
+        var hostSide = hostParty.Party.MapEventSide;
+        if (hostSide == null)
+            return $"Host {args[0]} is not in a battle.";
+
+        var mapEvent = hostSide.MapEvent;
+        if (mapEvent == null)
+            return "The host's battle side has no map event.";
+
+        if (mapEvent.IsFinalized)
+            return "The host's battle is already finalized.";
+
+        var existingSide = joinerParty.Party.MapEventSide;
+        if (existingSide == hostSide)
+            return $"{args[1]} is already fighting on that side.";
+        if (existingSide != null)
+            return $"{args[1]} is already in a different battle - leave it first.";
+
+        joinerParty.Party.MapEventSide = hostSide;
+
+        // Assigning the side is what enrolls the party; confirm rather than assume, because a silent no-op
+        // here would look exactly like a battle the joiner simply never sees.
+        var joined = hostSide.Parties.FirstOrDefault(party => party.Party == joinerParty.Party);
+        if (joined == null)
+            return "The joining party was not added to the battle side.";
+
+        var enemySide = mapEvent.AttackerSide == hostSide
+            ? mapEvent.DefenderSide
+            : mapEvent.AttackerSide;
+        var enemyParty = enemySide?.LeaderParty;
+
+        if (!ContainerProvider.TryResolve<INetwork>(out var network)
+            || enemyParty == null
+            || !objectManager.TryGetId(enemyParty, out string enemyPartyId)
+            || !objectManager.TryGetId(joinerParty.Party, out string joinerPartyId)
+            || !objectManager.TryGetId(mapEvent, out string mapEventId))
+        {
+            return "Joined the side, but the encounter ids could not be resolved to notify the client.";
+        }
+
+        network.SendAll(new NetworkPlayerPartyHostileEncounterStarted(
+            $"debug-add-to-battle-{Guid.NewGuid():N}",
+            enemyPartyId,
+            joinerPartyId,
+            mapEventId));
+
+        return $"Added {args[1]} ({joinerPartyId}) to {args[0]}'s battle {mapEventId}; " +
+               $"side now has {hostSide.Parties.Count()} parties against {enemyPartyId}.";
+    }
     [CommandLineArgumentFunction("battle_reward_fixture_prepare", "coop.debug.mapevent")]
     public static string PrepareBattleRewardFixture(List<string> args)
     {

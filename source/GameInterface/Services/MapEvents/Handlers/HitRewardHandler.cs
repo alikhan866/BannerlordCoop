@@ -23,6 +23,8 @@ public class HitRewardHandler : IHandler
 {
     private const string UpgradedTroopsScoreboardRefreshChannel = "UpgradedTroopsScoreboardRefreshChannel";
 
+    private readonly ScoreboardUpgradeTotals scoreboardUpgradeTotals = new();
+
     /// <summary>
     /// How often scoreboard upgrades are allowed onto the wire.
     /// </summary>
@@ -260,6 +262,14 @@ public class HitRewardHandler : IHandler
         int upgradedCount)
     {
         if (string.IsNullOrEmpty(mapEventId)) return;
+
+        // CheckUpgradedCount answers with a NEGATIVE to withdraw a troop type that has left the roster, and
+        // never clears its own bookkeeping, so it keeps answering with that same negative. This is asked on
+        // every hit reward and every agent removal, and the client ADDS each answer to a running total, so
+        // the repeats walked one party's scoreboard to -201406 while the other read a normal 239. Clamped
+        // at zero: the one real withdrawal still goes out, the repeats after it send nothing.
+        upgradedCount = scoreboardUpgradeTotals.Accept(mapEventId, partyId, characterId, upgradedCount);
+        if (upgradedCount == 0) return;
 
         var key = new CoalesceKey(UpgradedTroopsScoreboardRefreshChannel, mapEventId);
         var entry = new ScoreboardUpgradeEntry(characterId, partyId, side, upgradedCount);

@@ -702,6 +702,37 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
         RemoteAction action,
         bool removePendingBeforeApply)
     {
+        RemoteActionApplyResult result = TryApplyRemoteActionCore(
+            agentId,
+            info,
+            action,
+            removePendingBeforeApply);
+#if DEBUG
+        // Wrapped rather than recorded at each return, so a path added later cannot quietly go uncounted.
+        // Remote attacks were measured starting deep into the swing at zero latency, which is only possible
+        // if the packet carrying the start of that swing was discarded here.
+        // Both channels: a packet drives channel 0 and channel 1 with separate progresses, and melee attacks
+        // run on the upper-body channel. Recording only channel 0 read 0.1% while attacks were starting at 88%.
+        ActionDeliveryDiagnostics.Record(
+            (int)result,
+            0,
+            action.Data?.Action0Progress ?? 0f,
+            action.ControllerId);
+        ActionDeliveryDiagnostics.Record(
+            (int)result,
+            1,
+            action.Data?.Action1Progress ?? 0f,
+            action.ControllerId);
+#endif
+        return result;
+    }
+
+    private RemoteActionApplyResult TryApplyRemoteActionCore(
+        Guid agentId,
+        CoopAgentInfo info,
+        RemoteAction action,
+        bool removePendingBeforeApply)
+    {
         if (!IsCurrentActionAuthority(
             info,
             action.ControllerId,
@@ -965,10 +996,35 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
         Agent.MovementControlFlag defendFlags = guardState.Action.Data.DefendFlags;
         Agent.GuardMode guardMode = guardState.Action.Data.GuardMode;
 
-        if (defendFlags != Agent.MovementControlFlag.None
+        // A soldier keeps its shield up WHILE winding up a swing, so the defend flags stay set and the guard
+        // gets retained - then re-imposed every tick, pinning the puppet in a shield pose right through the
+        // owner's ReadyMelee. Measured on a live client, the wind-up never rendered once in three separate
+        // recordings; the swing only appeared at the release, which is why attacks arrived with nothing to
+        // react to.
+        //
+        // Read from the action just applied, not from the retained snapshot: an earlier attempt asked the
+        // stored guard whether an attack was happening, and that snapshot is by definition the one taken
+        // BEFORE the attack, so it always answered no and the fix never fired.
+        bool ownerIsMidSwing = AgentActionData.CarriesMeleeSwing(guardState.Action.Data);
+        bool guardConditionsHold =
+            defendFlags != Agent.MovementControlFlag.None
             || AgentActionData.IsGuardMode(guardMode)
             || (guardState.DrivesMountedReactionPresentation
-                && guardState.GuardAction != ActionIndexCache.act_none))
+                && guardState.GuardAction != ActionIndexCache.act_none);
+#if DEBUG
+        ActionWriteLog.GuardRetention(
+            ownerIsMidSwing,
+            guardConditionsHold,
+            retained: !ownerIsMidSwing && guardConditionsHold);
+#endif
+
+        // REVERTED: this once read `!ownerIsMidSwing && guardConditionsHold`, releasing the retained guard
+        // whenever the owner started a swing. Releasing runs ClearRemoteDefendState, which ends in
+        // ApplyGuardState(GuardMode.None) - a guard command issued to an agent at the exact moment it began
+        // winding up. Measured live it fired 34,344 times against 29,996 arriving wind-ups, very nearly one
+        // for one, cancelling the wind-up right after it had been applied. It was added to stop the guard
+        // interfering with attacks and did precisely that instead.
+        if (guardConditionsHold)
         {
             RemoteAgentActionState retainedState = GetOrCreateAgentState(agentId);
             retainedState.RetainedGuard = guardState;
@@ -992,9 +1048,24 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
         RemoteGuardState guardState,
         bool restoreNativeGuardState)
     {
-        Agent.GuardMode guardMode = guardState.Action.Data.GuardMode;
+        AgentActionData retainedData = guardState.Action.Data;
+        Agent.GuardMode guardMode = retainedData.GuardMode;
         if (!AgentActionData.IsGuardMode(guardMode))
         {
+            return;
+        }
+
+        // The owner is mid-swing, so the held guard must stand aside.
+        //
+        // HasInterruptingGuardAction asks whether the PUPPET is playing something that interrupts a guard,
+        // and a defending pose does not qualify. That is circular: the retained guard keeps re-imposing a
+        // shield, the shield is a defending action, so nothing ever counts as interrupting and the incoming
+        // attack can never break in. Measured on a live client, the wind-up phase never rendered at all - the
+        // puppet held a shield through the owner's whole ReadyMelee and only picked the swing up at the
+        // release, which is why attacks still arrived with nothing to react to.
+        if (ShouldYieldRetainedGuardToAttack(retainedData))
+        {
+            guardState.HasGuardCommand = false;
             return;
         }
 
@@ -1018,11 +1089,23 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
             && guardState.LastCommandedMountIndex != mountIndex;
         bool guardModeChanged = guardState.HasGuardCommand
             && guardState.LastCommandedGuardMode != guardMode;
+        // An agent that is SWINGING is not showing a defending action, and that is not a guard going
+        // missing - it is the agent attacking. Restoring the guard here overwrites the swing, and because
+        // the condition is true for exactly as long as the attack lasts, it fires again and again: measured
+        // on a live client, 112,174 of 128,314 guard re-commands (87%) came from this branch, at 565 per
+        // second. That is why the wind-up was missed in 100% of samples across five recordings while the
+        // sender was publishing every single one of them.
+        // NOTE: gating this on the owner's replicated swing (!CarriesMeleeSwing(guardState.Action.Data))
+        // was tried and reverted. It moved NATIVE_MISSING by only ~10% and left the outcome metric flat
+        // (swingEnd replacedBy=reaction 75% -> 80%, mean 39% -> 36%), while leaving the guard-reaction
+        // state standing longer: SWINGS_REFUSED by the guardReaction predicate went from 3 to 5,776
+        // refused releases on the loaded client. The guard is not what truncates the swing.
         bool nativeGuardStateMissing =
             restoreNativeGuardState
             && !agent.HasMount
             && agent.CurrentGuardMode != guardMode
-            && !HasDefendingAction(agent);
+            && !HasDefendingAction(agent)
+            && !IsAttackingNow(agent);
 
         bool shouldApplyGuardCommand =
             !guardState.HasGuardCommand
@@ -1034,11 +1117,32 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
 #if DEBUG
             MissionActionDiagnostics.RecordGuardCommand(
                 guardModeChanged);
+            ActionWriteLog.GuardCommand(
+                reacquiringGuard,
+                mountChanged,
+                guardModeChanged,
+                nativeGuardStateMissing);
 #endif
             bool forceGuardCommand =
                 mountChanged
                 || reacquiringGuard
                 || nativeGuardStateMissing;
+#if DEBUG
+            // nativeGuardStateMissing is `agent.CurrentGuardMode != guardMode`, so if the command below
+            // never makes those equal the condition stays true and re-fires every tick, applying a defend
+            // pose over whatever the agent was sent. Reading it either side says whether that is happening.
+            Agent.GuardMode guardModeBefore;
+            Agent.ActionCodeType actionBefore;
+            bool guardModeReadable;
+            try
+            {
+                guardModeBefore = agent.CurrentGuardMode;
+                actionBefore = agent.GetCurrentActionType(1);
+                guardModeReadable = true;
+            }
+            catch (Exception) { guardModeBefore = default; actionBefore = default; guardModeReadable = false; }
+            if (!guardModeReadable) GuardCommandEffectDiagnostics.RecordReadFailure();
+#endif
             if (guardModeChanged)
             {
                 AgentActionData.ApplyGuardDirectionTransition(
@@ -1052,6 +1156,23 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
                     guardMode,
                     force: forceGuardCommand);
             }
+#if DEBUG
+            if (guardModeReadable)
+            {
+                try
+                {
+                    GuardCommandEffectDiagnostics.Record(
+                        guardModeBefore,
+                        agent.CurrentGuardMode,
+                        guardMode,
+                        nativeGuardStateMissing,
+                        guardModeChanged,
+                        actionBefore,
+                        agent.GetCurrentActionType(1));
+                }
+                catch (Exception) { GuardCommandEffectDiagnostics.RecordReadFailure(); }
+            }
+#endif
         }
 
         guardState.HasGuardCommand = true;
@@ -1059,6 +1180,30 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
         guardState.LastCommandedMountIndex = mountIndex;
     }
 
+    /// <summary>
+    /// Whether a retained guard must stop re-imposing itself because the owner has begun a melee swing.
+    /// </summary>
+    /// <remarks>
+    /// Read from the action data the owner sent, not from what the puppet is currently showing - the puppet
+    /// is showing whatever the retained guard last wrote, so asking it produces a loop that no attack can
+    /// escape.
+    /// </remarks>
+    internal static bool ShouldYieldRetainedGuardToAttack(AgentActionData retainedData) =>
+        retainedData != null
+        && (retainedData.Action0IsMeleeSwing || retainedData.Action1IsMeleeSwing);
+    /// <summary>Whether the agent is mid melee swing right now, on either channel.</summary>
+    private static bool IsAttackingNow(Agent agent)
+    {
+        try
+        {
+            return AgentActionData.IsMeleeSwingType(agent.GetCurrentActionType(0))
+                || AgentActionData.IsMeleeSwingType(agent.GetCurrentActionType(1));
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
     private static bool HasInterruptingGuardAction(
         Agent agent,
         RemoteGuardState guardState)
@@ -1150,6 +1295,9 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
                 AnimFlags.anf_restart,
                 "retained-guard-release");
         }
+#endif
+#if DEBUG
+        ActionWriteLog.Record(ActionWriteLog.Source.RetainedGuardRelease, 0f, restart: true);
 #endif
         agent.SetActionChannel(
             channel,

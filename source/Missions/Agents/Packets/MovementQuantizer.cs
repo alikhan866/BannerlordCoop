@@ -129,6 +129,136 @@ internal static class MovementQuantizer
         DecodeUnit((short)(ushort)(packed >> 16)),
         DecodeUnit((short)(ushort)(packed >> 32)));
 
+    // ---- position --------------------------------------------------------------------------
+
+    /// <summary>Steps per metre. One step is 1 cm; the worst error is half of that.</summary>
+    /// <remarks>
+    /// Deliberately coarser than the direction encoding, and chosen from how position is CONSUMED rather
+    /// than from how precisely it could be sent. <c>AgentPositionInterpolator.MoveTowardTarget</c> hands
+    /// the value to <c>Agent.SetTargetPositionAndDirection</c>, so the agent WALKS there under its own
+    /// locomotion - it is a destination, not a snap target. Sub-centimetre precision in a walk destination
+    /// buys nothing.
+    ///
+    /// Half a centimetre is also half of the 1 cm change below which the sender refuses to transmit at all
+    /// (<c>PositionDeltaThresholdSq</c>), so the encoding cannot invent movement the sender judged too
+    /// small to mention.
+    ///
+    /// Spending the spare bits on RANGE rather than precision is the point: it turns the range from an
+    /// assumption that might be wrong into one that cannot plausibly be.
+    /// </remarks>
+    public const float PositionScale = 100f;
+
+    /// <summary>Bits per axis. Three axes fit in 63, leaving the top bit for the sentinel.</summary>
+    public const int PositionBits = 21;
+
+    private const ulong PositionMask = (1UL << PositionBits) - 1UL;
+    private const int PositionSignBit = PositionBits - 1;
+    private const long PositionMaxSteps = (1L << PositionSignBit) - 1L;
+    private const long PositionMinSteps = -(1L << PositionSignBit);
+
+    /// <summary>Furthest representable coordinate in metres - about 10.4 km from the scene origin.</summary>
+    /// <remarks>
+    /// A Bannerlord battle terrain is on the order of a kilometre across, so this is roughly a tenfold
+    /// margin. That margin is why no fallback FIELD is needed; the sentinel covers the case where the
+    /// margin still turns out to be wrong.
+    /// </remarks>
+    public const float MaximumPositionMetres = PositionMaxSteps / PositionScale;
+
+    /// <summary>Largest error a coordinate can pick up: half a step, 5 mm.</summary>
+    public const float PositionTolerance = 0.5f / PositionScale;
+
+    /// <summary>Set in the top bit to mean THIS PACKET CARRIES NO USABLE POSITION.</summary>
+    /// <remarks>
+    /// <para>
+    /// The contingency lives inside the value rather than in a second field, and each alternative is ruled
+    /// out by something concrete.
+    /// </para>
+    /// <para>
+    /// A second Vec3 fallback field would make the struct BIGGER than it is today. AgentData is built per
+    /// agent per poll, thousands of times a second, so growing it to guard a branch that should never run
+    /// gives back more than the encoding saves.
+    /// </para>
+    /// <para>
+    /// Dropping the agent from the batch instead would mean removing one entry from the id array and one
+    /// from the data array. Those are parallel arrays, and a mistake there hands one agent another agent's
+    /// position - precisely the teleport this design exists to prevent. Keeping every agent in the batch
+    /// and marking the value makes that class of bug impossible rather than merely unlikely.
+    /// </para>
+    /// <para>
+    /// It must be a SET bit rather than a reserved zero, because protobuf omits a default-valued field
+    /// entirely. Zero is a legitimate position - the scene origin - so an unavailable marker of zero would
+    /// vanish off the wire and be read as 'standing at the origin'.
+    /// </para>
+    /// </remarks>
+    public const ulong PositionUnavailable = 1UL << 63;
+
+    /// <summary>True when a packed position carries no usable value.</summary>
+    public static bool IsPositionUnavailable(ulong packed) => (packed & PositionUnavailable) != 0UL;
+
+    /// <summary>Packs a position into 63 bits, or reports that it cannot be represented.</summary>
+    /// <remarks>
+    /// Refusing rather than clamping is a correctness decision, not caution. Clamping a genuinely distant
+    /// agent would place it at the boundary, potentially kilometres from where it really is, and
+    /// <c>AgentPositionInterpolator</c> TELEPORTS an agent whose reported position is more than six metres
+    /// away. Clamping would therefore cause the very teleport it appears to prevent. Reporting the value as
+    /// unavailable lets the receiver keep easing toward the last position it had reason to trust.
+    /// </remarks>
+    public static bool TryPackPosition(Vec3 value, out ulong packed)
+    {
+        packed = PositionUnavailable;
+
+        if (!IsFinite(value.x) || !IsFinite(value.y) || !IsFinite(value.z)) return false;
+
+        if (!TryToSteps(value.x, out long x) ||
+            !TryToSteps(value.y, out long y) ||
+            !TryToSteps(value.z, out long z))
+        {
+            return false;
+        }
+
+        packed = ((ulong)x & PositionMask)
+            | (((ulong)y & PositionMask) << PositionBits)
+            | (((ulong)z & PositionMask) << (PositionBits * 2));
+        return true;
+    }
+
+    /// <summary>Reads a packed position. False when the sentinel is set.</summary>
+    public static bool TryUnpackPosition(ulong packed, out Vec3 value)
+    {
+        if (IsPositionUnavailable(packed))
+        {
+            value = Vec3.Zero;
+            return false;
+        }
+
+        value = new Vec3(
+            FromSteps(packed),
+            FromSteps(packed >> PositionBits),
+            FromSteps(packed >> (PositionBits * 2)));
+        return true;
+    }
+
+    private static bool TryToSteps(float metres, out long steps)
+    {
+        steps = (long)Math.Round(metres * PositionScale, MidpointRounding.AwayFromZero);
+        return steps >= PositionMinSteps && steps <= PositionMaxSteps;
+    }
+
+    /// <remarks>
+    /// Sign-extends from the top bit of the lane before scaling. Without this a negative coordinate reads
+    /// back as a large positive one - the wrap that would put a soldier standing just behind the origin ten
+    /// kilometres in front of it, and the single most dangerous mistake available in this file.
+    /// </remarks>
+    private static float FromSteps(ulong lane)
+    {
+        long steps = (long)(lane & PositionMask);
+        if ((steps & (1L << PositionSignBit)) != 0L) steps -= 1L << PositionBits;
+
+        return steps / PositionScale;
+    }
+
+    private static bool IsFinite(float value) => !float.IsNaN(value) && !float.IsInfinity(value);
+
     /// <summary>Packs a two-component direction or input into 32 bits.</summary>
     public static uint PackVec2(Vec2 value)
     {

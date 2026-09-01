@@ -150,6 +150,9 @@ public class AgentActionHandler : IAgentActionHandler
 #endif
         Mission mission = Mission.Current;
         if (mission == null) return;
+#if DEBUG
+        ActionSendLog.Poll();
+#endif
 
         List<Guid> ids = null;
         List<AgentActionData> actions = null;
@@ -226,6 +229,17 @@ public class AgentActionHandler : IAgentActionHandler
         MissionActionDiagnostics.RecordPolledAgent(
             agent,
             actionSyncedAgent);
+#endif
+#if DEBUG
+        ActionSendLog.Visited();
+        if (!actionSyncedAgent)
+        {
+            ActionSendLog.NotSynced(
+                agent == null || agent.Mission == null,
+                agent != null && agent.Mission != null && !agent.IsActive(),
+                agent != null && agent.Mission != null && agent.IsActive() && agent.Health <= 0,
+                agent != null && agent.IsMount);
+        }
 #endif
         if (!actionSyncedAgent) return;
 
@@ -334,6 +348,16 @@ public class AgentActionHandler : IAgentActionHandler
             agent.GetCurrentActionType(1);
         bool action0Discrete = IsDiscreteAction(action0Type);
         bool action1Discrete = IsDiscreteAction(action1Type);
+#if DEBUG
+        // A swing the owner has just noticed on its OWN agent. Whether it reaches the wire is the question.
+        bool sendLogSwingChange =
+            (action1Changed && ActionSendLog.IsSwing((int)action1Type))
+            || (action0Changed && ActionSendLog.IsSwing((int)action0Type));
+        bool sendLogWindup =
+            (action1Changed && ActionSendLog.IsWindup((int)action1Type))
+            || (action0Changed && ActionSendLog.IsWindup((int)action0Type));
+        if (sendLogSwingChange) ActionSendLog.SwingChangeDetected(sendLogWindup);
+#endif
 
         // Native command actions are untyped, so recognize the main agent's order gesture by action name.
         if (agent == Mission.Current.MainAgent)
@@ -387,6 +411,9 @@ public class AgentActionHandler : IAgentActionHandler
             && !guardedMountStateChanged
             && !guardedControllerRoleChanged)
         {
+#if DEBUG
+            ActionSendLog.NothingChanged(sendLogSwingChange);
+#endif
             if (hadState)
             {
                 state.DefendFlags = defendFlags;
@@ -457,6 +484,9 @@ public class AgentActionHandler : IAgentActionHandler
             || guardedMountStateChanged
             || guardedControllerRoleChanged
             || discreteActionChanged;
+#if DEBUG
+        ActionSendLog.Decision(broadcast, sendLogSwingChange, sendLogWindup);
+#endif
         state.HasObservation = true;
         state.Action0 = action0;
         state.Action1 = action1;
@@ -663,6 +693,25 @@ public class AgentActionHandler : IAgentActionHandler
                     in collisionData));
         }
 
+#if DEBUG
+        // Scoped by construction: a blow only lands if the attacker was in contact, so this samples exactly
+        // the handful of agents fighting the player rather than averaging over hundreds of distant puppets.
+        if (HitTimingDiagnostics.Enabled && affectorAgent != null && !blow.IsMissile)
+        {
+            try
+            {
+                HitTimingDiagnostics.Record(
+                    !agentRegistry.IsLocallyControlled(affectorAgent),
+                    (int)affectorAgent.GetCurrentActionType(1),
+                    affectorAgent.GetCurrentActionProgress(1),
+                    isBlocked);
+            }
+            catch (Exception)
+            {
+                // A diagnostic must never take a battle down.
+            }
+        }
+#endif
         guardReactionHandler.ObserveBlockedHit(
             affectedAgent,
             affectorAgent,

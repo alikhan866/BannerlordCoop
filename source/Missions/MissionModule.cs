@@ -37,6 +37,7 @@ public class MissionModule : Module
     internal const string AgentVoicePatchCategory = "CoopAgentVoicePatches";
     internal const string WeaponDropPatchCategory = "CoopWeaponDropPatches";
     internal const string WeaponPickupPatchCategory = "CoopWeaponPickupPatches";
+    internal const string DamageSuppressionPatchCategory = "CoopDamageSuppressionPatches";
 
     protected override void Load(ContainerBuilder builder)
     {
@@ -276,6 +277,12 @@ public class MissionModule : Module
         yield return new HarmonyPatchCategoryRegistration(
             typeof(MeleeHitPresentationPatch).Assembly,
             CombatHitPresentationPatchCategory);
+        yield return new HarmonyPatchCategoryRegistration(
+            typeof(RegisterBlowPatch).Assembly,
+            DamageSuppressionPatchCategory);
+        // NOTE: uncategorized patches in this assembly are never installed - nothing calls
+        // PatchAllUncategorized on it, only the categories registered here - so a patch without a
+        // category compiles, deploys and silently does nothing.
         yield return new HarmonyPatchCategoryRegistration(
             typeof(AgentVoicePatch).Assembly,
             AgentVoicePatchCategory);

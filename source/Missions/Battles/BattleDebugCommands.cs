@@ -501,6 +501,93 @@ internal static class BattleDebugCommands
         }
     }
 
+    /// <summary>
+    /// Wind-up loss on remote attacks. Separate from animation_trace because that one's snapshot is a
+    /// 20,000-event timeline that blows the live-test message limit and cannot be pulled off a running battle;
+    /// this one stays small enough to read mid-fight.
+    /// </summary>
+    /// <summary>
+    /// Tick-by-tick animation state for the same agents on every client, so two recordings can be diffed.
+    /// Armed on demand rather than at battle start: the buffers are small and the interesting seconds are
+    /// whenever the player is actually in melee.
+    /// </summary>
+    [CommandLineArgumentFunction("timeline", "coop.debug.battle")]
+    public static string Timeline(List<string> args)
+    {
+        if (args.Count != 1)
+            return "Usage: coop.debug.battle.timeline <start|snapshot|stop|status>";
+
+        switch (args[0].ToLowerInvariant())
+        {
+            case "start":
+                AnimationTimeline.Start();
+                return "Animation timeline recording STARTED.";
+            case "snapshot":
+                return "BATTLE_TIMELINE " + AnimationTimeline.Snapshot(stop: false);
+            case "stop":
+                return "BATTLE_TIMELINE " + AnimationTimeline.Snapshot(stop: true);
+            case "status":
+                return "Animation timeline is "
+                    + (AnimationTimeline.Enabled ? "RECORDING." : "idle.");
+            default:
+                return "Usage: coop.debug.battle.timeline <start|snapshot|stop|status>";
+        }
+    }
+    [CommandLineArgumentFunction("windup", "coop.debug.battle")]
+    public static string Windup(List<string> args)
+    {
+        if (args.Count != 1)
+            return "Usage: coop.debug.battle.windup <start|snapshot|stop|status>";
+
+        switch (args[0].ToLowerInvariant())
+        {
+            case "start":
+                WindupDiagnostics.Start();
+                ActionDeliveryDiagnostics.Start();
+                ActionApplyTrace.Start();
+                MeleeSwingDiagnostics.Start();
+                GuardSyncDiagnostics.Start();
+                ActionWriteLog.Start();
+                HitTimingDiagnostics.Start();
+                ActionSendLog.Start();
+                GuardCommandEffectDiagnostics.Start();
+                DamageAttributionDiagnostics.Start();
+                ShieldImpactDiagnostics.Start();
+                HotPathCostDiagnostics.Start();
+                return "Remote attack wind-up and delivery measurement is ON.";
+            case "snapshot":
+                return "BATTLE_WINDUP " + WindupDiagnostics.Snapshot(stop: false)
+                    + "  ||  " + ActionDeliveryDiagnostics.Snapshot(stop: false)
+                    + "  ||  " + ActionApplyTrace.Snapshot(stop: false)
+                    + "  ||  " + MeleeSwingDiagnostics.Snapshot(stop: false)
+                    + "  ||  " + GuardSyncDiagnostics.Snapshot(stop: false)
+                    + "  ||  " + ActionWriteLog.Snapshot(stop: false)
+                    + "  ||  " + HitTimingDiagnostics.Snapshot(stop: false)
+                    + "  ||  " + ActionSendLog.Snapshot(stop: false)
+                    + "  ||  " + GuardCommandEffectDiagnostics.Snapshot(stop: false)
+                    + "  ||  " + DamageAttributionDiagnostics.Snapshot(stop: false)
+                    + "  ||  " + ShieldImpactDiagnostics.Snapshot(stop: false)
+                    + "  ||  " + HotPathCostDiagnostics.Snapshot(stop: false);
+            case "stop":
+                return "BATTLE_WINDUP " + WindupDiagnostics.Snapshot(stop: true)
+                    + "  ||  " + ActionDeliveryDiagnostics.Snapshot(stop: true)
+                    + "  ||  " + ActionApplyTrace.Snapshot(stop: true)
+                    + "  ||  " + MeleeSwingDiagnostics.Snapshot(stop: true)
+                    + "  ||  " + GuardSyncDiagnostics.Snapshot(stop: true)
+                    + "  ||  " + ActionWriteLog.Snapshot(stop: true)
+                    + "  ||  " + HitTimingDiagnostics.Snapshot(stop: true)
+                    + "  ||  " + ActionSendLog.Snapshot(stop: true)
+                    + "  ||  " + GuardCommandEffectDiagnostics.Snapshot(stop: true)
+                    + "  ||  " + DamageAttributionDiagnostics.Snapshot(stop: true)
+                    + "  ||  " + ShieldImpactDiagnostics.Snapshot(stop: true)
+                    + "  ||  " + HotPathCostDiagnostics.Snapshot(stop: true);
+            case "status":
+                return "Remote attack wind-up measurement is "
+                    + (WindupDiagnostics.Enabled ? "ON." : "OFF.");
+            default:
+                return "Usage: coop.debug.battle.windup <start|snapshot|stop|status>";
+        }
+    }
     [CommandLineArgumentFunction("animation_trace", "coop.debug.battle")]
     public static string AnimationTrace(List<string> args)
     {

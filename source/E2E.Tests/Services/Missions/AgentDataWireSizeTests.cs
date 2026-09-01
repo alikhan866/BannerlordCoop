@@ -24,6 +24,9 @@ namespace E2E.Tests.Services.Missions;
 /// so ordinary changes do not trip it, and low enough that quietly restoring a full-precision vector would.
 /// Before quantisation an agent cost about 57 bytes: a Vec3 surrogate is 15 and a Vec2 is 11, so four
 /// vectors and a float accounted for 52 of them.
+/// With directions, input, speed AND position all packed it is 31, and a stationary agent 18 - so a
+/// ceiling of 34 leaves room for ordinary change while a single restored full-precision Vec3, six bytes
+/// more, would trip it.
 /// </para>
 /// </remarks>
 public class AgentDataWireSizeTests
@@ -85,7 +88,7 @@ public class AgentDataWireSizeTests
         int size = SerializedSize(Typical());
         output.WriteLine($"foot agent update = {size} bytes");
 
-        Assert.True(size <= 40, $"a foot agent update grew to {size} bytes");
+        Assert.True(size <= 34, $"a foot agent update grew to {size} bytes");
     }
 
     /// <summary>
@@ -127,7 +130,7 @@ public class AgentDataWireSizeTests
 
         output.WriteLine($"stationary agent update = {size} bytes");
 
-        Assert.True(size <= 40, $"a stationary agent update grew to {size} bytes");
+        Assert.True(size <= 34, $"a stationary agent update grew to {size} bytes");
     }
 
     /// <summary>

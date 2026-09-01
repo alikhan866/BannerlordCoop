@@ -30,14 +30,31 @@ namespace Missions.Agents.Patches
         }
     }
 
+    /// <summary>
+    /// Stops this node applying a blow to an agent it does not own, so the hit can be routed to the owner
+    /// instead. BattleDamageRouter is written around this being live - it publishes the suppressed hit as a
+    /// BattlePuppetHit, and calls RunOriginalRegisterBlow with an AllowedThread purely to bypass this
+    /// prefix - but the class carried no patch category, and nothing calls PatchAllUncategorized on this
+    /// assembly, so it was never installed. Every node applied each hit locally AND received the routed
+    /// copy: damage landed twice, which reads in a battle as one side killing about twice as fast.
+    /// </summary>
     [HarmonyPatch(typeof(Agent), "RegisterBlow")]
+    [HarmonyPatchCategory(MissionModule.DamageSuppressionPatchCategory)]
     public class RegisterBlowPatch
     {
         private static bool Prefix(ref Agent __instance)
         {
-            if (AllowedThread.IsThisThreadAllowed()) return true;
+            bool onAllowedThread = AllowedThread.IsThisThreadAllowed();
+            bool victimIsLocal = !onAllowedThread && __instance.IsLocallyControlled();
+#if DEBUG
+            Missions.Diagnostics.DamageAttributionDiagnostics.RecordRegisterBlow(
+                onAllowedThread,
+                victimIsLocal);
+#endif
 
-            return __instance.IsLocallyControlled();
+            if (onAllowedThread) return true;
+
+            return victimIsLocal;
         }
 
         public static void RunOriginalRegisterBlow(Agent agent, Blow blow, AttackCollisionData collisionData)

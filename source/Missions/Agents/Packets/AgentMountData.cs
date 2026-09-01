@@ -69,7 +69,7 @@ namespace Missions.Agents.Packets
             mountLookDirectionPacked = MovementQuantizer.PackVec3(mountAgent.LookDirection);
             mountMovementDirectionPacked = MovementQuantizer.PackVec2(
                 mountAgent.GetMovementDirection());
-            MountPosition = mountAgent.Position;
+            MovementQuantizer.TryPackPosition(mountAgent.Position, out mountPositionPacked);
             MountMovementFlag = (uint)AgentData.GetLocomotionMovementFlags(
                 mountAgent.MovementFlags);
             MountMovementId = mountMovementId;
@@ -176,6 +176,9 @@ namespace Missions.Agents.Packets
                         MountAction1Index,
                         MountAction1Progress,
                         (AnimFlags)MountAction1Flag);
+#endif
+#if DEBUG
+                    ActionWriteLog.Record(ActionWriteLog.Source.MountAction, MountAction1Progress, restart: false);
 #endif
                     mountAgent.SetActionChannel(1, ActionIndexCache.Create(mActionName2), additionalFlags: (AnimFlags)MountAction1Flag, startProgress: MountAction1Progress);
                 }
@@ -521,8 +524,25 @@ namespace Missions.Agents.Packets
         [ProtoMember(4)]
         public int MountAction1Index { get; }
 
-        [ProtoMember(7)]
-        public Vec3 MountPosition { get; }
+        // Packed like the rider's position, and for the same reasons. This one carries more weight than it
+        // looks: a ridden mount's data travels NESTED inside its rider's AgentData, so in a cavalry battle
+        // nearly every agent on the wire pays for two positions rather than one.
+        [ProtoMember(7, DataFormat = DataFormat.FixedSize)]
+        private ulong mountPositionPacked;
+
+        /// <summary>The mount's position, or <see cref="Vec3.Zero"/> when this packet carries none.</summary>
+        /// <remarks>
+        /// Check <see cref="HasMountPosition"/> first. AgentPositionInterpolator uses this as the mount's
+        /// snap target, so a zero read as a real position would drag a horse to the scene origin.
+        /// </remarks>
+        public Vec3 MountPosition =>
+            MovementQuantizer.TryUnpackPosition(mountPositionPacked, out Vec3 position)
+                ? position
+                : Vec3.Zero;
+
+        /// <summary>False when the sender could not represent this mount's position.</summary>
+        public bool HasMountPosition =>
+            !MovementQuantizer.IsPositionUnavailable(mountPositionPacked);
         /// <summary>The mount's owner-scoped movement id, or zero when the horse is unregistered.</summary>
         [ProtoMember(8)]
         public ushort MountMovementId { get; }

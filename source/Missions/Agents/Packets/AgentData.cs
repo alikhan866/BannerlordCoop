@@ -82,7 +82,7 @@ namespace Missions.Agents.Packets
             float? mountAction0TurnProgress = null,
             bool? mountAction0IsSyntheticTurn = null)
         {
-            Position = agent.Position;
+            MovementQuantizer.TryPackPosition(agent.Position, out positionPacked);
             movementDirectionPacked = MovementQuantizer.PackVec2(agent.GetMovementDirection());
             lookDirectionPacked = MovementQuantizer.PackVec3(agent.LookDirection);
             inputVectorPacked = MovementQuantizer.PackVec2(agent.MovementInputVector);
@@ -137,7 +137,7 @@ namespace Missions.Agents.Packets
             AgentMountData mountData = null,
             uint movementFlag = 0)
         {
-            Position = position;
+            MovementQuantizer.TryPackPosition(position, out positionPacked);
             movementDirectionPacked = MovementQuantizer.PackVec2(movementDirection);
             lookDirectionPacked = MovementQuantizer.PackVec3(lookDirection);
             inputVectorPacked = MovementQuantizer.PackVec2(inputVector);
@@ -197,8 +197,34 @@ namespace Missions.Agents.Packets
                 : new Vec2(0f, throttle);
         }
 
-        [ProtoMember(1)]
-        public Vec3 Position { get; }
+        // Packed to 63 bits at 1 cm, with the top bit reserved to say the position is unusable. See
+        // MovementQuantizer for why the contingency lives inside the value rather than in a second field:
+        // a fallback Vec3 would make this struct BIGGER than it was before quantising, and dropping the
+        // agent from the batch instead risks misaligning the parallel id and data arrays, which would hand
+        // one agent another's position - the exact teleport this design exists to prevent.
+        [ProtoMember(1, DataFormat = DataFormat.FixedSize)]
+        private ulong positionPacked;
+
+        /// <summary>
+        /// The reported position, or <see cref="Vec3.Zero"/> when this packet carries none.
+        /// </summary>
+        /// <remarks>
+        /// ALWAYS check <see cref="HasPosition"/> before feeding this to anything that moves an agent.
+        /// Zero is a real place - the scene origin - so a caller that ignores the flag will quietly walk an
+        /// agent to the middle of the map instead of leaving it where it was.
+        /// </remarks>
+        public Vec3 Position =>
+            MovementQuantizer.TryUnpackPosition(positionPacked, out Vec3 position)
+                ? position
+                : Vec3.Zero;
+
+        /// <summary>False when the sender could not represent this agent's position.</summary>
+        /// <remarks>
+        /// Only reachable if a position is non-finite or further than about 10 km from the scene origin.
+        /// Neither should ever happen; the flag exists so that if one does, the receiver holds the last
+        /// position it trusted instead of being told something false.
+        /// </remarks>
+        public bool HasPosition => !MovementQuantizer.IsPositionUnavailable(positionPacked);
 
         // The four members below are stored quantised and exposed as vectors, so callers and tests are
         // unchanged while the wire carries a third fewer bytes. See MovementQuantizer for the precision

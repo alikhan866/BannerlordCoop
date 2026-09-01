@@ -66,6 +66,14 @@ public class AgentPositionInterpolator : IAgentPositionInterpolator
     // Exponential ease rate for the mounted-puppet position follow: fraction MountedFollowRate*dt of the gap is
     // closed each frame, so it tracks the owner with a small lag and settles when the owner stops.
     private const float MountedFollowRate = 12f;
+    /// <summary>
+    /// Raising this to let mounted puppets carry small drift under their own locomotion was TRIED AND
+    /// REVERTED. The theory was sound - TeleportToPosition moves an agent without locomotion, so the
+    /// engine sees a horse translating while standing still and plays the standing gait, which is the
+    /// sliding - but at 0.35m the position error more than doubled at the median (p50 0.14m -> 0.32m,
+    /// max 1.53m -> 2.05m) and the sliding did not improve (client puppets 7.6% -> 8.9%). The horse
+    /// needs the per-tick correction; skipping it just lets it drift.
+    /// </summary>
     private const float MountedPositionEpsilon = 0.0001f;
     private const float MountedGuardPositionTolerance = 0.15f;
     private readonly Dictionary<Agent, TargetFrame> _targets = new Dictionary<Agent, TargetFrame>();
@@ -84,11 +92,91 @@ public class AgentPositionInterpolator : IAgentPositionInterpolator
         this.agentRegistry = agentRegistry;
     }
 
+    /// <summary>
+    /// Keeps the last trusted position when a packet reports it cannot represent one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A movement packet carries position packed into 63 bits with a reserved bit meaning 'unusable'. The
+    /// sender sets it when a position is non-finite or beyond about 10 km from the scene origin - neither
+    /// of which should ever happen in a real mission.
+    /// </para>
+    /// <para>
+    /// If one does, the worst thing this class could do is believe it. AgentData.Position reads Vec3.Zero
+    /// in that case, and zero is a REAL place: the scene origin. Feeding it as a target would walk the agent
+    /// to the middle of the map, or - if it is far enough away - trip the snap distance below and teleport it
+    /// there outright. Holding the previous target instead leaves the agent moving as it was, and the stale
+    /// target logging further down reports it if the condition persists.
+    /// </para>
+    /// </remarks>
+    /// <summary>The position and time of the frame BEFORE the current one, per agent.</summary>
+    /// <remarks>
+    /// Two consecutive frames give the owner's velocity, which is what lets a puppet be aimed at where its
+    /// owner IS rather than where it was. Without it a puppet is told to walk to a stale position and, while
+    /// the owner keeps moving, never arrives: measured across 20,311 samples the drawn position trailed the
+    /// owner's by a mean of 0.41m, 1.08m at p90 and up to 3.33m. Melee reach is about 2m, so a legitimate
+    /// blow could appear to land from over three metres away.
+    /// </remarks>
+    private readonly Dictionary<Agent, PreviousFrame> _previousTargets = new Dictionary<Agent, PreviousFrame>();
+
+    private readonly struct PreviousFrame
+    {
+        public PreviousFrame(Vec3 position, float updatedAt)
+        {
+            Position = position;
+            UpdatedAt = updatedAt;
+        }
+
+        public Vec3 Position { get; }
+        public float UpdatedAt { get; }
+    }
+
+    private void StoreTarget(Agent agent, TargetFrame frame)
+    {
+        if (agent == null) return;
+        if (_targets.TryGetValue(agent, out TargetFrame previous))
+            _previousTargets[agent] = new PreviousFrame(previous.Position, previous.UpdatedAt);
+        _targets[agent] = frame;
+    }
+    private bool TryResolveTargetPosition(Agent agent, bool hasPosition, Vec3 reported, out Vec3 position)
+    {
+        if (hasPosition)
+        {
+            position = reported;
+            return true;
+        }
+
+        unusablePositionReports++;
+
+        // Keep walking toward the last position we had reason to trust.
+        if (agent != null && _targets.TryGetValue(agent, out TargetFrame existing))
+        {
+            position = existing.Position;
+            return true;
+        }
+
+        // Nothing trustworthy has ever arrived for this agent, so there is nothing to hold on to. Refusing
+        // the update leaves the agent where the engine already has it, which is the only safe answer.
+        position = Vec3.Zero;
+        return false;
+    }
+
+    /// <summary>How many packets arrived without a usable position. Reported by the battle census.</summary>
+    /// <remarks>
+    /// Non-zero means the coordinate range assumption is wrong, or something upstream is producing
+    /// non-finite positions. Either is worth knowing from a log line rather than from a player noticing.
+    /// </remarks>
+    public long UnusablePositionReports => unusablePositionReports;
+
+    private long unusablePositionReports;
     public void SetRiderTarget(Agent agent, AgentData data)
     {
         if (agent == null) return;
-        _targets[agent] = new TargetFrame(
-            data.Position,
+        if (!TryResolveTargetPosition(agent, data.HasPosition, data.Position, out Vec3 riderPosition))
+            return;
+
+        StoreTarget(agent, new TargetFrame(
+            riderPosition,
             new ContinuousState(
                 data.MovementDirection,
                 data.LookDirection,
@@ -98,34 +186,39 @@ public class AgentPositionInterpolator : IAgentPositionInterpolator
             Vec3.Zero,
             default,
             updatedAt: elapsed,
-            updateSequence: GetNextUpdateSequence());
+            updateSequence: GetNextUpdateSequence()));
     }
 
     public void SetMountedRiderTarget(Agent agent, AgentData data)
     {
         if (agent == null || data.MountData == null) return;
-        _targets[agent] = new TargetFrame(
-            data.Position,
+        if (!TryResolveTargetPosition(agent, data.HasPosition, data.Position, out Vec3 mountedPosition))
+            return;
+
+        StoreTarget(agent, new TargetFrame(
+            mountedPosition,
             new ContinuousState(
                 data.MountData.MountMovementDirection,
                 data.MountData.MountLookDirection,
                 data.MountData.GetMovementInput(),
                 data.MountData.GetMovementFlags()),
-            hasMountSnapPosition: true,
-            data.MountData.MountPosition,
+            // An unusable mount position must not advertise itself as a snap target: FollowMounted would
+            // ease the horse straight to the scene origin.
+            hasMountSnapPosition: data.MountData.HasMountPosition,
+            data.MountData.HasMountPosition ? data.MountData.MountPosition : Vec3.Zero,
             new ContinuousState(
                 data.MovementDirection,
                 data.LookDirection,
                 data.GetMovementInput(agent),
                 data.MovementFlag),
             elapsed,
-            GetNextUpdateSequence());
+            GetNextUpdateSequence()));
     }
 
     public void SetMountTarget(Agent mountAgent, AgentMountData data)
     {
         if (mountAgent == null) return;
-        _targets[mountAgent] = new TargetFrame(
+        StoreTarget(mountAgent, new TargetFrame(
             data.MountPosition,
             new ContinuousState(
                 data.MountMovementDirection,
@@ -136,7 +229,7 @@ public class AgentPositionInterpolator : IAgentPositionInterpolator
             Vec3.Zero,
             default,
             updatedAt: elapsed,
-            updateSequence: GetNextUpdateSequence());
+            updateSequence: GetNextUpdateSequence()));
     }
 
     public void SetMountedRiderTarget(
@@ -148,14 +241,14 @@ public class AgentPositionInterpolator : IAgentPositionInterpolator
     {
         if (agent == null) return;
         Agent mount = agent.MountAgent;
-        _targets[agent] = new TargetFrame(
+        StoreTarget(agent, new TargetFrame(
             targetPosition,
             ContinuousState.Capture(mount, mountMovementDirection),
             hasMountSnapPosition: true,
             mountSnapPosition,
             ContinuousState.Capture(agent, riderMovementDirection),
             elapsed,
-            GetNextUpdateSequence());
+            GetNextUpdateSequence()));
     }
 
     public void Forget(Agent agent)
@@ -323,6 +416,7 @@ public class AgentPositionInterpolator : IAgentPositionInterpolator
             {
                 _targets.Remove(agent);
                 _mountedGuardProcessedSequences.Remove(agent);
+                _previousTargets.Remove(agent);
             }
             _evict.Clear();
         }
@@ -384,12 +478,140 @@ public class AgentPositionInterpolator : IAgentPositionInterpolator
             sampleTarget.Position,
             sampleTarget.UpdateSequence);
     }
-    private static void MoveTowardTarget(Agent agent, TargetFrame target)
+    /// <summary>Furthest a puppet may be aimed beyond its reported position, in metres.</summary>
+    /// <remarks>
+    /// Dead reckoning is only worth as much as the frame it is derived from. A dropped or reordered
+    /// update can make two frames look like a huge jump, and multiplying that by the target's age would
+    /// fling the agent. Capped well inside the 6m snap distance so the worst case is a puppet slightly
+    /// ahead of itself rather than one thrown across the field.
+    /// </remarks>
+    private const float MaximumLeadDistance = 1f;
+
+    /// <summary>Fastest believable ground speed; anything above this is a bad frame, not a sprint.</summary>
+    private const float MaximumLeadSpeed = 12f;
+
+    /// <summary>Frame gaps outside this range cannot give a trustworthy velocity.</summary>
+    private const float MinimumLeadInterval = 0.02f;
+    private const float MaximumLeadInterval = 0.5f;
+
+    /// <summary>Ignore jitter: below this the puppet is standing still and leading it would wobble it.</summary>
+    private const float MinimumLeadSpeed = 0.4f;
+
+    private long deadReckonedMoves;
+    private long plainMoves;
+    private double leadDistanceSum;
+
+    /// <summary>How often the lead below was applied, and how far it reached. Read by the battle census.</summary>
+    public long DeadReckonedMoves => deadReckonedMoves;
+    public long PlainMoves => plainMoves;
+    public double MeanLeadDistance => deadReckonedMoves == 0 ? 0 : leadDistanceSum / deadReckonedMoves;
+
+    /// <summary>
+    /// Aim at where the owner IS, not where it was when the frame was sent.
+    /// </summary>
+    /// <remarks>
+    /// The puppet walks to this position under its own locomotion, so pointing it at a stale position
+    /// leaves it permanently chasing while the owner keeps moving. Leading by the owner's velocity times
+    /// the age of the frame cancels that trail. Every input is checked first - a bad frame simply falls
+    /// back to the reported position, which is the previous behaviour.
+    /// </remarks>
+    private Vec3 ResolveSeekPosition(Agent agent, TargetFrame target)
     {
-        Vec2 targetPosition = target.Position.AsVec2;
+#if DEBUG
+        // Measuring the measurement: this runs once per MOVING PUPPET PER TICK - about 3,000 times a
+        // second in a full battle - so it must not exist at all in a shipping build.
+        long costStart = Missions.Diagnostics.HotPathCostDiagnostics.Now();
+        try
+        {
+            return ResolveSeekPositionCore(agent, target);
+        }
+        finally
+        {
+            Missions.Diagnostics.HotPathCostDiagnostics.AddDeadReckon(costStart);
+        }
+#else
+        return ResolveSeekPositionCore(agent, target);
+#endif
+    }
+
+    private Vec3 ResolveSeekPositionCore(Agent agent, TargetFrame target)
+    {
+        if (!_previousTargets.TryGetValue(agent, out PreviousFrame previous))
+        {
+            plainMoves++;
+            return target.Position;
+        }
+
+        float interval = target.UpdatedAt - previous.UpdatedAt;
+        if (interval < MinimumLeadInterval || interval > MaximumLeadInterval)
+        {
+            plainMoves++;
+            return target.Position;
+        }
+
+        if (!TryComputeLead(
+                target.Position - previous.Position,
+                interval,
+                elapsed - target.UpdatedAt,
+                out Vec3 lead))
+        {
+            plainMoves++;
+            return target.Position;
+        }
+
+        deadReckonedMoves++;
+        leadDistanceSum += lead.Length;
+        return target.Position + lead;
+    }
+
+    /// <summary>
+    /// How far ahead of its reported position a puppet should be aimed, given the owner's last step.
+    /// </summary>
+    /// <remarks>
+    /// Pure so the guards can be tested. Every one of them exists to make a bad frame harmless: a
+    /// nonsensical interval, an impossible speed, a stale age or an over-long lead all fall back to
+    /// aiming at the reported position, which is the behaviour this replaced.
+    /// </remarks>
+    internal static bool TryComputeLead(Vec3 travelled, float interval, float age, out Vec3 lead)
+    {
+        lead = Vec3.Zero;
+
+        if (float.IsNaN(interval) || interval < MinimumLeadInterval || interval > MaximumLeadInterval)
+            return false;
+        if (float.IsNaN(age) || age <= 0f || age > MaximumLeadInterval)
+            return false;
+
+        float distance = travelled.Length;
+        if (float.IsNaN(distance) || float.IsInfinity(distance)) return false;
+
+        float speed = distance / interval;
+        if (speed < MinimumLeadSpeed || speed > MaximumLeadSpeed) return false;
+
+        // Never lead more than ONE update period. If updates are irregular, age can be several times
+        // the interval, and multiplying a whole step by that invents a position the owner never
+        // occupied. Measured with the ratio unclamped the median improved but the tail got worse:
+        // p99 1.57m -> 2.76m and max 3.33m -> 6.08m, past the snap distance, so puppets began
+        // teleporting. The tail is what makes a blow look like it landed from out of reach, so it is
+        // the half that must not regress.
+        float ratio = age / interval;
+        if (ratio > 1f) ratio = 1f;
+        Vec3 candidate = travelled * ratio;
+        float leadDistance = candidate.Length;
+        if (float.IsNaN(leadDistance) || float.IsInfinity(leadDistance)) return false;
+        if (leadDistance > MaximumLeadDistance)
+            candidate *= MaximumLeadDistance / leadDistance;
+
+        lead = candidate;
+        return true;
+    }
+
+    private void MoveTowardTarget(Agent agent, TargetFrame target)
+    {
+        Vec3 seek = ResolveSeekPosition(agent, target);
+        Vec2 targetPosition = seek.AsVec2;
         Vec3 targetDirection = ResolveDirection(
             agent,
-            target.Position,
+            seek,
             target.AgentState.MovementDirection);
         agent.SetTargetPositionAndDirection(in targetPosition, in targetDirection);
     }
@@ -477,7 +699,7 @@ public class AgentPositionInterpolator : IAgentPositionInterpolator
         return new Vec3(direction.X, direction.Y, 0f);
     }
 
-    private static void Teleport(Agent agent, TargetFrame target)
+    private void Teleport(Agent agent, TargetFrame target)
     {
         var lookDirection = agent.LookDirection;
         var movementDirection = agent.GetMovementDirection();

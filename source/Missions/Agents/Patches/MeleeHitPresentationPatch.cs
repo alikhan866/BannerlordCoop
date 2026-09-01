@@ -33,6 +33,10 @@ public static class MeleeHitPresentationPatch
 
         if (collisionData.AttackBlockedWithShield)
         {
+#if DEBUG
+            Missions.Diagnostics.ShieldImpactDiagnostics.BlockedSeen();
+            Missions.Diagnostics.ShieldImpactDiagnostics.Published();
+#endif
             Publish(
                 victim,
                 MeleeHitPresentationKind.ShieldImpact,
