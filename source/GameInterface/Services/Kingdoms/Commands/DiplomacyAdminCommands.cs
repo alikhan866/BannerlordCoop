@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Text;
 using Common;
@@ -87,12 +87,12 @@ public static class DiplomacyAdminCommands
         return $"Ended alliance.\n  before: {before}\n  after:  {after}";
     }
 
-    [CommandLineArgumentFunction("join_kingdom", "coop.debug.clan")]
+    [CommandLineArgumentFunction("join_kingdom", "coop.debug.kingdom")]
     public static string JoinKingdom(List<string> args)
     {
         if (ModInformation.IsClient) return "Command can only be run on the server.";
         if (args.Count < 2 || args.Count > 5)
-            return "Usage: coop.debug.clan.join_kingdom <clanId> <kingdomId> [gold] [relation] [scan]";
+            return "Usage: coop.debug.kingdom.join_kingdom <clanId> <kingdomId> [gold] [relation] [scan]";
 
         if (ContainerProvider.TryResolve<IObjectManager>(out var objectManager) == false)
             return "Unable to resolve the ObjectManager.";

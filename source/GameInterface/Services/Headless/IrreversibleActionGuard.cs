@@ -1,4 +1,4 @@
-using Common.Logging;
+﻿using Common.Logging;
 using Serilog;
 using System;
 using System.Collections.Generic;
@@ -45,6 +45,7 @@ namespace GameInterface.Services.Headless
             "clan.change_clan_kingdom",
             "clan.change_clan_leader",
             "clan.join_kingdom",
+            "kingdom.join_kingdom",
             "clan.leave_kingdom",
             "romance.marry",
             "romance.divorce",
@@ -57,6 +58,13 @@ namespace GameInterface.Services.Headless
             "player_captivity.capture_player",
             "mobileparty.destroyParty",
             "mobileparty.destroyAllBanditParties",
+            // The migrated command classes use snake_case prefixes and names; the entries above keep the old spellings.
+            "mobile_party.declare_war",
+            "mobile_party.destroy_party",
+            "mobile_party.destroy_all_bandit_parties",
+            "hero.create_hero",
+            "settlement_component.set_owner",
+            "settlements.set_owner_clan",
         };
 
         private static readonly object Gate = new object();

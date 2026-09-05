@@ -1,4 +1,5 @@
 ﻿using Common;
+using Common.Commands;
 using Common.Messaging;
 using Common.Network;
 using Coop.Core.Client.Services.MobileParties.Messages;
@@ -668,8 +669,8 @@ public class VillageHostileActionTests : MapEventTestBase
             .Append(AccessTools.Method(typeof(GameMenu), nameof(GameMenu.SwitchToMenu), new[] { typeof(string) }))
             .Append(AccessTools.Method(
                 typeof(E2E.Tests.Environment.TestNetworkRouter),
-                nameof(E2E.Tests.Environment.TestNetworkRouter.SendAll),
-                new[] { typeof(LiteNetLib.NetPeer), typeof(IMessage) }))
+                nameof(E2E.Tests.Environment.TestNetworkRouter.SendReliablePayload),
+                new[] { typeof(LiteNetLib.NetPeer), typeof(LiteNetLib.NetPeer), typeof(byte[]) }))
             .ToList();
 
         client.NetworkSentMessages.Clear();
@@ -1460,8 +1461,11 @@ public class VillageHostileActionTests : MapEventTestBase
 
             client.Call(() =>
             {
-                var result = RaidDebugCommands.AllowRaidAiIntervention(new List<string> { "off" });
-                Assert.Contains("server update requested", result);
+                var command = new RaidDebugCommands.AllowRaidAiInterventionCoopCommand();
+                CoopCommandResult result = command.ProcessCommand(
+                    new CoopCommandArgsFactory().FromValues(new[] { "off" }));
+                Assert.True(result.Succeeded);
+                Assert.Contains("server update requested", result.Output);
             });
 
             var request = client.NetworkSentMessages.GetMessages<NetworkRequestRaidAiInterventionConfigChange>().Single();
@@ -1746,12 +1750,12 @@ public class VillageHostileActionTests : MapEventTestBase
         var disabledMethods = MapEventDisabledMethods
             .Append(AccessTools.Method(typeof(GameMenu), nameof(GameMenu.ActivateGameMenu), new[] { typeof(string) }))
             .Append(AccessTools.Method(typeof(GameMenu), nameof(GameMenu.SwitchToMenu), new[] { typeof(string) }))
-            // The E2E router delivers SendAll synchronously. Keep the outgoing request recorded, but avoid
+            // The E2E router delivers reliable payloads synchronously. Keep the outgoing request recorded, but avoid
             // server-side map-event mutation while native JoinBattleInternal is still building local state.
             .Append(AccessTools.Method(
                 typeof(E2E.Tests.Environment.TestNetworkRouter),
-                nameof(E2E.Tests.Environment.TestNetworkRouter.SendAll),
-                new[] { typeof(LiteNetLib.NetPeer), typeof(IMessage) }))
+                nameof(E2E.Tests.Environment.TestNetworkRouter.SendReliablePayload),
+                new[] { typeof(LiteNetLib.NetPeer), typeof(LiteNetLib.NetPeer), typeof(byte[]) }))
             .ToList();
 
         client.Call(() =>
@@ -1971,6 +1975,9 @@ public class VillageHostileActionTests : MapEventTestBase
 
             Assert.True(Server.NetworkSentMessages.GetMessages<NetworkBattleStartReply>().Single().Accepted);
             Assert.Equal(raidMapEventId, Server.NetworkSentMessages.GetMessages<NetworkStartAttackMission>().Single().MapEventId);
+
+            foreach (var instance in Clients)
+                instance.PumpGameThread();
         }
         finally
         {
@@ -2071,8 +2078,8 @@ public class VillageHostileActionTests : MapEventTestBase
             .Append(AccessTools.Method(typeof(GameMenu), nameof(GameMenu.SwitchToMenu), new[] { typeof(string) }))
             .Append(AccessTools.Method(
                 typeof(E2E.Tests.Environment.TestNetworkRouter),
-                nameof(E2E.Tests.Environment.TestNetworkRouter.SendAll),
-                new[] { typeof(LiteNetLib.NetPeer), typeof(IMessage) }))
+                nameof(E2E.Tests.Environment.TestNetworkRouter.SendReliablePayload),
+                new[] { typeof(LiteNetLib.NetPeer), typeof(LiteNetLib.NetPeer), typeof(byte[]) }))
             .ToList();
 
         client.NetworkSentMessages.Clear();
@@ -2204,6 +2211,9 @@ public class VillageHostileActionTests : MapEventTestBase
             Assert.Equal(
                 raidMapEventId,
                 Server.NetworkSentMessages.GetMessages<NetworkStartAttackMission>().Single().MapEventId);
+
+            foreach (var instance in Clients)
+                instance.PumpGameThread();
         }
         finally
         {

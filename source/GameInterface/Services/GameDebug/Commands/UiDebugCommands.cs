@@ -1,4 +1,5 @@
-﻿using Common;
+﻿using Common.Commands;
+using Common;
 using Common.Logging;
 using Common.Util;
 using GameInterface.Services.Settlements.Interfaces;
@@ -9,7 +10,6 @@ using Serilog;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
-using System.Linq;
 using TaleWorlds.CampaignSystem;
 using TaleWorlds.CampaignSystem.Encounters;
 using TaleWorlds.CampaignSystem.GameState;
@@ -19,6 +19,7 @@ using TaleWorlds.Core;
 using TaleWorlds.Engine;
 using TaleWorlds.Library;
 using static TaleWorlds.Library.CommandLineFunctionality;
+using System.Linq;
 
 namespace GameInterface.Services.GameDebug.Commands;
 
@@ -28,34 +29,389 @@ namespace GameInterface.Services.GameDebug.Commands;
 /// </summary>
 internal class UiDebugCommands
 {
+    private static CoopCommandResult Succeeded(string output) =>
+        new CoopCommandResult(true, output);
+
+    private static CoopCommandResult Failed(string output) =>
+        new CoopCommandResult(false, output, "command_failed");
+
     public static readonly ILogger Logger = LogManager.GetLogger<UiDebugCommands>();
 
-    private const string CloseScreenUsage =
-@"Usage:
-  coop.debug.ui.close_screen
-
-Exits the current game menu (GameMenu.ExitToLast). Use to dismiss a post-battle encounter screen left open.";
-
-    [CommandLineArgumentFunction("close_screen", "coop.debug.ui")]
-    public static string CloseScreen(List<string> args)
+    public sealed class UiCloseScreenCoopCommand : ICoopCommand
     {
-        var ctx = new CommandContext("close_screen", CloseScreenUsage, args);
-        if (!ctx.RequireArgCount(0, out var error))
-            return error;
+        public string Prefix => "coop.debug.ui";
 
-        if (Campaign.Current == null)
-            return "Failed: no active campaign.";
+        public string Name => "close_screen";
 
-        try
+        public string Description => "Runs the close screen debug operation.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
         {
-            GameMenu.ExitToLast();
+            if (Campaign.Current == null)
+                return Failed("Failed: no active campaign.");
+
+            try
+            {
+                GameMenu.ExitToLast();
+            }
+            catch (Exception ex)
+            {
+                return Failed(CommandHelpers.FormatException("Close screen", ex));
+            }
+
+            return Succeeded("Called GameMenu.ExitToLast().");
         }
-        catch (Exception ex)
+    }
+
+    public sealed class UiPrepareEvidenceMapCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.ui";
+
+        public string Name => "prepare_evidence_map";
+
+        public string Description => "Runs the prepare evidence map debug operation.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
         {
-            return CommandHelpers.FormatException("Close screen", ex);
+            if (ModInformation.IsServer)
+                return Failed("Run this command on a client.");
+
+
+            MapScreen mapScreen = MapScreen.Instance;
+            if (mapScreen == null)
+                return Failed("Campaign map screen is unavailable.");
+
+            try
+            {
+                // Hide only the client presentation; keep the saved encounter and map event unchanged.
+                if (mapScreen.IsInMenu)
+                {
+                    mapScreen._latestMenuContext = null;
+                    mapScreen.ExitMenuContext();
+                }
+                mapScreen.RemoveEncounterOverlay();
+            }
+            catch (Exception ex)
+            {
+                return Failed(CommandHelpers.FormatException("Prepare evidence map", ex));
+            }
+
+            return Succeeded(GetEvidenceMapState(mapScreen));
+        }
+    }
+
+    public sealed class UiEvidenceMapStateCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.ui";
+
+        public string Name => "evidence_map_state";
+
+        public string Description => "Reports evidence map state.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (ModInformation.IsServer)
+                return Failed("Run this command on a client.");
+
+
+            MapScreen mapScreen = MapScreen.Instance;
+            if (mapScreen == null)
+                return Failed("Campaign map screen is unavailable.");
+
+            return Succeeded(GetEvidenceMapState(mapScreen));
+        }
+    }
+
+    private static string GetEvidenceMapState(MapScreen mapScreen)
+    {
+        var cameraView = mapScreen.MapCameraView;
+        PartyBase cameraFollowParty = Campaign.Current?.CameraFollowParty;
+        string cameraFollowPartyId = cameraFollowParty?.MobileParty?.StringId ?? "null";
+        string cameraMode = cameraView?.CurrentCameraFollowMode.ToString() ?? "null";
+        bool followTargetReached = false;
+        if (cameraView != null && cameraFollowParty != null)
+        {
+            var followPosition = cameraFollowParty.MapEvent?.Position ?? cameraFollowParty.Position;
+            var targetDelta = followPosition.ToVec2() - cameraView._cameraTarget.AsVec2;
+            followTargetReached = targetDelta.LengthSquared < 0.0001f;
         }
 
-        return "Called GameMenu.ExitToLast().";
+        return $"menuView={mapScreen.IsInMenu} " +
+               $"pendingMenuView={mapScreen._latestMenuContext != null} " +
+               $"encounterOverlay={mapScreen._encounterOverlay != null} " +
+               $"cameraFollowParty={cameraFollowPartyId} " +
+               $"cameraMode={cameraMode} " +
+               $"followTargetReached={followTargetReached} " +
+               $"animation={cameraView?.CameraAnimationInProgress} " +
+               $"fastMove={cameraView?._doFastCameraMovementToTarget} " +
+               $"loading={LoadingWindow.IsLoadingWindowActive}";
+    }
+
+    public sealed class UiLeaveSettlementEncounterCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.ui";
+
+        public string Name => "leave_settlement_encounter";
+
+        public string Description => "Runs the leave settlement encounter debug operation.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (ModInformation.IsServer)
+                return Failed("Run this command on a client.");
+
+
+            if (Campaign.Current == null)
+                return Failed("Failed: no active campaign.");
+
+            var mainParty = MobileParty.MainParty;
+            if (mainParty == null)
+                return Failed("Failed: no main party.");
+
+            if (PlayerEncounter.Battle != null || mainParty.MapEvent != null)
+                return Failed("Cannot leave the settlement encounter after a battle has started.");
+
+            if (PlayerEncounter.Current == null || PlayerEncounter.EncounterSettlement == null)
+                return Failed("No active settlement encounter to leave.");
+
+            if (!ContainerProvider.TryResolve<ISettlementInterface>(out var settlementInterface))
+                return Failed("Unable to resolve the settlement interface.");
+
+            try
+            {
+                using (new AllowedThread())
+                    settlementInterface.EndSettlementEncounter();
+            }
+            catch (Exception ex)
+            {
+                return Failed(CommandHelpers.FormatException("Leave settlement encounter", ex));
+            }
+
+            return Succeeded("Cleared the local settlement encounter and returned to the campaign map.");
+        }
+    }
+
+#if DEBUG
+    public sealed class UiMapClickOffsetCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.ui";
+
+        public string Name => "map_click_offset";
+
+        public string Description => "Runs the map click offset debug operation.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("offset_x", "The horizontal map offset.", isRequired: true),
+            new ExpectedArgs("offset_y", "The vertical map offset.", isRequired: true),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (ModInformation.IsServer)
+                return Failed("Run this command on a client.");
+            if (!float.TryParse(args[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var offsetX) ||
+                !float.TryParse(args[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var offsetY))
+                return Failed("Offsets must be valid numbers.");
+
+            var mapScreen = MapScreen.Instance;
+            var mainParty = MobileParty.MainParty;
+            if (mapScreen == null || mainParty == null)
+                return Failed("Failed: campaign map or main party is unavailable.");
+            if (PlayerEncounter.Current != null || mainParty.CurrentSettlement != null)
+                return Failed("Leave the active settlement encounter before clicking the campaign map.");
+            if (mainParty.MapEvent != null)
+                return Failed("Cannot click-to-move while the main party is in a map event.");
+
+            var current = mainParty.Position;
+            var offsets = new[]
+            {
+                new Vec2(offsetX, offsetY),
+                new Vec2(-offsetY, offsetX),
+                new Vec2(-offsetX, -offsetY),
+                new Vec2(offsetY, -offsetX),
+            };
+            CampaignVec2 target = default;
+            bool targetFound = false;
+            foreach (var offset in offsets)
+            {
+                var candidate = new CampaignVec2(
+                    new Vec2(current.X + offset.x, current.Y + offset.y),
+                    current.IsOnLand);
+                if (!candidate.Face.IsValid() ||
+                    !mapScreen.MapScene.DoesPathExistBetweenFaces(
+                        candidate.Face.FaceIndex,
+                        mainParty.CurrentNavigationFace.FaceIndex,
+                        false))
+                    continue;
+
+                target = candidate;
+                targetFound = true;
+                break;
+            }
+            if (!targetFound)
+                return Failed("No nearby navigable map-click target was found.");
+
+            mapScreen.HandleLeftMouseButtonClick(null, target, target.Face, false);
+
+            return Succeeded($"Issued a real campaign-map click from {current.X:R},{current.Y:R} " +
+                $"to {target.X:R},{target.Y:R}; time={Campaign.Current.TimeControlMode}; " +
+                $"behavior={mainParty.DefaultBehavior}; target={mainParty.TargetPosition.X:R},{mainParty.TargetPosition.Y:R}.");
+        }
+    }
+
+    public sealed class UiMapMovementStateCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.ui";
+
+        public string Name => "map_movement_state";
+
+        public string Description => "Reports map movement state.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (ModInformation.IsServer)
+                return Failed("Run this command on a client.");
+
+            var mainParty = MobileParty.MainParty;
+            if (mainParty == null || Campaign.Current == null)
+                return Failed("Failed: no active campaign or main party.");
+
+            return Succeeded($"position={mainParty.Position.X:R},{mainParty.Position.Y:R}|" +
+                $"target={mainParty.TargetPosition.X:R},{mainParty.TargetPosition.Y:R}|" +
+                $"behavior={mainParty.DefaultBehavior}|" +
+                $"settlement={mainParty.CurrentSettlement?.StringId ?? "none"}|" +
+                $"encounter={PlayerEncounter.EncounterSettlement?.StringId ?? "none"}|" +
+                $"time={Campaign.Current.TimeControlMode}");
+        }
+    }
+#endif
+
+    public sealed class UiSwitchMenuCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.ui";
+
+        public string Name => "switch_menu";
+
+        public string Description => "Runs the switch menu debug operation.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("menu_id", "The game menu id.", isRequired: true),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (ModInformation.IsServer)
+                return Failed("Run this command on a client.");
+
+
+            if (Campaign.Current == null)
+                return Failed("Failed: no active campaign.");
+
+            try
+            {
+                GameMenu.SwitchToMenu(args[0]);
+            }
+            catch (Exception ex)
+            {
+                return Failed(CommandHelpers.FormatException("Switch menu", ex));
+            }
+
+            return Succeeded($"Switched to game menu {args[0]}.");
+        }
+    }
+
+    public sealed class UiPopStateCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.ui";
+
+        public string Name => "pop_state";
+
+        public string Description => "Reports pop state.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+
+            TaleWorlds.Core.GameState activeState = Game.Current?.GameStateManager?.ActiveState;
+            if (activeState == null)
+                return Failed("Failed: no active game state.");
+
+            if (activeState is MapState)
+                return Failed("Active state is already MapState.");
+
+            Game.Current.GameStateManager.PopState();
+            return Succeeded($"Queued pop for {activeState.GetType().Name}.");
+        }
+    }
+
+    public sealed class UiActiveStateCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.ui";
+
+        public string Name => "active_state";
+
+        public string Description => "Reports active state.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+
+            return Succeeded(Game.Current?.GameStateManager?.ActiveState?.GetType().Name ?? "none");
+        }
+    }
+
+    public sealed class UiLoadingWindowStateCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.ui";
+
+        public string Name => "loading_window_state";
+
+        public string Description => "Reports loading window state.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+
+            return Succeeded($"Loading window: {(LoadingWindow.IsLoadingWindowActive ? "ACTIVE" : "INACTIVE")}.");
+        }
+    }
+
+    public sealed class UiSavingOverlayStateCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.ui";
+
+        public string Name => "saving_overlay_state";
+
+        public string Description => "Reports saving overlay state.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = Array.Empty<IExpectedArgs>();
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+
+            var dataSource = MapScreen.Instance?
+                .GetMapView<GauntletMapSaveView>()?
+                ._dataSource;
+            if (dataSource == null)
+                return Failed("Saving overlay: UNAVAILABLE.");
+
+            return Succeeded($"Saving overlay: {(dataSource.IsActive ? "ACTIVE" : "INACTIVE")}.");
+        }
     }
 
     /// <summary>
@@ -70,34 +426,47 @@ Exits the current game menu (GameMenu.ExitToLast). Use to dismiss a post-battle 
     /// Not a mock: routing through the real API is the entire point. A test that called PopupCapture.Record
     /// directly would prove only that a list can hold an item.
     /// </remarks>
-    [CommandLineArgumentFunction("raise_test_popup", "coop.debug.ui")]
-    public static string RaiseTestPopup(List<string> args)
+    public sealed class RaiseTestPopupCoopCommand : ICoopCommand
     {
-        string kind = args.Count == 0 ? "inquiry" : args[0].ToLowerInvariant();
+        public string Prefix => "coop.debug.ui";
 
-        switch (kind)
+        public string Name => "raise_test_popup";
+
+        public string Description => "Raises a real popup through the engine's own entry point, to prove the capture intercepts it.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
         {
-            case "inquiry":
-                InformationManager.ShowInquiry(new InquiryData(
-                    "Rig self-test",
-                    "Raised by coop.debug.ui.raise_test_popup to prove popup capture.",
-                    true, true,
-                    "Accept", "Decline",
-                    null, null));
-                return "Raised an inquiry. Check coop.debug.ui.popup_log.";
+            new ExpectedArgs("kind", "inquiry (default), quick or message.", false),
+        };
 
-            case "quick":
-                MBInformationManager.AddQuickInformation(
-                    new TaleWorlds.Localization.TextObject("Rig self-test quick information."));
-                return "Raised a quick information message. Check coop.debug.ui.popup_log.";
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            string kind = (args.ElementAtOrDefault(0) ?? "inquiry").ToLowerInvariant();
 
-            case "message":
-                InformationManager.DisplayMessage(
-                    new InformationMessage("Rig self-test campaign message."));
-                return "Raised a campaign message. Check coop.debug.ui.message_log.";
+            switch (kind)
+            {
+                case "inquiry":
+                    InformationManager.ShowInquiry(new InquiryData(
+                        "Rig self-test",
+                        "Raised by coop.debug.ui.raise_test_popup to prove popup capture.",
+                        true, true,
+                        "Accept", "Decline",
+                        null, null));
+                    return Succeeded("Raised an inquiry. Check coop.debug.ui.popup_log.");
 
-            default:
-                return "Usage: coop.debug.ui.raise_test_popup [inquiry|quick|message]";
+                case "quick":
+                    MBInformationManager.AddQuickInformation(
+                        new TaleWorlds.Localization.TextObject("Rig self-test quick information."));
+                    return Succeeded("Raised a quick information message. Check coop.debug.ui.popup_log.");
+
+                case "message":
+                    InformationManager.DisplayMessage(
+                        new InformationMessage("Rig self-test campaign message."));
+                    return Succeeded("Raised a campaign message. Check coop.debug.ui.message_log.");
+
+                default:
+                    return Failed("Usage: coop.debug.ui.raise_test_popup [inquiry|quick|message]");
+            }
         }
     }
 
@@ -106,24 +475,44 @@ Exits the current game menu (GameMenu.ExitToLast). Use to dismiss a post-battle 
     /// Deliberately reachable while armed: the guard denies irreversible ACTS, not the ability to see what it
     /// has refused. A guard whose own status command was blocked would be indistinguishable from a broken one.
     /// </remarks>
-    [CommandLineArgumentFunction("guard", "coop.debug.testclient")]
-    public static string Guard(List<string> args)
+    public sealed class TestClientGuardCoopCommand : ICoopCommand
     {
-        if (args.Count == 1 && string.Equals(args[0], "arm", StringComparison.OrdinalIgnoreCase))
-        {
-            Services.Headless.IrreversibleActionGuard.Arm(true);
-            return "Irreversible-action refusal ARMED.";
-        }
-        if (args.Count == 1 && string.Equals(args[0], "disarm", StringComparison.OrdinalIgnoreCase))
-        {
-            Services.Headless.IrreversibleActionGuard.Arm(false);
-            return "Irreversible-action refusal disarmed.";
-        }
-        if (args.Count == 1 && string.Equals(args[0], "clear", StringComparison.OrdinalIgnoreCase))
-            return $"Cleared {Services.Headless.IrreversibleActionGuard.ClearRefusals()} refusal(s).";
-        if (args.Count != 0)
-            return "Usage: coop.debug.testclient.guard [arm|disarm|clear]";
+        public string Prefix => "coop.debug.testclient";
 
+        public string Name => "guard";
+
+        public string Description => "Arms, disarms, clears or reports the server's refusal of irreversible actions.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("action", "arm, disarm or clear; omit to print the guard state and its refusals.", false),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            string action = args.ElementAtOrDefault(0);
+            if (string.Equals(action, "arm", StringComparison.OrdinalIgnoreCase))
+            {
+                Services.Headless.IrreversibleActionGuard.Arm(true);
+                return Succeeded("Irreversible-action refusal ARMED.");
+            }
+            if (string.Equals(action, "disarm", StringComparison.OrdinalIgnoreCase))
+            {
+                Services.Headless.IrreversibleActionGuard.Arm(false);
+                return Succeeded("Irreversible-action refusal disarmed.");
+            }
+            if (string.Equals(action, "clear", StringComparison.OrdinalIgnoreCase))
+                return Succeeded($"Cleared {Services.Headless.IrreversibleActionGuard.ClearRefusals()} refusal(s).");
+            if (action != null)
+                return Failed("Usage: coop.debug.testclient.guard [arm|disarm|clear]");
+
+            return Succeeded(GuardReport());
+        }
+    }
+
+    /// <summary>The guard's state and every refusal it has recorded, one per line.</summary>
+    private static string GuardReport()
+    {
         var refusals = Services.Headless.IrreversibleActionGuard.RefusalLog;
         var report = new System.Text.StringBuilder();
         report.AppendLine($"GUARD armed={Services.Headless.IrreversibleActionGuard.IsArmed} " +
@@ -134,37 +523,71 @@ Exits the current game menu (GameMenu.ExitToLast). Use to dismiss a post-battle 
     }
 
     /// <summary>C23 - declare how a named popup should be answered.</summary>
-    [CommandLineArgumentFunction("popup_declare", "coop.debug.ui")]
-    public static string PopupDeclare(List<string> args)
+    public sealed class PopupDeclareCoopCommand : ICoopCommand
     {
-        if (args.Count == 1 && string.Equals(args[0], "clear", StringComparison.OrdinalIgnoreCase))
-            return $"Cleared {Services.Headless.PopupPolicy.ClearDeclarations()} declaration(s).";
+        public string Prefix => "coop.debug.ui";
 
-        if (args.Count < 2)
-            return "Usage: coop.debug.ui.popup_declare <affirmative|negative> <pattern...>  |  popup_declare clear";
+        public string Name => "popup_declare";
 
-        Services.Headless.PopupPolicy.Answer answer;
-        switch (args[0].ToLowerInvariant())
+        public string Description => "Declares how a popup matching a pattern should be answered.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
         {
-            case "affirmative": answer = Services.Headless.PopupPolicy.Answer.Affirmative; break;
-            case "negative": answer = Services.Headless.PopupPolicy.Answer.Negative; break;
-            default: return "The answer must be 'affirmative' or 'negative'. There is no accept-all.";
-        }
+            new ExpectedArgs("answer", "affirmative or negative, or clear to drop every declaration."),
+            new ExpectedArgs("pattern", "The popup pattern to answer. Quote multi-word patterns.", false),
+        };
 
-        string pattern = string.Join(" ", args.Skip(1));
-        Services.Headless.PopupPolicy.Declare(pattern, answer);
-        return $"Declared '{pattern}' -> {answer}.";
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (string.Equals(args[0], "clear", StringComparison.OrdinalIgnoreCase))
+                return Succeeded($"Cleared {Services.Headless.PopupPolicy.ClearDeclarations()} declaration(s).");
+
+            string pattern = args.ElementAtOrDefault(1);
+            if (string.IsNullOrEmpty(pattern))
+                return Failed("Usage: coop.debug.ui.popup_declare <affirmative|negative> <pattern>  |  popup_declare clear");
+
+            Services.Headless.PopupPolicy.Answer answer;
+            switch (args[0].ToLowerInvariant())
+            {
+                case "affirmative": answer = Services.Headless.PopupPolicy.Answer.Affirmative; break;
+                case "negative": answer = Services.Headless.PopupPolicy.Answer.Negative; break;
+                default: return Failed("The answer must be 'affirmative' or 'negative'. There is no accept-all.");
+            }
+
+            Services.Headless.PopupPolicy.Declare(pattern, answer);
+            return Succeeded($"Declared '{pattern}' -> {answer}.");
+        }
     }
 
     /// <summary>C23 - the declarations in force, and whether the run has already failed.</summary>
-    [CommandLineArgumentFunction("popup_policy", "coop.debug.ui")]
-    public static string PopupPolicyState(List<string> args)
+    public sealed class PopupPolicyCoopCommand : ICoopCommand
     {
-        if (args.Count == 1 && string.Equals(args[0], "reset_failures", StringComparison.OrdinalIgnoreCase))
-            return $"Cleared {Services.Headless.PopupPolicy.ClearFailures()} failure(s).";
-        if (args.Count != 0)
-            return "Usage: coop.debug.ui.popup_policy [reset_failures]";
+        public string Prefix => "coop.debug.ui";
 
+        public string Name => "popup_policy";
+
+        public string Description => "Reports the popup declarations in force and whether the run has failed.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("action", "reset_failures to clear recorded failures; omit to print the policy state.", false),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            string action = args.ElementAtOrDefault(0);
+            if (string.Equals(action, "reset_failures", StringComparison.OrdinalIgnoreCase))
+                return Succeeded($"Cleared {Services.Headless.PopupPolicy.ClearFailures()} failure(s).");
+            if (action != null)
+                return Failed("Usage: coop.debug.ui.popup_policy [reset_failures]");
+
+            return Succeeded(PopupPolicyReport());
+        }
+    }
+
+    /// <summary>The popup declarations in force, whether the run has failed, and why.</summary>
+    private static string PopupPolicyReport()
+    {
         var declared = Services.Headless.PopupPolicy.Declared;
         var failures = Services.Headless.PopupPolicy.FailureReasons;
 
@@ -179,83 +602,207 @@ Exits the current game menu (GameMenu.ExitToLast). Use to dismiss a post-battle 
     }
 
     /// <summary>C27 - the campaign messages this process could not show.</summary>
-    [CommandLineArgumentFunction("message_log", "coop.debug.ui")]
-    public static string MessageLog(List<string> args)
+    public sealed class MessageLogCoopCommand : ICoopCommand
     {
-        if (args.Count == 1 && string.Equals(args[0], "clear", StringComparison.OrdinalIgnoreCase))
-            return $"Cleared {Services.Headless.PopupCapture.ClearMessages()} message(s).";
+        public string Prefix => "coop.debug.ui";
 
-        var captured = Services.Headless.PopupCapture.MessageSnapshot();
+        public string Name => "message_log";
 
-        if (args.Count >= 1 && string.Equals(args[0], "json", StringComparison.OrdinalIgnoreCase))
+        public string Description => "Prints, clears or exports the campaign messages this process captured.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
         {
-            int jsonWanted = args.Count > 1 && int.TryParse(args[1], out var parsed) ? parsed : 200;
-            var chosen = captured.Skip(Math.Max(0, captured.Count - Math.Max(1, jsonWanted))).ToList();
-            var json = new System.Text.StringBuilder();
-            json.Append("{\"count\":").Append(captured.Count).Append(",\"messages\":[");
-            for (int index = 0; index < chosen.Count; index++)
+            new ExpectedArgs("mode", "clear, json, or the number of messages to print (default 30).", false),
+            new ExpectedArgs("count", "With json: how many messages to include (default 200).", false),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            string mode = args.ElementAtOrDefault(0);
+            string countArgument = args.ElementAtOrDefault(1);
+
+            if (string.Equals(mode, "clear", StringComparison.OrdinalIgnoreCase))
+                return Succeeded($"Cleared {Services.Headless.PopupCapture.ClearMessages()} message(s).");
+
+            var captured = Services.Headless.PopupCapture.MessageSnapshot();
+
+            if (string.Equals(mode, "json", StringComparison.OrdinalIgnoreCase))
             {
-                if (index > 0) json.Append(',');
-                var message = chosen[index];
-                json.Append("{\"sequence\":").Append(message.Sequence)
-                    .Append(",\"text\":").Append(JsonString(message.Text))
-                    .Append(",\"campaignTime\":").Append(JsonString(message.CampaignTime))
-                    .Append(",\"campaignDays\":")
-                    .Append(message.CampaignDays.ToString("F6", System.Globalization.CultureInfo.InvariantCulture))
-                    .Append(",\"realTimeUtc\":")
-                    .Append(JsonString(message.RealTimeUtc.ToString("o", System.Globalization.CultureInfo.InvariantCulture)))
-                    .Append('}');
+                int jsonWanted = countArgument != null && int.TryParse(countArgument, out var parsed) ? parsed : 200;
+                var chosen = captured.Skip(Math.Max(0, captured.Count - Math.Max(1, jsonWanted))).ToList();
+                var json = new System.Text.StringBuilder();
+                json.Append("{\"count\":").Append(captured.Count).Append(",\"messages\":[");
+                for (int index = 0; index < chosen.Count; index++)
+                {
+                    if (index > 0) json.Append(',');
+                    var message = chosen[index];
+                    json.Append("{\"sequence\":").Append(message.Sequence)
+                        .Append(",\"text\":").Append(JsonString(message.Text))
+                        .Append(",\"campaignTime\":").Append(JsonString(message.CampaignTime))
+                        .Append(",\"campaignDays\":")
+                        .Append(message.CampaignDays.ToString("F6", System.Globalization.CultureInfo.InvariantCulture))
+                        .Append(",\"realTimeUtc\":")
+                        .Append(JsonString(message.RealTimeUtc.ToString("o", System.Globalization.CultureInfo.InvariantCulture)))
+                        .Append('}');
+                }
+                return Succeeded("LIVE_TEST_JSON=" + json.Append("]}"));
             }
-            return "LIVE_TEST_JSON=" + json.Append("]}");
+
+            int wanted = 30;
+            if (countArgument != null || (mode != null && !int.TryParse(mode, out wanted)))
+                return Failed("Usage: coop.debug.ui.message_log [clear|json [count]|<count>]");
+
+            if (captured.Count == 0) return Succeeded("MESSAGE_LOG count=0");
+            var report = new System.Text.StringBuilder();
+            report.AppendLine($"MESSAGE_LOG count={captured.Count}");
+            foreach (var message in captured.Skip(Math.Max(0, captured.Count - wanted)))
+                report.AppendLine($"#{message.Sequence} utc={message.RealTimeUtc:HH:mm:ss} " +
+                                  $"campaign='{message.CampaignTime}' text='{message.Text}'");
+            return Succeeded(report.ToString().TrimEnd());
         }
-
-        int wanted = 30;
-        if (args.Count == 1 && !int.TryParse(args[0], out wanted))
-            return "Usage: coop.debug.ui.message_log [clear|json [count]|<count>]";
-
-        if (captured.Count == 0) return "MESSAGE_LOG count=0";
-        var report = new System.Text.StringBuilder();
-        report.AppendLine($"MESSAGE_LOG count={captured.Count}");
-        foreach (var message in captured.Skip(Math.Max(0, captured.Count - wanted)))
-            report.AppendLine($"#{message.Sequence} utc={message.RealTimeUtc:HH:mm:ss} " +
-                              $"campaign='{message.CampaignTime}' text='{message.Text}'");
-        return report.ToString().TrimEnd();
     }
 
     /// <summary>C22 - the popups this process could not show.</summary>
-    [CommandLineArgumentFunction("popup_log", "coop.debug.ui")]
-    public static string PopupLog(List<string> args)
+    public sealed class PopupLogCoopCommand : ICoopCommand
     {
-        if (args.Count > 1)
-            return "Usage: coop.debug.ui.popup_log [clear|<count>]";
+        public string Prefix => "coop.debug.ui";
 
-        if (args.Count == 1 && string.Equals(args[0], "clear", StringComparison.OrdinalIgnoreCase))
-            return $"Cleared {Services.Headless.PopupCapture.Clear()} captured popup(s).";
+        public string Name => "popup_log";
 
-        // A machine-readable form, because C25 asserts on these and parsing the prose below would break on
-        // any popup whose own text contained a quote or a bracket - which player-facing text eventually does.
-        if (args.Count >= 1 && string.Equals(args[0], "json", StringComparison.OrdinalIgnoreCase))
-            return PopupLogJson(args.Count > 1 && int.TryParse(args[1], out var jsonCount) ? jsonCount : 200);
+        public string Description => "Prints, clears or exports the popups this process captured.";
 
-        int wanted = 25;
-        if (args.Count == 1 && !int.TryParse(args[0], out wanted))
-            return "Usage: coop.debug.ui.popup_log [clear|json [count]|<count>]";
-
-        var captured = Services.Headless.PopupCapture.Snapshot();
-        if (captured.Count == 0) return "POPUP_LOG count=0";
-
-        var report = new System.Text.StringBuilder();
-        report.AppendLine($"POPUP_LOG count={captured.Count}");
-        foreach (var popup in captured.Skip(Math.Max(0, captured.Count - wanted)))
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
         {
-            report.AppendLine(
-                $"#{popup.Sequence} {popup.Kind} utc={popup.RealTimeUtc:HH:mm:ss} " +
-                $"campaign='{popup.CampaignTime}' days={popup.CampaignDays:F4} " +
-                $"answered={popup.Answered} answer='{popup.Answer}' title='{popup.Title}' " +
-                $"options=[{string.Join(" | ", popup.Options.Where(o => !string.IsNullOrEmpty(o)))}] " +
-                $"text='{popup.Text}'");
+            new ExpectedArgs("mode", "clear, json, or the number of popups to print (default 25).", false),
+            new ExpectedArgs("count", "With json: how many popups to include (default 200).", false),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            string mode = args.ElementAtOrDefault(0);
+            string countArgument = args.ElementAtOrDefault(1);
+
+            if (string.Equals(mode, "clear", StringComparison.OrdinalIgnoreCase))
+                return Succeeded($"Cleared {Services.Headless.PopupCapture.Clear()} captured popup(s).");
+
+            // A machine-readable form, because C25 asserts on these and parsing the prose below would break on
+            // any popup whose own text contained a quote or a bracket - which player-facing text eventually does.
+            if (string.Equals(mode, "json", StringComparison.OrdinalIgnoreCase))
+                return Succeeded(PopupLogJson(countArgument != null && int.TryParse(countArgument, out var jsonCount) ? jsonCount : 200));
+
+            int wanted = 25;
+            if (countArgument != null || (mode != null && !int.TryParse(mode, out wanted)))
+                return Failed("Usage: coop.debug.ui.popup_log [clear|json [count]|<count>]");
+
+            var captured = Services.Headless.PopupCapture.Snapshot();
+            if (captured.Count == 0) return Succeeded("POPUP_LOG count=0");
+
+            var report = new System.Text.StringBuilder();
+            report.AppendLine($"POPUP_LOG count={captured.Count}");
+            foreach (var popup in captured.Skip(Math.Max(0, captured.Count - wanted)))
+            {
+                report.AppendLine(
+                    $"#{popup.Sequence} {popup.Kind} utc={popup.RealTimeUtc:HH:mm:ss} " +
+                    $"campaign='{popup.CampaignTime}' days={popup.CampaignDays:F4} " +
+                    $"answered={popup.Answered} answer='{popup.Answer}' title='{popup.Title}' " +
+                    $"options=[{string.Join(" | ", popup.Options.Where(o => !string.IsNullOrEmpty(o)))}] " +
+                    $"text='{popup.Text}'");
+            }
+            return Succeeded(report.ToString().TrimEnd());
         }
-        return report.ToString().TrimEnd();
+    }
+
+    /// <summary>
+    /// Lists the current menu's options with the result of each one's condition.
+    /// </summary>
+    /// <remarks>
+    /// The enabled flag is the whole point. A driven client that invoked a consequence directly would be
+    /// bypassing the menu rather than clicking it, and would happily "succeed" at something a player cannot
+    /// do - which is exactly the class of bug this rig exists to find, so it must be able to SEE a wrongly
+    /// disabled option rather than step over it.
+    ///
+    /// Found by reflection instead of a compile-time member: the option list hangs off MenuContext under a
+    /// name that is not part of the public surface, and guessing it wrong costs a build and a campaign load
+    /// per attempt. Reflection also keeps this working if the field is renamed by a game update - it reports
+    /// that it could not find the list rather than failing to compile.
+    /// </remarks>
+    public sealed class MenuOptionsCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.ui";
+
+        public string Name => "menu_options";
+
+        public string Description => "Lists the current game menu's options with the result of each one's condition.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("format", "json for a LIVE_TEST_JSON line; omit for the readable report.", false),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            string format = args.ElementAtOrDefault(0);
+            bool asJson = string.Equals(format, "json", StringComparison.OrdinalIgnoreCase);
+            if (format != null && !asJson)
+                return Failed("Usage: coop.debug.ui.menu_options [json]");
+
+            var menuContext = Campaign.Current?.CurrentMenuContext;
+            if (menuContext == null)
+                return Succeeded(asJson ? "LIVE_TEST_JSON={\"menuOpen\":false}" : "No game menu is open.");
+
+            string menuId = menuContext.GameMenu?.StringId ?? "unknown";
+            var options = FindMenuOptions(menuContext);
+
+            // C26 - the reachability report, which must describe an EMPTY menu as clearly as a full one. On a
+            // render-free client the context is never activated, so a real menu legitimately offers nothing; a
+            // command that only printed options would show the same blank as a command that had crashed.
+            if (asJson) return Succeeded(MenuJson(menuContext, menuId, options));
+
+            if (options == null)
+            {
+                // Self-describing on failure. Reporting only "not found" would cost a build and a campaign load
+                // per guess at the field name, which is the loop this command was written to avoid.
+                return Failed($"menu={menuId} contextState={ReadMember(menuContext, "_currentState") ?? "?"}: " +
+                       $"no option list found. Candidates:\n" + DescribeCandidates(menuContext));
+            }
+
+            var report = new System.Text.StringBuilder();
+            report.AppendLine($"menu={menuId} options={options.Count}");
+            for (int index = 0; index < options.Count; index++)
+            {
+                object option = options[index];
+                report.AppendLine(
+                    $"[{index}] id={ReadMember(option, "IdString") ?? "?"} " +
+                    $"enabled={ReadMember(option, "IsEnabled") ?? "?"} " +
+                    $"disabled={ReadMember(option, "IsDisabled") ?? "?"} " +
+                    $"text='{ReadMember(option, "Text")}'");
+            }
+            return Succeeded(report.ToString().TrimEnd());
+        }
+    }
+
+    /// <summary>Escapes a string for JSON by hand - popup text is arbitrary and quotes appear in it.</summary>
+    private static string JsonString(string value)
+    {
+        if (value == null) return "null";
+
+        var escaped = new System.Text.StringBuilder("\"");
+        foreach (char character in value)
+        {
+            switch (character)
+            {
+                case '"': escaped.Append("\\\""); break;
+                case '\\': escaped.Append("\\\\"); break;
+                case '\n': escaped.Append("\\n"); break;
+                case '\r': escaped.Append("\\r"); break;
+                case '\t': escaped.Append("\\t"); break;
+                default:
+                    if (character < ' ') escaped.Append("\\u").Append(((int)character).ToString("x4"));
+                    else escaped.Append(character);
+                    break;
+            }
+        }
+        return escaped.Append('"').ToString();
     }
 
     /// <summary>The popup log as one LIVE_TEST_JSON line, for assertions rather than for reading.</summary>
@@ -292,85 +839,6 @@ Exits the current game menu (GameMenu.ExitToLast). Use to dismiss a post-battle 
         json.Append("]}");
 
         return "LIVE_TEST_JSON=" + json;
-    }
-
-    /// <summary>Escapes a string for JSON by hand - popup text is arbitrary and quotes appear in it.</summary>
-    private static string JsonString(string value)
-    {
-        if (value == null) return "null";
-
-        var escaped = new System.Text.StringBuilder("\"");
-        foreach (char character in value)
-        {
-            switch (character)
-            {
-                case '"': escaped.Append("\\\""); break;
-                case '\\': escaped.Append("\\\\"); break;
-                case '\n': escaped.Append("\\n"); break;
-                case '\r': escaped.Append("\\r"); break;
-                case '\t': escaped.Append("\\t"); break;
-                default:
-                    if (character < ' ') escaped.Append("\\u").Append(((int)character).ToString("x4"));
-                    else escaped.Append(character);
-                    break;
-            }
-        }
-        return escaped.Append('"').ToString();
-    }
-
-    /// <summary>
-    /// Lists the current menu's options with the result of each one's condition.
-    /// </summary>
-    /// <remarks>
-    /// The enabled flag is the whole point. A driven client that invoked a consequence directly would be
-    /// bypassing the menu rather than clicking it, and would happily "succeed" at something a player cannot
-    /// do - which is exactly the class of bug this rig exists to find, so it must be able to SEE a wrongly
-    /// disabled option rather than step over it.
-    ///
-    /// Found by reflection instead of a compile-time member: the option list hangs off MenuContext under a
-    /// name that is not part of the public surface, and guessing it wrong costs a build and a campaign load
-    /// per attempt. Reflection also keeps this working if the field is renamed by a game update - it reports
-    /// that it could not find the list rather than failing to compile.
-    /// </remarks>
-    [CommandLineArgumentFunction("menu_options", "coop.debug.ui")]
-    public static string MenuOptions(List<string> args)
-    {
-        bool asJson = args.Count == 1 && string.Equals(args[0], "json", StringComparison.OrdinalIgnoreCase);
-        if (args.Count > 1 || (args.Count == 1 && !asJson))
-            return "Usage: coop.debug.ui.menu_options [json]";
-
-        var menuContext = Campaign.Current?.CurrentMenuContext;
-        if (menuContext == null)
-            return asJson ? "LIVE_TEST_JSON={\"menuOpen\":false}" : "No game menu is open.";
-
-        string menuId = menuContext.GameMenu?.StringId ?? "unknown";
-        var options = FindMenuOptions(menuContext);
-
-        // C26 - the reachability report, which must describe an EMPTY menu as clearly as a full one. On a
-        // render-free client the context is never activated, so a real menu legitimately offers nothing; a
-        // command that only printed options would show the same blank as a command that had crashed.
-        if (asJson) return MenuJson(menuContext, menuId, options);
-
-        if (options == null)
-        {
-            // Self-describing on failure. Reporting only "not found" would cost a build and a campaign load
-            // per guess at the field name, which is the loop this command was written to avoid.
-            return $"menu={menuId} contextState={ReadMember(menuContext, "_currentState") ?? "?"}: " +
-                   $"no option list found. Candidates:\n" + DescribeCandidates(menuContext);
-        }
-
-        var report = new System.Text.StringBuilder();
-        report.AppendLine($"menu={menuId} options={options.Count}");
-        for (int index = 0; index < options.Count; index++)
-        {
-            object option = options[index];
-            report.AppendLine(
-                $"[{index}] id={ReadMember(option, "IdString") ?? "?"} " +
-                $"enabled={ReadMember(option, "IsEnabled") ?? "?"} " +
-                $"disabled={ReadMember(option, "IsDisabled") ?? "?"} " +
-                $"text='{ReadMember(option, "Text")}'");
-        }
-        return report.ToString().TrimEnd();
     }
 
     /// <summary>C26 - menu reachability as one LIVE_TEST_JSON line.</summary>
@@ -465,6 +933,20 @@ Exits the current game menu (GameMenu.ExitToLast). Use to dismiss a post-battle 
         return report.ToString().TrimEnd();
     }
 
+    private static string ReadMember(object instance, string name)
+    {
+        if (instance == null) return null;
+
+        var property = instance.GetType().GetProperty(name);
+        if (property != null) return property.GetValue(instance)?.ToString();
+
+        var field = instance.GetType().GetField(name,
+            System.Reflection.BindingFlags.Instance |
+            System.Reflection.BindingFlags.Public |
+            System.Reflection.BindingFlags.NonPublic);
+        return field?.GetValue(instance)?.ToString();
+    }
+
     private static string Describe(object value)
     {
         if (value == null) return "<null>";
@@ -482,281 +964,5 @@ Exits the current game menu (GameMenu.ExitToLast). Use to dismiss a post-battle 
             return $"[{count} x {elementType}]";
         }
         return value.ToString();
-    }
-
-    private static string ReadMember(object instance, string name)
-    {
-        if (instance == null) return null;
-
-        var property = instance.GetType().GetProperty(name);
-        if (property != null) return property.GetValue(instance)?.ToString();
-
-        var field = instance.GetType().GetField(name,
-            System.Reflection.BindingFlags.Instance |
-            System.Reflection.BindingFlags.Public |
-            System.Reflection.BindingFlags.NonPublic);
-        return field?.GetValue(instance)?.ToString();
-    }
-
-    [CommandLineArgumentFunction("prepare_evidence_map", "coop.debug.ui")]
-    public static string PrepareEvidenceMap(List<string> args)
-    {
-        if (ModInformation.IsServer)
-            return "Run this command on a client.";
-
-        if (args.Count != 0)
-            return "Usage: coop.debug.ui.prepare_evidence_map";
-
-        MapScreen mapScreen = MapScreen.Instance;
-        if (mapScreen == null)
-            return "Campaign map screen is unavailable.";
-
-        try
-        {
-            // Hide only the client presentation; keep the saved encounter and map event unchanged.
-            if (mapScreen.IsInMenu)
-            {
-                mapScreen._latestMenuContext = null;
-                mapScreen.ExitMenuContext();
-            }
-            mapScreen.RemoveEncounterOverlay();
-        }
-        catch (Exception ex)
-        {
-            return CommandHelpers.FormatException("Prepare evidence map", ex);
-        }
-
-        return GetEvidenceMapState(mapScreen);
-    }
-
-    [CommandLineArgumentFunction("evidence_map_state", "coop.debug.ui")]
-    public static string EvidenceMapState(List<string> args)
-    {
-        if (ModInformation.IsServer)
-            return "Run this command on a client.";
-
-        if (args.Count != 0)
-            return "Usage: coop.debug.ui.evidence_map_state";
-
-        MapScreen mapScreen = MapScreen.Instance;
-        return mapScreen == null
-            ? "Campaign map screen is unavailable."
-            : GetEvidenceMapState(mapScreen);
-    }
-
-    private static string GetEvidenceMapState(MapScreen mapScreen)
-    {
-        var cameraView = mapScreen.MapCameraView;
-        PartyBase cameraFollowParty = Campaign.Current?.CameraFollowParty;
-        string cameraFollowPartyId = cameraFollowParty?.MobileParty?.StringId ?? "null";
-        string cameraMode = cameraView?.CurrentCameraFollowMode.ToString() ?? "null";
-        bool followTargetReached = false;
-        if (cameraView != null && cameraFollowParty != null)
-        {
-            var followPosition = cameraFollowParty.MapEvent?.Position ?? cameraFollowParty.Position;
-            var targetDelta = followPosition.ToVec2() - cameraView._cameraTarget.AsVec2;
-            followTargetReached = targetDelta.LengthSquared < 0.0001f;
-        }
-
-        return $"menuView={mapScreen.IsInMenu} " +
-               $"pendingMenuView={mapScreen._latestMenuContext != null} " +
-               $"encounterOverlay={mapScreen._encounterOverlay != null} " +
-               $"cameraFollowParty={cameraFollowPartyId} " +
-               $"cameraMode={cameraMode} " +
-               $"followTargetReached={followTargetReached} " +
-               $"animation={cameraView?.CameraAnimationInProgress} " +
-               $"fastMove={cameraView?._doFastCameraMovementToTarget} " +
-               $"loading={LoadingWindow.IsLoadingWindowActive}";
-    }
-
-    [CommandLineArgumentFunction("leave_settlement_encounter", "coop.debug.ui")]
-    public static string LeaveSettlementEncounter(List<string> args)
-    {
-        if (ModInformation.IsServer)
-            return "Run this command on a client.";
-
-        if (args.Count != 0)
-            return "Usage: coop.debug.ui.leave_settlement_encounter";
-
-        if (Campaign.Current == null)
-            return "Failed: no active campaign.";
-
-        var mainParty = MobileParty.MainParty;
-        if (mainParty == null)
-            return "Failed: no main party.";
-
-        if (PlayerEncounter.Battle != null || mainParty.MapEvent != null)
-            return "Cannot leave the settlement encounter after a battle has started.";
-
-        if (PlayerEncounter.Current == null || PlayerEncounter.EncounterSettlement == null)
-            return "No active settlement encounter to leave.";
-
-        if (!ContainerProvider.TryResolve<ISettlementInterface>(out var settlementInterface))
-            return "Unable to resolve the settlement interface.";
-
-        try
-        {
-            using (new AllowedThread())
-                settlementInterface.EndSettlementEncounter();
-        }
-        catch (Exception ex)
-        {
-            return CommandHelpers.FormatException("Leave settlement encounter", ex);
-        }
-
-        return "Cleared the local settlement encounter and returned to the campaign map.";
-    }
-
-#if DEBUG
-    [CommandLineArgumentFunction("map_click_offset", "coop.debug.ui")]
-    public static string MapClickOffset(List<string> args)
-    {
-        if (ModInformation.IsServer)
-            return "Run this command on a client.";
-        if (args.Count != 2 ||
-            !float.TryParse(args[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var offsetX) ||
-            !float.TryParse(args[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var offsetY))
-            return "Usage: coop.debug.ui.map_click_offset <offsetX> <offsetY>";
-
-        var mapScreen = MapScreen.Instance;
-        var mainParty = MobileParty.MainParty;
-        if (mapScreen == null || mainParty == null)
-            return "Failed: campaign map or main party is unavailable.";
-        if (PlayerEncounter.Current != null || mainParty.CurrentSettlement != null)
-            return "Leave the active settlement encounter before clicking the campaign map.";
-        if (mainParty.MapEvent != null)
-            return "Cannot click-to-move while the main party is in a map event.";
-
-        var current = mainParty.Position;
-        var offsets = new[]
-        {
-            new Vec2(offsetX, offsetY),
-            new Vec2(-offsetY, offsetX),
-            new Vec2(-offsetX, -offsetY),
-            new Vec2(offsetY, -offsetX),
-        };
-        CampaignVec2 target = default;
-        bool targetFound = false;
-        foreach (var offset in offsets)
-        {
-            var candidate = new CampaignVec2(
-                new Vec2(current.X + offset.x, current.Y + offset.y),
-                current.IsOnLand);
-            if (!candidate.Face.IsValid() ||
-                !mapScreen.MapScene.DoesPathExistBetweenFaces(
-                    candidate.Face.FaceIndex,
-                    mainParty.CurrentNavigationFace.FaceIndex,
-                    false))
-                continue;
-
-            target = candidate;
-            targetFound = true;
-            break;
-        }
-        if (!targetFound)
-            return "No nearby navigable map-click target was found.";
-
-        mapScreen.HandleLeftMouseButtonClick(null, target, target.Face, false);
-
-        return
-            $"Issued a real campaign-map click from {current.X:R},{current.Y:R} " +
-            $"to {target.X:R},{target.Y:R}; time={Campaign.Current.TimeControlMode}; " +
-            $"behavior={mainParty.DefaultBehavior}; target={mainParty.TargetPosition.X:R},{mainParty.TargetPosition.Y:R}.";
-    }
-
-    [CommandLineArgumentFunction("map_movement_state", "coop.debug.ui")]
-    public static string MapMovementState(List<string> args)
-    {
-        if (ModInformation.IsServer)
-            return "Run this command on a client.";
-        if (args.Count != 0)
-            return "Usage: coop.debug.ui.map_movement_state";
-
-        var mainParty = MobileParty.MainParty;
-        if (mainParty == null || Campaign.Current == null)
-            return "Failed: no active campaign or main party.";
-
-        return
-            $"position={mainParty.Position.X:R},{mainParty.Position.Y:R}|" +
-            $"target={mainParty.TargetPosition.X:R},{mainParty.TargetPosition.Y:R}|" +
-            $"behavior={mainParty.DefaultBehavior}|" +
-            $"settlement={mainParty.CurrentSettlement?.StringId ?? "none"}|" +
-            $"encounter={PlayerEncounter.EncounterSettlement?.StringId ?? "none"}|" +
-            $"time={Campaign.Current.TimeControlMode}";
-    }
-#endif
-
-    [CommandLineArgumentFunction("switch_menu", "coop.debug.ui")]
-    public static string SwitchMenu(List<string> args)
-    {
-        if (ModInformation.IsServer)
-            return "Run this command on a client.";
-
-        if (args.Count != 1)
-            return "Usage: coop.debug.ui.switch_menu <menuId>";
-
-        if (Campaign.Current == null)
-            return "Failed: no active campaign.";
-
-        try
-        {
-            GameMenu.SwitchToMenu(args[0]);
-        }
-        catch (Exception ex)
-        {
-            return CommandHelpers.FormatException("Switch menu", ex);
-        }
-
-        return $"Switched to game menu {args[0]}.";
-    }
-
-    [CommandLineArgumentFunction("pop_state", "coop.debug.ui")]
-    public static string PopState(List<string> args)
-    {
-        if (args.Count != 0)
-            return "Usage: coop.debug.ui.pop_state";
-
-        TaleWorlds.Core.GameState activeState = Game.Current?.GameStateManager?.ActiveState;
-        if (activeState == null)
-            return "Failed: no active game state.";
-
-        if (activeState is MapState)
-            return "Active state is already MapState.";
-
-        Game.Current.GameStateManager.PopState();
-        return $"Queued pop for {activeState.GetType().Name}.";
-    }
-
-    [CommandLineArgumentFunction("active_state", "coop.debug.ui")]
-    public static string ActiveState(List<string> args)
-    {
-        if (args.Count != 0)
-            return "Usage: coop.debug.ui.active_state";
-
-        return Game.Current?.GameStateManager?.ActiveState?.GetType().Name ?? "none";
-    }
-
-    [CommandLineArgumentFunction("loading_window_state", "coop.debug.ui")]
-    public static string LoadingWindowState(List<string> args)
-    {
-        if (args.Count != 0)
-            return "Usage: coop.debug.ui.loading_window_state";
-
-        return $"Loading window: {(LoadingWindow.IsLoadingWindowActive ? "ACTIVE" : "INACTIVE")}.";
-    }
-
-    [CommandLineArgumentFunction("saving_overlay_state", "coop.debug.ui")]
-    public static string SavingOverlayState(List<string> args)
-    {
-        if (args.Count != 0)
-            return "Usage: coop.debug.ui.saving_overlay_state";
-
-        var dataSource = MapScreen.Instance?
-            .GetMapView<GauntletMapSaveView>()?
-            ._dataSource;
-        if (dataSource == null)
-            return "Saving overlay: UNAVAILABLE.";
-
-        return $"Saving overlay: {(dataSource.IsActive ? "ACTIVE" : "INACTIVE")}.";
     }
 }
