@@ -33,7 +33,8 @@ namespace GameInterface.Services.Inventory.Interfaces
             MobileParty currentMobileParty,
             SettlementComponent currentSettlementComponent,
             List<(ItemRosterElement, int)> boughtItems,
-            List<(ItemRosterElement, int)> soldItems);
+            List<(ItemRosterElement, int)> soldItems,
+            float donationXp = 0f);
 
         void UpdateRosterWithData(ItemRoster targetItemRoster, ItemRosterElement[] itemRosterElements);
 
@@ -66,7 +67,8 @@ namespace GameInterface.Services.Inventory.Interfaces
             MobileParty currentMobileParty,
             SettlementComponent currentSettlementComponent,
             List<ValueTuple<ItemRosterElement, int>> boughtItems,
-            List<ValueTuple<ItemRosterElement, int>> soldItems)
+            List<ValueTuple<ItemRosterElement, int>> soldItems,
+            float donationXp = 0f)
         {
             GameThread.RunSafe(() =>
             {
@@ -81,7 +83,8 @@ namespace GameInterface.Services.Inventory.Interfaces
                         currentMobileParty,
                         currentSettlementComponent,
                         boughtItems,
-                        soldItems);
+                        soldItems,
+                        donationXp);
             });
         }
 
@@ -96,7 +99,8 @@ namespace GameInterface.Services.Inventory.Interfaces
             MobileParty currentMobileParty,
             SettlementComponent currentSettlementComponent,
             List<ValueTuple<ItemRosterElement, int>> boughtItems,
-            List<ValueTuple<ItemRosterElement, int>> soldItems)
+            List<ValueTuple<ItemRosterElement, int>> soldItems,
+            float donationXp)
         {
             PartyBase partyBase = null;
             if (currentMobileParty != null)
@@ -141,17 +145,19 @@ namespace GameInterface.Services.Inventory.Interfaces
                 }
             }
 
-            // Discarding items
-            if (isDiscardDonating && ownerHero.PartyBelongedTo != null)
+            // Donated items. The client's InventoryLogic accumulates XpGainFromDonations as the player donates and
+            // vanilla's DoneLogic applies that one number; the server received it capped to what the party could have
+            // donated (TradeHandler.CapDonationXp). Items merely left on the loot pile pay nothing, as in vanilla: the
+            // old per-item loop over the left-behind loot never saw a donated item (donating removes it from the roster),
+            // so donating paid nothing at all (M12).
+            if (isDiscardDonating && donationXp > 0f && ownerHero.PartyBelongedTo != null)
             {
-                foreach (ItemRosterElement rosterElement in soldItems.Select(x => x.Item1))
-                {
-                    int xpBonusForDiscardingItems = defaultItemDiscardModelInterface.GetXpBonusForDiscardingItem(ownerHero.PartyBelongedTo, rosterElement.EquipmentElement.Item, rosterElement.Amount);
-                    if ((float)xpBonusForDiscardingItems > 0f)
-                    {
-                        MobilePartyHelper.PartyAddSharedXp(ownerHero.PartyBelongedTo, (float)xpBonusForDiscardingItems);
-                    }
-                }
+                MobilePartyHelper.PartyAddSharedXp(ownerHero.PartyBelongedTo, donationXp);
+                // Writing XP does not refresh the roster's row list, so without this the party that was just paid
+                // goes on reading its old XP everywhere the rows are read (TroopRosterXpVisibilityTests).
+                ownerHero.PartyBelongedTo.MemberRoster?.UpdateVersion();
+                logger.Information("[Loot] {Party} gained {Xp} shared troop XP from donated items",
+                    ownerHero.PartyBelongedTo.StringId, donationXp);
             }
 
             sessionTradePlayerDataInterface.UpdatePlayerInventory(ownerHero, boughtItems, soldItems, isTrading);

@@ -1,4 +1,4 @@
-using Missions.Agents;
+﻿using Missions.Agents;
 using TaleWorlds.Library;
 using Xunit;
 
@@ -111,5 +111,73 @@ public class PuppetDeadReckoningTests
             new Vec3(0f, 0.2f, 0f), 0.1f, 0.1f, out Vec3 lead));
         Assert.Equal(0f, lead.x, 3);
         Assert.Equal(0.2f, lead.y, 3);
+    }
+
+    // ---- mounted lead: the owner's sent horse velocity x (frame age, capped 0.1 s + one-way delay, capped 0.3 s
+    //      + one frame of presentation lag, 20 ms) ----
+
+    private static Vec2 Gallop(float metresPerSecond) => new Vec2(metresPerSecond, 0f);
+
+    /// <summary>A canter at 8 m/s read 10 ms after arrival on a zero-delay link: 8 x (0.010 + 0.020) = 0.24 m.</summary>
+    [Fact]
+    public void Canter_IsLedByAgeAndPresentationLag()
+    {
+        Assert.True(AgentPositionInterpolator.TryComputeMountLead(Gallop(8f), 0.01f, 0f, out Vec3 lead));
+        Assert.Equal(8f * (0.01f + 0.02f), lead.x, 3);
+    }
+
+    /// <summary>A stalled stream is extrapolated 100 ms at most, not for ever.</summary>
+    [Fact]
+    public void StaleMountFrame_LeadsAtMostTheAgeCap()
+    {
+        Assert.True(AgentPositionInterpolator.TryComputeMountLead(Gallop(8f), 0.4f, 0f, out Vec3 lead));
+        Assert.Equal(8f * (0.1f + 0.02f), lead.x, 3);
+    }
+
+    /// <summary>A gallop is a real horse speed and is led; 50 m/s is a bad frame and is not.</summary>
+    [Fact]
+    public void GallopIsLed_TeleportIsRefused()
+    {
+        Assert.True(AgentPositionInterpolator.TryComputeMountLead(Gallop(14f), 0.01f, 0f, out _));
+        Assert.False(AgentPositionInterpolator.TryComputeMountLead(Gallop(50f), 0.01f, 0f, out _));
+    }
+
+    /// <summary>The lead never reaches past 3 m, a quarter of the mount snap distance.</summary>
+    [Fact]
+    public void MountLead_IsCapped()
+    {
+        Assert.True(AgentPositionInterpolator.TryComputeMountLead(Gallop(20f), 0.1f, 0.3f, out Vec3 lead));
+        Assert.Equal(3f, lead.Length, 3);
+    }
+
+    [Fact]
+    public void StandingHorse_IsNotLed()
+    {
+        Assert.False(AgentPositionInterpolator.TryComputeMountLead(Gallop(0.1f), 0.01f, 0f, out _));
+    }
+
+    /// <summary>Between two real machines the delay dominates: 12 m/s with 50 ms one way is 0.6 m of lead on its own.</summary>
+    [Fact]
+    public void NetworkDelay_IsLedToo()
+    {
+        Assert.True(AgentPositionInterpolator.TryComputeMountLead(Gallop(12f), 0.01f, 0.05f, out Vec3 lead));
+        Assert.Equal(12f * (0.01f + 0.05f + 0.02f), lead.x, 3);
+    }
+
+    /// <summary>A ping spike is not a delay to lead by: the latency term is capped at 300 ms.</summary>
+    [Fact]
+    public void PingSpike_IsCapped()
+    {
+        Assert.True(AgentPositionInterpolator.TryComputeMountLead(Gallop(4f), 0.01f, 2f, out Vec3 lead));
+        Assert.Equal(4f * (0.01f + 0.3f + 0.02f), lead.x, 3);
+    }
+
+    /// <summary>The velocity is the owner's, whatever direction the horse points: a sideways drift leads sideways.</summary>
+    [Fact]
+    public void LeadFollowsTheVelocityDirection()
+    {
+        Assert.True(AgentPositionInterpolator.TryComputeMountLead(new Vec2(0f, 6f), 0.0f, 0.05f, out Vec3 lead));
+        Assert.Equal(0f, lead.x, 3);
+        Assert.Equal(6f * 0.07f, lead.y, 3);
     }
 }

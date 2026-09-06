@@ -26,6 +26,17 @@ public static class MeleeHitPresentationPatch
             return;
         }
 
+#if DEBUG
+        // Blocked, parried and chambered swings never reach Mission.RegisterBlow, so the duel rig takes them here.
+        if (collisionData.AttackBlockedWithShield ||
+            collisionData.CollisionResult == CombatCollisionResult.Blocked ||
+            collisionData.CollisionResult == CombatCollisionResult.Parried ||
+            collisionData.CollisionResult == CombatCollisionResult.ChamberBlocked)
+        {
+            Missions.Diagnostics.DuelEvents.RecordBlocked(attacker, victim, in collisionData);
+        }
+#endif
+
         MissionWeapon weapon = ResolveWeapon(attacker, collisionData.AffectorWeaponSlotOrMissileIndex);
         WeaponClass weaponClass = weapon.IsEmpty
             ? WeaponClass.Undefined

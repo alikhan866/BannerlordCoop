@@ -25,6 +25,11 @@ public readonly struct TradeAttempted : IEvent
     public readonly SettlementComponent CurrentSettlementComponent;
     public readonly List<(ItemRosterElement, int)> BoughtItems;
     public readonly List<(ItemRosterElement, int)> SoldItems;
+    /// <summary>
+    /// <c>InventoryLogic.XpGainFromDonations</c>: the troop XP the player earned by donating items on this screen.
+    /// Vanilla's DoneLogic applies this one number; the coop Done prefix replaces DoneLogic, so it must travel.
+    /// </summary>
+    public readonly float DonationXp;
 
     public TradeAttempted(
         ItemRoster fromRoster,
@@ -40,7 +45,8 @@ public readonly struct TradeAttempted : IEvent
         MobileParty currentMobileParty,
         SettlementComponent currentSettlementComponent,
         List<(ItemRosterElement, int)> boughtItems,
-        List<(ItemRosterElement, int)> soldItems)
+        List<(ItemRosterElement, int)> soldItems,
+        float donationXp = 0f)
     {
         FromRoster = fromRoster;
         ToRoster = toRoster;
@@ -56,5 +62,6 @@ public readonly struct TradeAttempted : IEvent
         CurrentSettlementComponent = currentSettlementComponent;
         BoughtItems = boughtItems;
         SoldItems = soldItems;
+        DonationXp = donationXp;
     }
 }

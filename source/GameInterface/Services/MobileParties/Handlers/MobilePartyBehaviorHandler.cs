@@ -204,7 +204,13 @@ internal class MobilePartyBehaviorHandler : IHandler
                     return;
 
                 if (ModInformation.IsClient && data.ForcePosition)
-                    ApplyForcedPosition(party, data.PartyPosition, data.IsCurrentlyAtSea);
+                {
+                    // A forced position that comes with "hold" is the server parking the party exactly; anything
+                    // else is the hourly drift correction, which the smoother spreads over a few frames instead
+                    // of teleporting the copy (see PartyPositionSmoothing).
+                    ApplyForcedPosition(party, data.PartyPosition, data.IsCurrentlyAtSea,
+                        smooth: !data.ResetMovementToHold);
+                }
 
                 if (ModInformation.IsClient && data.ResetMovementToHold)
                 {
@@ -229,9 +235,9 @@ internal class MobilePartyBehaviorHandler : IHandler
                             isSelfEcho,
                             data.ForcePosition,
                             party.PartyMoveMode == MoveModeType.Hold,
-                            party.Position,
+                            PartyPositionSmoothing.SettledPosition(party),
                             data.PartyPosition))
-                        party.Position = data.PartyPosition;
+                        PartyPositionSmoothing.Apply(party, data.PartyPosition);
                 }
             }
 
@@ -246,9 +252,11 @@ internal class MobilePartyBehaviorHandler : IHandler
         });
     }
 
-    private static void ApplyForcedPosition(MobileParty party, CampaignVec2 position, bool isCurrentlyAtSea)
+    private static void ApplyForcedPosition(MobileParty party, CampaignVec2 position, bool isCurrentlyAtSea,
+        bool smooth = false)
     {
-        party.Position = position;
+        if (smooth) PartyPositionSmoothing.Apply(party, position);
+        else party.Position = position;
 
         if (party.IsCurrentlyAtSea != isCurrentlyAtSea)
             party.ChangeIsCurrentlyAtSeaCheat();

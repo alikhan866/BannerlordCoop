@@ -343,6 +343,19 @@ public class BattleDamageRouter : IBattleDamageRouter
         }
     }
 
+#if DEBUG
+    /// <summary>Duel rig: the instant a blow left this machine, so the analyzer can split blow -> routed -> received -> applied.</summary>
+    private static void RecordRouted(Guid victimId, PendingLocalDamage pending)
+    {
+        if (!Missions.Diagnostics.DuelEvents.Enabled) return;
+        Missions.Diagnostics.DuelEvents.Record("routed",
+            "victim=" + Missions.Diagnostics.DuelEvents.Id8(victimId) +
+            " attacker=" + Missions.Diagnostics.DuelEvents.Id8(pending.AttackerId) +
+            " dmg=" + pending.Hit.Blow.InflictedDamage.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+            " missile=" + (pending.Hit.Blow.IsMissile ? "1" : "0"));
+    }
+#endif
+
     private void RouteLocalDamage(PendingLocalDamage pending)
     {
         var registry = coopMissionComponent.AgentRegistry;
@@ -371,6 +384,9 @@ public class BattleDamageRouter : IBattleDamageRouter
                 victimInfo.AgentId,
                 pending,
                 isMount: false));
+#if DEBUG
+            RecordRouted(victimInfo.AgentId, pending);
+#endif
             return;
         }
 
@@ -400,6 +416,9 @@ public class BattleDamageRouter : IBattleDamageRouter
                 riderInfo.AgentId,
                 pending,
                 isMount: true));
+#if DEBUG
+            RecordRouted(riderInfo.AgentId, pending);
+#endif
             return;
         }
 
@@ -480,6 +499,14 @@ public class BattleDamageRouter : IBattleDamageRouter
         }
 
         bool enqueued = false;
+#if DEBUG
+        if (Missions.Diagnostics.DuelEvents.Enabled)
+            Missions.Diagnostics.DuelEvents.Record("damage_rx",
+                "victim=" + Missions.Diagnostics.DuelEvents.Id8(damage.VictimAgentId) +
+                " attacker=" + Missions.Diagnostics.DuelEvents.Id8(damage.AttackerAgentId) +
+                " dmg=" + damage.Blow.InflictedDamage.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " missile=" + (damage.IsMissile ? "1" : "0"));
+#endif
         lock (inboundDamageGate)
         {
             if (!disposed && !closing)
@@ -610,6 +637,9 @@ public class BattleDamageRouter : IBattleDamageRouter
     // Cumulative routed damage per agent index, for the unkillable-troop diagnostic below.
     private static readonly Dictionary<int, float> DamageTakenByAgent = new();
     private static readonly HashSet<int> ReportedUnkillable = new();
+    // Who the index belonged to when it was last tallied: the engine hands a dead agent's index to the next spawn,
+    // so without this a reinforcement wave's men inherit their predecessors' totals and read as unkillable.
+    private static readonly Dictionary<int, object> TallyOwner = new();
 
     /// <summary>
     /// Totals the routed damage an agent has absorbed, and says so once when that total passes what should
@@ -627,6 +657,24 @@ public class BattleDamageRouter : IBattleDamageRouter
     /// <summary>Adds to an agent's running total. The arithmetic alone, so it can be asserted without a mission.</summary>
     internal static float NoteDamageTaken(int agentIndex, float inflicted)
     {
+        return NoteDamageTaken(agentIndex, null, inflicted);
+    }
+
+    /// <summary>
+    /// Adds to an agent's running total; <paramref name="identity"/> is the agent the index currently belongs to,
+    /// and a different identity under the same index starts a fresh tally (index reuse across spawns).
+    /// </summary>
+    internal static float NoteDamageTaken(int agentIndex, object identity, float inflicted)
+    {
+        if (identity != null)
+        {
+            if (TallyOwner.TryGetValue(agentIndex, out var owner) && !ReferenceEquals(owner, identity))
+            {
+                DamageTakenByAgent.Remove(agentIndex);
+                ReportedUnkillable.Remove(agentIndex);
+            }
+            TallyOwner[agentIndex] = identity;
+        }
         DamageTakenByAgent.TryGetValue(agentIndex, out var total);
 
         // Negative values are clamped rather than subtracted: healing and zeroed blows both arrive here, and
@@ -647,7 +695,7 @@ public class BattleDamageRouter : IBattleDamageRouter
         try { index = victim.Index; }
         catch { return 0f; }
 
-        float total = NoteDamageTaken(index, inflicted);
+        float total = NoteDamageTaken(index, victim, inflicted);
 
         try
         {
@@ -675,6 +723,7 @@ public class BattleDamageRouter : IBattleDamageRouter
     {
         DamageTakenByAgent.Clear();
         ReportedUnkillable.Clear();
+        TallyOwner.Clear();
     }
 
     private void TryApplyNetworkDamage(
@@ -758,6 +807,17 @@ public class BattleDamageRouter : IBattleDamageRouter
             }
             return;
         }
+
+#if DEBUG
+        // The duel rig's "routed blow reached its owner" event; the attacker's half is DamageAttributionPatch.
+        Missions.Diagnostics.DuelEvents.RecordApplied(
+            damage.VictimAgentId,
+            damage.AttackerAgentId,
+            blow.InflictedDamage,
+            collisionData.AttackBlockedWithShield,
+            (int)collisionData.CollisionResult,
+            victim.Health);
+#endif
 
         bool hasNativeMountedPair = !blow.BlowFlag.HasAnyFlag(BlowFlags.CanDismount)
             || agentNativeMountState.HasMountedPair(victim);

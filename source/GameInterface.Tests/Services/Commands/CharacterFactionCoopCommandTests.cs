@@ -38,9 +38,9 @@ public class CharacterFactionCoopCommandTests
         Type[] commandTypes = GetCommandTypes();
 
 #if DEBUG
-        Assert.Equal(138, commandTypes.Length);
+        Assert.Equal(143, commandTypes.Length);
 #else
-        Assert.Equal(133, commandTypes.Length);
+        Assert.Equal(138, commandTypes.Length);
 #endif
         Assert.All(commandTypes, type =>
         {

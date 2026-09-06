@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 
 namespace GameInterface.Services.MapEvents.Loot;
 
@@ -157,6 +157,26 @@ public sealed class BattleLootOfferRegistry
     }
 
     /// <summary>
+    /// Every unexpired offer made to a party, answered or not.
+    /// </summary>
+    /// <remarks>
+    /// "What was this party offered recently", which is what bounds the troop XP it may claim for donating loot
+    /// (<c>TradeHandler.CapDonationXp</c>). Answering an offer must not shrink that bound: the loot answer and the
+    /// inventory screen's Done are two messages and either can arrive first.
+    /// </remarks>
+    public IReadOnlyList<BattleLootOffer> RecentFor(string partyId, double nowSeconds)
+    {
+        var recent = new List<BattleLootOffer>();
+        foreach (var entry in byOfferId.Values)
+        {
+            if (nowSeconds >= entry.ExpiresAtSeconds) continue;
+            if (!string.Equals(entry.Offer.PartyId, partyId, System.StringComparison.Ordinal)) continue;
+            recent.Add(entry.Offer);
+        }
+        return recent;
+    }
+
+    /// <summary>
     /// Whether anything is still waiting on an answer.
     /// </summary>
     /// <remarks>
@@ -193,6 +213,25 @@ public sealed class BattleLootOfferRegistry
     /// one wave stays outstanding while the next wave's offer arrives, and a late answer to the old one would
     /// still be honoured.
     /// </remarks>
+    /// <summary>
+    /// Drops the offers one party still holds for a battle, so a new wave's offer to that party cannot be
+    /// answered against the old one. The other parties' offers for the same battle stay answerable: a
+    /// two-player battle offers each player its own spoils, and the second offer must not wipe the first.
+    /// </summary>
+    public int ForgetPartyOffers(string mapEventId, string partyId)
+    {
+        if (string.IsNullOrEmpty(mapEventId) || string.IsNullOrEmpty(partyId)) return 0;
+        var doomed = new List<string>();
+        foreach (var pair in byOfferId)
+        {
+            if (string.Equals(pair.Value.Offer.MapEventId, mapEventId, System.StringComparison.Ordinal) &&
+                string.Equals(pair.Value.Offer.PartyId, partyId, System.StringComparison.Ordinal))
+                doomed.Add(pair.Key);
+        }
+        foreach (var id in doomed) byOfferId.Remove(id);
+        return doomed.Count;
+    }
+
     public int ForgetMapEvent(string mapEventId)
     {
         if (string.IsNullOrEmpty(mapEventId)) return 0;

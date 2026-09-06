@@ -1,4 +1,4 @@
-using Common.Util;
+﻿using Common.Util;
 using Missions.Battles;
 using TaleWorlds.MountAndBlade;
 using Xunit;
@@ -37,6 +37,23 @@ public class UnkillableTroopDiagnosticTests
         // The whole point: one number that keeps rising across hits, which is what "he would not die" looks
         // like in data. A per-hit log could never show it.
         Assert.Equal(30f, total);
+    }
+
+    [Fact]
+    public void AReusedIndexStartsAFreshTallyForTheNextAgent()
+    {
+        // The engine hands a dead man's index to the next spawn. In an 800 v 800 battle capped at 400 (5 Sep 2026)
+        // the tally of several successive men added up under one index and 195-259 agents a side were reported
+        // unkillable, against 0-1 in battles without reinforcement waves. The identity is the agent object itself.
+        BattleDamageRouter.ResetDamageTally();
+        var firstMan = new object();
+        var secondMan = new object();
+        BattleDamageRouter.NoteDamageTaken(agentIndex: 7, firstMan, 150f);
+        BattleDamageRouter.NoteDamageTaken(agentIndex: 7, firstMan, 150f);
+        float fresh = BattleDamageRouter.NoteDamageTaken(agentIndex: 7, secondMan, 10f);
+        Assert.Equal(10f, fresh);
+        // And the same man keeps accumulating.
+        Assert.Equal(25f, BattleDamageRouter.NoteDamageTaken(agentIndex: 7, secondMan, 15f));
     }
 
     [Fact]

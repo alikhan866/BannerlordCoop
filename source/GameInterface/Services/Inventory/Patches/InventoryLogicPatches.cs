@@ -65,7 +65,10 @@ internal class InventoryLogicPatches
             __instance.CurrentMobileParty,
             __instance.CurrentSettlementComponent,
             __instance.GetBoughtItems(),
-            __instance.GetSoldItems()
+            __instance.GetSoldItems(),
+            // The player's donations on this screen. Vanilla applies this in DoneLogic, which this prefix replaces;
+            // without it every donated item paid nothing (M12: "discarding items after a battle loses the troops' XP").
+            __instance.XpGainFromDonations
         );
 
         MessageBroker.Instance.Publish(__instance, message);

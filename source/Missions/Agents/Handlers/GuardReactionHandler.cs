@@ -287,6 +287,14 @@ public class GuardReactionHandler : IGuardReactionHandler
                 0f,
                 (animationFlags & AnimFlags.anf_restart) != 0);
 #endif
+#if DEBUG
+            if (Missions.Diagnostics.DuelEvents.Enabled)
+                Missions.Diagnostics.DuelEvents.Record("reaction",
+                    "agent=" + Missions.Diagnostics.DuelEvents.Id8(agent) + " kind=synthetic ch=" + channel.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    " action=" + reactionAction.Index.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    " pup=" + agent.GetCurrentAction(channel).Index.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    "/" + ((int)agent.GetCurrentActionType(channel)).ToString(System.Globalization.CultureInfo.InvariantCulture));
+#endif
             return agent.SetActionChannel(
                 channel,
                 in reactionAction,
@@ -477,6 +485,14 @@ public class GuardReactionHandler : IGuardReactionHandler
                 additionalFlags:
                     (AnimFlags)message.AnimationFlags,
                 startProgress: message.Progress);
+#if DEBUG
+            if (Missions.Diagnostics.DuelEvents.Enabled)
+                Missions.Diagnostics.DuelEvents.Record("reaction",
+                    "agent=" + Missions.Diagnostics.DuelEvents.Id8(agent) + " kind=remote ch=" + message.ReactionChannel.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    " action=" + reactionAction.Index.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    "@" + message.Progress.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) +
+                    " applied=" + (applied ? "1" : "0"));
+#endif
         }
         if (applied)
             RecordAppliedReaction(message);

@@ -1,4 +1,4 @@
-using Missions.Agents.Packets;
+﻿using Missions.Agents.Packets;
 using Xunit;
 
 namespace E2E.Tests.Services.Missions;
@@ -51,5 +51,22 @@ public class ReplicatedSwingPriorityTests
         Assert.False(AgentActionData.ShouldIgnorePriority(
             forceGuardDirectionTransition: false,
             incomingIsMeleeSwing: false));
+    }
+
+    /// <summary>
+    /// The owner leaving a held wind-up (a feint) must take the puppet out of it too; the engine otherwise
+    /// keeps the puppet winding up an attack that no longer exists (duel rig: set=-1 ok=0 refusals).
+    /// </summary>
+    [Fact]
+    public void OwnerLeavingHeldWindup_Overrides()
+    {
+        Assert.True(AgentActionData.ShouldIgnorePriority(
+            forceGuardDirectionTransition: false,
+            incomingIsMeleeSwing: false,
+            puppetHoldsReadyMelee: true));
+        Assert.False(AgentActionData.ShouldIgnorePriority(
+            forceGuardDirectionTransition: false,
+            incomingIsMeleeSwing: false,
+            puppetHoldsReadyMelee: false));
     }
 }

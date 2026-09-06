@@ -167,6 +167,91 @@ public class LiteNetP2PClient : INatPunchListener, INetEventListener, IUpdateabl
         return routes.Count == 0 ? "mesh routes: none" : $"mesh routes: {string.Join(", ", routes)}";
     }
 
+    // ---- Simulated one-way delay on the receive side (debug rig, PVP-SYNC-PLAN P8) -------------------------------
+    // LiteNetLib 1.3.1 ships the SimulateLatency fields but the shipped build never calls its delay path (the
+    // duel's onset latency did not move with it on), so the mesh holds payloads itself: every received payload is
+    // queued with a due time and dispatched from Update(), on the same thread PollEvents delivers on. Due times
+    // are monotonic so ReliableOrdered traffic keeps its order. Nothing calls this in normal play.
+    private readonly object delayGate = new object();
+    private readonly Queue<DelayedPayload> delayedPayloads = new Queue<DelayedPayload>();
+    private readonly Random delayRandom = new Random(12345);
+    private bool simulatedDelayEnabled;
+    private int simulatedDelayMinMs;
+    private int simulatedDelayMaxMs;
+    private long lastDelayedDueTicks;
+
+    private readonly struct DelayedPayload
+    {
+        public DelayedPayload(long dueTicks, NetPeer peer, byte[] payload)
+        {
+            DueTicks = dueTicks;
+            Peer = peer;
+            Payload = payload;
+        }
+
+        public long DueTicks { get; }
+        public NetPeer Peer { get; }
+        public byte[] Payload { get; }
+    }
+
+    /// <summary>
+    /// Mean of the rig's simulated receive-side hold, so dead reckoning can lead by it: the LiteNetLib ping is
+    /// measured under the hold and does not include it. Zero in normal play.
+    /// </summary>
+    public static float SimulatedOneWayDelaySeconds { get; private set; }
+
+    internal string SetSimulatedLatency(bool enabled, int minMs, int maxMs)
+    {
+        List<DelayedPayload> flush = null;
+        lock (delayGate)
+        {
+            simulatedDelayEnabled = enabled;
+            simulatedDelayMinMs = Math.Max(0, Math.Min(minMs, maxMs));
+            simulatedDelayMaxMs = Math.Max(simulatedDelayMinMs, maxMs);
+            SimulatedOneWayDelaySeconds = enabled ? (simulatedDelayMinMs + simulatedDelayMaxMs) / 2000f : 0f;
+            if (!enabled && delayedPayloads.Count > 0)
+            {
+                flush = new List<DelayedPayload>(delayedPayloads);
+                delayedPayloads.Clear();
+            }
+        }
+        if (flush != null)
+            foreach (DelayedPayload entry in flush)
+                HandleReceivedPayload(entry.Peer, entry.Payload);
+        return enabled
+            ? "MESH_LATENCY_SIMULATED min=" + simulatedDelayMinMs + "ms max=" + simulatedDelayMaxMs + "ms (receive-side hold in LiteNetP2PClient)"
+            : "MESH_LATENCY_OFF";
+    }
+
+    private bool TryHoldPayload(NetPeer peer, byte[] payload)
+    {
+        lock (delayGate)
+        {
+            if (!simulatedDelayEnabled) return false;
+            int delayMs = delayRandom.Next(simulatedDelayMinMs, simulatedDelayMaxMs + 1);
+            long due = Stopwatch.GetTimestamp() + delayMs * Stopwatch.Frequency / 1000L;
+            if (due < lastDelayedDueTicks) due = lastDelayedDueTicks;
+            lastDelayedDueTicks = due;
+            delayedPayloads.Enqueue(new DelayedPayload(due, peer, payload));
+            return true;
+        }
+    }
+
+    private void DispatchHeldPayloads()
+    {
+        List<DelayedPayload> ready = null;
+        lock (delayGate)
+        {
+            if (delayedPayloads.Count == 0) return;
+            long now = Stopwatch.GetTimestamp();
+            while (delayedPayloads.Count > 0 && delayedPayloads.Peek().DueTicks <= now)
+                (ready ??= new List<DelayedPayload>()).Add(delayedPayloads.Dequeue());
+        }
+        if (ready == null) return;
+        foreach (DelayedPayload entry in ready)
+            HandleReceivedPayload(entry.Peer, entry.Payload);
+    }
+
     public void Dispose()
     {
         if (disposed) return;
@@ -270,6 +355,7 @@ public class LiteNetP2PClient : INatPunchListener, INetEventListener, IUpdateabl
     public void Update(TimeSpan frameTime)
     {
         netManager.PollEvents();
+        DispatchHeldPayloads();
         netManager.NatPunchModule.PollEvents();
         FlushPendingMessages();
     }
@@ -952,7 +1038,9 @@ public class LiteNetP2PClient : INatPunchListener, INetEventListener, IUpdateabl
             if (!mappedPeerControllers.ContainsKey(peer)) return;
         }
 
-        HandleReceivedPayload(peer, reader.GetRemainingBytes());
+        byte[] payload = reader.GetRemainingBytes();
+        if (TryHoldPayload(peer, payload)) return;
+        HandleReceivedPayload(peer, payload);
     }
 
     internal void HandleReceivedPayload(NetPeer peer, byte[] serializedPacket)

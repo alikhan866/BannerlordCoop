@@ -73,6 +73,13 @@ public interface IBattleTroopReserveBuilder : IGameAbstraction
     /// if it rejoins, its party is re-flattened fresh (supplied pointer reset) and re-spawns.</summary>
     void ForgetController(MapEvent mapEvent, string controllerId);
 
+    /// <summary>
+    /// The mobile parties of players who RETREATED from this battle's mission and have not re-engaged since
+    /// (a re-engagement rebuilds the controller's reserves, which clears its mark). They are still members of
+    /// the map event; the server's conclusion must let them leave rather than finalize them as defeated.
+    /// </summary>
+    IReadOnlyCollection<string> GetRetreatedMobilePartyIds(MapEvent mapEvent);
+
     /// <summary>Forget EVERY reserve of a battle (its whole ledger entry + flatten cache). Called when a battle
     /// ENDS — concluded (victory) or fully ABANDONED (host left with no successors) — so the server stops
     /// holding the battle's reserves and a later battle on the SAME map event re-flattens all parties fresh
@@ -96,6 +103,10 @@ public class BattleTroopReserveBuilder : IBattleTroopReserveBuilder
     private readonly HashSet<string> builtParties = new HashSet<string>();
     private readonly Dictionary<string, Dictionary<int, int>> ambushSupplyOrders =
         new Dictionary<string, Dictionary<int, int>>();
+
+    // mapEventId -> controllerId -> mobile party ids the controller withdrew from the battle by retreating.
+    private readonly Dictionary<string, Dictionary<string, HashSet<string>>> retreatedByBattle =
+        new Dictionary<string, Dictionary<string, HashSet<string>>>();
     private readonly object gate = new object();
 
     public BattleTroopReserveBuilder(IBattleTroopLedger ledger, IObjectManager objectManager, IPlayerManager playerManager)
@@ -131,6 +142,18 @@ public class BattleTroopReserveBuilder : IBattleTroopReserveBuilder
             return Array.Empty<SideReserve>();
 
         EnsureBuilt(mapEvent, mapEventId);
+
+        // Asking for its reserves is what a re-engaging player does on entry: its retreat is over.
+        lock (gate)
+        {
+            if (retreatedByBattle.TryGetValue(mapEventId, out var retreated) && retreated.Remove(controllerId))
+            {
+                Logger.Information("[TroopSupply] {Controller} re-engaged battle {MapEventId}; its retreat no longer counts",
+                    controllerId, mapEventId);
+                if (retreated.Count == 0)
+                    retreatedByBattle.Remove(mapEventId);
+            }
+        }
 
         var attacker = new List<PartyReserve>();
         var defender = new List<PartyReserve>();
@@ -226,6 +249,15 @@ public class BattleTroopReserveBuilder : IBattleTroopReserveBuilder
                 builtParties.Remove(partyId);
                 Logger.Information("[TroopSupply] Forgot party {PartyId} of retreating {Controller} (re-flattens fresh on rejoin)",
                     partyId, controllerId);
+                var mobileParty = party.Party?.MobileParty;
+                if (mobileParty != null && objectManager.TryGetId(mobileParty, out var mobilePartyId))
+                {
+                    if (!retreatedByBattle.TryGetValue(mapEventId, out var retreated))
+                        retreatedByBattle[mapEventId] = retreated = new Dictionary<string, HashSet<string>>();
+                    if (!retreated.TryGetValue(controllerId, out var ids))
+                        retreated[controllerId] = ids = new HashSet<string>();
+                    ids.Add(mobilePartyId);
+                }
             }
         }
     }
@@ -246,8 +278,21 @@ public class BattleTroopReserveBuilder : IBattleTroopReserveBuilder
             // enumerable) and leaves no empty per-battle entry behind, so a restart re-flattens fresh.
             ledger.Remove(mapEventId);
             ambushSupplyOrders.Remove(mapEventId);
+            retreatedByBattle.Remove(mapEventId);
             Logger.Information("[TroopSupply] Forgot ALL reserves of battle {MapEventId} ({Count} flatten-cache entries cleared)",
                 mapEventId, forgotten);
+        }
+    }
+
+    public IReadOnlyCollection<string> GetRetreatedMobilePartyIds(MapEvent mapEvent)
+    {
+        if (mapEvent == null || !objectManager.TryGetId(mapEvent, out var mapEventId))
+            return Array.Empty<string>();
+        lock (gate)
+        {
+            if (!retreatedByBattle.TryGetValue(mapEventId, out var retreated))
+                return Array.Empty<string>();
+            return retreated.Values.SelectMany(ids => ids).Distinct().ToArray();
         }
     }
 

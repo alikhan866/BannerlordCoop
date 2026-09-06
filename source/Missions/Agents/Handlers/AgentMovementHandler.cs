@@ -1,4 +1,4 @@
-using Common;
+﻿using Common;
 using Common.Logging;
 using Common.Messaging;
 using Common.PacketHandlers;
@@ -18,6 +18,7 @@ using System.Diagnostics;
 using TaleWorlds.Library;
 using TaleWorlds.MountAndBlade;
 using AgentControllerType = TaleWorlds.Core.AgentControllerType;
+using EquipmentIndex = TaleWorlds.Core.EquipmentIndex;
 
 namespace Missions.Agents.Handlers;
 
@@ -43,6 +44,9 @@ public interface IAgentMovementHandler : IPacketHandler, IDisposable
 
     /// <summary>Replays authoritative synthetic mount turns after native agent processing.</summary>
     void ReplaySyntheticMountTurnAnimationsAfterNativeTick();
+
+    /// <summary>Re-asserts a dropped weapon usage on watched puppets (couched lance) after the native tick.</summary>
+    void ReassertPuppetWeaponUsage();
 
     /// <summary>Receive side for masterless-horse movement (<see cref="MountMovementPacket"/>); the send side
     /// is this handler's movement tick. Exposed so the packet flow is reachable in tests.</summary>
@@ -130,6 +134,8 @@ public class AgentMovementHandler : IAgentMovementHandler
     private readonly IMovementPriorityScheduler movementPriorityScheduler;
     private readonly IMissionContext missionContext;
     private readonly Dictionary<Guid, AgentEquipmentData> lastEquipment = new Dictionary<Guid, AgentEquipmentData>();
+    // A couched lance flips the owner's usage index every frame; the latch keeps that off the wire (see WieldUsageLatch).
+    private readonly Dictionary<Guid, WieldUsageLatch> usageLatches = new Dictionary<Guid, WieldUsageLatch>();
     // A puppet's horse, remembered when its owner dismounts, so a later re-mount can put it back on the
     // same one. Touched only on the game thread (inside HandlePacket's apply), so no lock; per-mission
     // (this handler is transient), so it can't leak across missions.
@@ -521,6 +527,7 @@ public class AgentMovementHandler : IAgentMovementHandler
 
         _dismountedHorses.Clear();
         resolvedMountIdentities.Clear();
+        PuppetUsageWatch.Clear();
         recipientMovementStates.Clear();
 
         movementBatchSender.Clear();
@@ -813,6 +820,7 @@ public class AgentMovementHandler : IAgentMovementHandler
                 // have no native wield-state pointers, so equipment capture is only valid for humans.
                 if (!AgentEquipmentData.TryCapture(agent, out var equipment))
                     continue;
+                equipment = StabilizeUsage(agentInfo.AgentId, equipment);
 
                 if (!lastEquipment.TryGetValue(agentInfo.AgentId, out var previousEquipment))
                 {
@@ -1607,7 +1615,62 @@ public class AgentMovementHandler : IAgentMovementHandler
                 staleEquipmentAgentIds.Add(agentId);
         }
         foreach (Guid agentId in staleEquipmentAgentIds)
+        {
             lastEquipment.Remove(agentId);
+            usageLatches.Remove(agentId);
+        }
+    }
+
+    private readonly List<Agent> _usageWatchScratch = new List<Agent>();
+    private long usageReasserts;
+
+    /// <summary>How many per-tick usage re-asserts ran (a couched puppet lance costs one per frame while couched).</summary>
+    public long UsageReasserts => usageReasserts;
+
+    /// <summary>
+    /// After the native tick: puppets whose engine dropped the usage their owner reported get it set again, every
+    /// tick, until it matches or the authoritative usage moves on (the couched lance; PVP-SYNC-PLAN 13.3).
+    /// </summary>
+    public void ReassertPuppetWeaponUsage()
+    {
+        if (!MountedSyncSwitches.UsageReassertEnabled)
+        {
+            PuppetUsageWatch.Clear();
+            return;
+        }
+        if (PuppetUsageWatch.Count == 0) return;
+
+        _usageWatchScratch.Clear();
+        PuppetUsageWatch.CopyTo(_usageWatchScratch);
+        using (new AllowedThread())
+        {
+            foreach (Agent agent in _usageWatchScratch)
+            {
+                if (agent == null || agent.Mission != Mission.Current || !agent.IsActive()
+                    || agentRegistry.IsLocallyControlled(agent)
+                    || !agentRegistry.TryGetAgentInfo(agent, out CoopAgentInfo info)
+                    || !info.TryGetAuthoritativeEquipment(out AgentEquipmentData wanted))
+                {
+                    PuppetUsageWatch.Remove(agent);
+                    continue;
+                }
+
+                if (!wanted.TryReassertUsage(agent, out bool reasserted))
+                {
+                    PuppetUsageWatch.Remove(agent);
+                    continue;
+                }
+                if (reasserted) usageReasserts++;
+#if DEBUG
+                // Once a second per watched puppet: is the engine keeping the usage, and how often did we put it back.
+                if (Missions.Diagnostics.DuelEvents.Enabled && (usageReasserts % 200) == 1 && reasserted)
+                    Missions.Diagnostics.DuelEvents.Record("usage",
+                        "agent=" + Missions.Diagnostics.DuelEvents.Id8(agent) +
+                        " reassert want=" + wanted.MainHandUsageIndex.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                        " total=" + usageReasserts.ToString(System.Globalization.CultureInfo.InvariantCulture));
+#endif
+            }
+        }
     }
 
     public void ReplaySyntheticMountTurnAnimationsAfterNativeTick()
@@ -2165,7 +2228,7 @@ public class AgentMovementHandler : IAgentMovementHandler
                 // correction bound to the ~10ms poll cadence); push the latest targets it eases toward.
                 if (agent.HasMount && data.MountData != null)
                 {
-                    _interpolator.SetMountedRiderTarget(agent, data);
+                    _interpolator.SetMountedRiderTarget(agent, data, EstimateOneWayLatencySeconds(agentInfo));
                 }
                 else
                 {
@@ -2173,6 +2236,37 @@ public class AgentMovementHandler : IAgentMovementHandler
                 }
             }
         }
+    }
+
+    private AgentEquipmentData StabilizeUsage(Guid agentId, AgentEquipmentData equipment)
+    {
+        if (!MountedSyncSwitches.UsageLatchEnabled) return equipment;
+        if (!usageLatches.TryGetValue(agentId, out WieldUsageLatch latch))
+        {
+            latch = new WieldUsageLatch();
+            usageLatches[agentId] = latch;
+        }
+        int usage = latch.Filter(equipment.MainHandUsageIndex, Stopwatch.GetTimestamp());
+        return usage == equipment.MainHandUsageIndex
+            ? equipment
+            : new AgentEquipmentData((EquipmentIndex)equipment.MainHandIndex, (EquipmentIndex)equipment.OffHandIndex, usage);
+    }
+
+    /// <summary>
+    /// The sender's one-way delay for a puppet's frames: half the mesh round trip to its authority (LiteNetLib's
+    /// <c>Ping</c> is RTT / 2) plus the rig's simulated hold, which the ping cannot see. Feeds the mounted lead.
+    /// </summary>
+    private float EstimateOneWayLatencySeconds(CoopAgentInfo info)
+    {
+        float seconds = Missions.Services.Network.LiteNetP2PClient.SimulatedOneWayDelaySeconds;
+        string authority = info?.CurrentAuthority;
+        if (!string.IsNullOrEmpty(authority)
+            && missionContext.TryGetPeer(authority, out NetPeer peer)
+            && peer != null)
+        {
+            seconds += peer.Ping / 1000f;
+        }
+        return seconds;
     }
 
     // [Game thread] Replicate the owner's mount/dismount onto its puppet. The per-tick AgentData reports

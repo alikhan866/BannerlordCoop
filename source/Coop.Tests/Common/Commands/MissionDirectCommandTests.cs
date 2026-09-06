@@ -22,7 +22,7 @@ public class MissionDirectCommandTests
     {
         Type[] commandTypes = GetCommandTypes();
 #if DEBUG
-        Assert.Equal(29, commandTypes.Length);
+        Assert.Equal(32, commandTypes.Length);
 #else
         Assert.Equal(16, commandTypes.Length);
 #endif

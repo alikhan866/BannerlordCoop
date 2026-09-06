@@ -6,6 +6,8 @@ using Common.Util;
 using GameInterface.Services.Inventory.Data;
 using GameInterface.Services.Inventory.Interfaces;
 using GameInterface.Services.Inventory.Messages;
+using GameInterface.Services.MapEvents.Handlers;
+using GameInterface.Services.MapEvents.Loot;
 using GameInterface.Services.ObjectManager;
 using GameInterface.Services.Workshops.Messages;
 using HarmonyLib;
@@ -30,13 +32,16 @@ internal class TradeHandler : IHandler
     private readonly IMessageBroker messageBroker;
     private readonly IObjectManager objectManager;
     private readonly INetwork network;
+    private readonly IDefaultItemDiscardModelInterface discardModel;
 
     public TradeHandler(
         IInventoryLogicInterface inventoryLogicInterface,
         IMessageBroker messageBroker,
         IObjectManager objectManager,
-        INetwork network)
+        INetwork network,
+        IDefaultItemDiscardModelInterface discardModel)
     {
+        this.discardModel = discardModel;
         this.inventoryLogicInterface = inventoryLogicInterface;
         this.messageBroker = messageBroker;
         this.objectManager = objectManager;
@@ -108,7 +113,8 @@ internal class TradeHandler : IHandler
             currentSettlementComponentId is null,
             currentSettlementComponentId,
             boughtItems,
-            soldItems
+            soldItems,
+            what.DonationXp
         );
 
         network.SendAll(message);
@@ -151,6 +157,8 @@ internal class TradeHandler : IHandler
                 totalAmount = ReconcilePurchases(fromRoster, fromItemRosterData, toItemRosterData, boughtItems, totalAmount);
             }
 
+            // The donation cap prices the party's items as they were BEFORE this trade rewrites them.
+            float donationXp = CapDonationXp(message, ownerParty, toRoster);
             // Update rosters with new data
             if (toRoster != null) inventoryLogicInterface.UpdateRosterWithData(toRoster, toItemRosterData);
             if (fromRoster != null) inventoryLogicInterface.UpdateRosterWithData(fromRoster, fromItemRosterData);
@@ -175,9 +183,58 @@ internal class TradeHandler : IHandler
                 currentMobileParty,
                 currentSettlementComponent,
                 boughtItems,
-                soldItems
+                soldItems,
+                donationXp
             );
         });
+    }
+
+    /// <summary>
+    /// The troop XP a client may claim for donated items, bounded by what its party could actually have donated:
+    /// the item lines of the loot the server offered that party (still outstanding while its loot screen is up)
+    /// plus the items the party carried before this trade, each priced by the discard model, which is where the
+    /// Steward perk gates live (no perks, no XP, exactly as vanilla). A client cannot invent XP for items it
+    /// never had.
+    /// </summary>
+    internal float CapDonationXp(CompleteTrade message, MobileParty ownerParty, ItemRoster partyItemsBeforeTrade)
+    {
+        if (!message.CanGainXpFromDiscarding || message.DonationXp <= 0f || ownerParty == null) return 0f;
+        long cap = 0;
+        try
+        {
+            var offers = BattleLootOfferRegistry.Shared.RecentFor(message.OwnerPartyId, BattleLootTransactionHandler.NowSeconds());
+            foreach (var offer in offers)
+            {
+                if (offer.Lines == null) continue;
+                foreach (var line in offer.Lines)
+                {
+                    if (line.Kind != BattleLootLineKind.Item || line.Count <= 0) continue;
+                    if (!objectManager.TryGetObject<ItemObject>(line.ObjectId, out var item) || item == null) continue;
+                    cap += discardModel.GetXpBonusForDiscardingItem(ownerParty, item, line.Count);
+                }
+            }
+            if (partyItemsBeforeTrade != null)
+            {
+                foreach (var element in partyItemsBeforeTrade)
+                {
+                    var item = element.EquipmentElement.Item;
+                    if (item == null || element.Amount <= 0) continue;
+                    cap += discardModel.GetXpBonusForDiscardingItem(ownerParty, item, element.Amount);
+                }
+            }
+        }
+        catch (System.Exception e)
+        {
+            logger.Warning(e, "[Loot] Could not price the donation cap for {Party}; granting nothing", message.OwnerPartyId);
+            return 0f;
+        }
+        float granted = System.Math.Min(message.DonationXp, cap);
+        if (granted < message.DonationXp)
+        {
+            logger.Warning("[Loot] {Party} claimed {Claimed} donation XP but could only have donated {Cap}; granting {Granted}",
+                message.OwnerPartyId, message.DonationXp, cap, granted);
+        }
+        return granted;
     }
 
     private void Handle_UpdateEquipmentClients(MessagePayload<UpdateEquipmentClients> obj)

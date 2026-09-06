@@ -1,4 +1,5 @@
-﻿using ProtoBuf;
+﻿using Missions.Agents;
+using ProtoBuf;
 using System;
 using TaleWorlds.Core;
 using TaleWorlds.MountAndBlade;
@@ -80,22 +81,74 @@ namespace Missions.Agents.Packets
             // here covers both the wrong-index case and the end-of-battle race, since it reads the live equipment.
             var mainHand = (EquipmentIndex)MainHandIndex;
             int mainHandUsageIndex = GetSafeUsageIndex(agent.Equipment, mainHand, MainHandUsageIndex);
-            if ((mainHand != agent.GetPrimaryWieldedItemIndex() ||
-                 mainHandUsageIndex != GetUsageIndex(agent.Equipment, mainHand)) &&
-                CanWield(agent, mainHand))
+            if (CanWield(agent, mainHand))
             {
-                agent.SetWieldedItemIndexAsClient(
-                    Agent.HandIndex.MainHand,
-                    mainHand,
-                    false,
-                    false,
-                    mainHandUsageIndex);
+                bool slotDiffers = mainHand != agent.GetPrimaryWieldedItemIndex();
+                bool usageDiffers = mainHandUsageIndex != GetUsageIndex(agent.Equipment, mainHand);
+                if (slotDiffers)
+                {
+                    agent.SetWieldedItemIndexAsClient(
+                        Agent.HandIndex.MainHand,
+                        mainHand,
+                        false,
+                        false,
+                        mainHandUsageIndex);
+                }
+                else if (usageDiffers && mainHand != EquipmentIndex.None)
+                {
+                    // Same weapon, different usage (a couched lance, a javelin flipped to melee). This is the call the
+                    // vanilla multiplayer client makes for WeaponUsageIndexChangeMessage; re-wielding the slot for a
+                    // usage change restarted the wield and the couch usage never stuck (run m-lance-after: the
+                    // puppet's lance read couched for one sample).
+                    agent.SetUsageIndexOfWeaponInSlotAsClient(mainHand, mainHandUsageIndex);
+                }
+
+                // The engine may not keep a usage it re-evaluates itself (the couch, which needs a galloping horse
+                // and a couch request the puppet never made): while the owner reports a non-default usage, the
+                // per-tick re-assert watches this puppet. Watched even when the read-back matched right here: on the
+                // host the managed value read 2 for the rest of the frame and reverted next frame, so a watch that
+                // only started on a mismatch never started (run v2-lance-after A->B: 0 couched samples of 4227).
+                if (mainHand != EquipmentIndex.None && mainHandUsageIndex != 0)
+                    PuppetUsageWatch.Add(agent);
+#if DEBUG
+                if (Missions.Diagnostics.DuelEvents.Enabled && usageDiffers)
+                    Missions.Diagnostics.DuelEvents.Record("usage",
+                        "agent=" + Missions.Diagnostics.DuelEvents.Id8(agent) +
+                        " apply slot=" + ((int)mainHand).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                        " want=" + mainHandUsageIndex.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                        " read=" + GetUsageIndex(agent.Equipment, mainHand).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                        " slotDiffers=" + (slotDiffers ? "1" : "0"));
+#endif
             }
 
             var offHand = (EquipmentIndex)OffHandIndex;
             // The native API's final argument is the main-hand usage index for both hand changes.
             if (offHand != agent.GetOffhandWieldedItemIndex() && CanWield(agent, offHand))
                 agent.SetWieldedItemIndexAsClient(Agent.HandIndex.OffHand, offHand, false, false, mainHandUsageIndex);
+        }
+
+        /// <summary>
+        /// Re-applies this record's main-hand usage to a puppet whose engine shows another one. Returns whether the
+        /// puppet still needs watching: as long as the owner reports a non-default usage on the wielded slot, the
+        /// engine may drop it again next frame, so the watch stays; it ends when the usage is the default (0) or the
+        /// record no longer applies (a different slot is wielded; the packet path owns wield changes).
+        /// <paramref name="reasserted"/> says whether a write happened this tick.
+        /// </summary>
+        internal bool TryReassertUsage(Agent agent, out bool reasserted)
+        {
+            reasserted = false;
+            if (agent?.IsHuman != true || !HasSafeWeaponSlots(agent.Equipment)) return false;
+            var mainHand = (EquipmentIndex)MainHandIndex;
+            if (mainHand == EquipmentIndex.None || !CanWield(agent, mainHand)) return false;
+            if (mainHand != agent.GetPrimaryWieldedItemIndex()) return false;
+            int usage = GetSafeUsageIndex(agent.Equipment, mainHand, MainHandUsageIndex);
+            if (usage == 0) return false;
+            if (usage != GetUsageIndex(agent.Equipment, mainHand))
+            {
+                agent.SetUsageIndexOfWeaponInSlotAsClient(mainHand, usage);
+                reasserted = true;
+            }
+            return true;
         }
 
         // True when it is safe to wield this index on this agent: -1 (None) unwields (UpdateHumanStats guards the -1

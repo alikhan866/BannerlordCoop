@@ -48,6 +48,9 @@ internal readonly struct CompleteTrade : ICommand
     public readonly (ItemRosterElementData, int)[] BoughtItems;
     [ProtoMember(19)]
     public readonly (ItemRosterElementData, int)[] SoldItems;
+    /// <summary>Troop XP from items the player donated on the screen (see <c>TradeAttempted.DonationXp</c>); the server caps it.</summary>
+    [ProtoMember(20)]
+    public readonly float DonationXp;
 
     public CompleteTrade(
         string fromItemRosterId,
@@ -68,7 +71,8 @@ internal readonly struct CompleteTrade : ICommand
         bool isSettlementComponentNull,
         string currentSettlementComponentId,
         (ItemRosterElementData, int)[] boughtItems,
-        (ItemRosterElementData, int)[] soldItems)
+        (ItemRosterElementData, int)[] soldItems,
+        float donationXp = 0f)
     {
         FromItemRosterId = fromItemRosterId;
         IsFromItemRosterNull = isFromItemRosterNull;
@@ -89,5 +93,6 @@ internal readonly struct CompleteTrade : ICommand
         CurrentSettlementComponentId = currentSettlementComponentId;
         BoughtItems = boughtItems;
         SoldItems = soldItems;
+        DonationXp = donationXp;
     }
 }

@@ -115,6 +115,18 @@ public class MissileHandler : IMissileHandler
         string modifierId = missileWeapon.ItemModifier?.StringId;
         long sequence = Interlocked.Increment(ref nextShotSequence);
         localShots[payload.What.MissileIndex] = (agentInfo.AgentId, sequence);
+#if DEBUG
+        if (Missions.Diagnostics.DuelEvents.Enabled)
+            Missions.Diagnostics.DuelEvents.Record("shot",
+                "agent=" + Missions.Diagnostics.DuelEvents.Id8(agentInfo.AgentId) +
+                " seq=" + sequence.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " idx=" + payload.What.MissileIndex.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " item=" + missileItem.StringId +
+                " speed=" + payload.What.Speed.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) +
+                " pos=" + payload.What.Position.x.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "," +
+                payload.What.Position.y.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "," +
+                payload.What.Position.z.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+#endif
 
         Logger.Debug("Sending missile sequence {sequence}, source {index}, item {itemId}, usage {usageIndex}/{usageCount}",
             sequence, payload.What.MissileIndex, missileItem.StringId, missileWeapon.CurrentUsageIndex,
@@ -161,6 +173,13 @@ public class MissileHandler : IMissileHandler
             {
                 Logger.Warning("Dropping missile {MissileIndex}: no cosmetic shooter became available",
                     pending.Shot.MissileIndex);
+#if DEBUG
+                if (Missions.Diagnostics.DuelEvents.Enabled)
+                    Missions.Diagnostics.DuelEvents.Record("missile",
+                        "agent=" + Missions.Diagnostics.DuelEvents.Id8(pending.Shot.AgentId) +
+                        " seq=" + pending.Shot.ShotSequence.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                        " how=dropped attempts=" + pending.Attempts.ToString(System.Globalization.CultureInfo.InvariantCulture));
+#endif
             }
             CompleteReconstruction(pending.Shot);
         }
@@ -216,6 +235,7 @@ public class MissileHandler : IMissileHandler
             return false;
 
         Agent agent = null;
+        bool standIn = false;
         if (networkAgentRegistry.TryGetAgentInfo(shot.AgentId, out var info)
             && info.Agent != null && info.Agent.Mission == mission && info.Agent.IsActive()
             && !networkAgentRegistry.IsLocallyControlled(info.Agent))
@@ -225,6 +245,7 @@ public class MissileHandler : IMissileHandler
         else if (BattleSpawnGate.IsCoopBattleActive)
         {
             agent = FindStandInShooter(mission);
+            standIn = agent != null;
         }
 
         if (agent == null)
@@ -299,6 +320,12 @@ public class MissileHandler : IMissileHandler
         if (index < 0 || missileEntity == null || !missileEntity.WeakEntity.IsValid)
         {
             Logger.Warning("Cannot reconstruct missile {index}: native add returned no entity", shot.MissileIndex);
+#if DEBUG
+            if (Missions.Diagnostics.DuelEvents.Enabled)
+                Missions.Diagnostics.DuelEvents.Record("missile",
+                    "agent=" + Missions.Diagnostics.DuelEvents.Id8(shot.AgentId) +
+                    " seq=" + shot.ShotSequence.ToString(System.Globalization.CultureInfo.InvariantCulture) + " how=failed");
+#endif
             return true;
         }
 
@@ -308,6 +335,19 @@ public class MissileHandler : IMissileHandler
 
         Logger.Debug("Reconstructed missile sequence {sequence}, source {sourceIndex}, as local {localIndex}",
             shot.ShotSequence, shot.MissileIndex, index);
+#if DEBUG
+        if (Missions.Diagnostics.DuelEvents.Enabled)
+            Missions.Diagnostics.DuelEvents.Record("missile",
+                "agent=" + Missions.Diagnostics.DuelEvents.Id8(shot.AgentId) +
+                " seq=" + shot.ShotSequence.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " how=reconstructed ff=" + (replay.IsFastForwarded ? "1" : "0") +
+                " standIn=" + (standIn ? "1" : "0") +
+                " item=" + shot.MissileItemId +
+                " local=" + index.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " pos=" + position.x.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "," +
+                position.y.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + "," +
+                position.z.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture));
+#endif
         messageBroker.Publish(this, new MissileReconstructed(
             shot.AgentId,
             shot.ShotSequence,

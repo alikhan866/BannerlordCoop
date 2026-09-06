@@ -108,6 +108,8 @@ public abstract class CoopMissionController : MissionBehavior, IDisposable
 
         coopMissionComponent.AgentMovementHandler
             .ReplaySyntheticMountTurnAnimationsAfterNativeTick();
+        // A puppet whose engine dropped its owner's weapon usage (couched lance) gets it set again this frame.
+        coopMissionComponent.AgentMovementHandler.ReassertPuppetWeaponUsage();
 
         // Keep short remote guard reactions visible for this frame without driving held guard actions.
         coopMissionComponent.AgentActionHandler.ReplayRemoteGuardReactions();

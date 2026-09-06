@@ -277,7 +277,20 @@ namespace Missions.Agents.Packets
         internal static bool ShouldIgnorePriority(
             bool forceGuardDirectionTransition,
             bool incomingIsMeleeSwing) =>
-            forceGuardDirectionTransition || incomingIsMeleeSwing;
+            ShouldIgnorePriority(forceGuardDirectionTransition, incomingIsMeleeSwing, puppetHoldsReadyMelee: false);
+
+        /// <summary>
+        /// A ReadyMelee is a HELD state: nothing but the owner's input ends it. When the owner leaves it for
+        /// anything that is not a swing (a feint, a block, idle), the puppet must leave it too, or it keeps
+        /// winding up an attack the owner cancelled. The engine refused those writes on the duel rig
+        /// (set=-1 ok=0 while the puppet sat in ReadyMelee), so the owner's exit from a held wind-up
+        /// overrides local priority as well. Releases are left alone: they end on their own timeline.
+        /// </summary>
+        internal static bool ShouldIgnorePriority(
+            bool forceGuardDirectionTransition,
+            bool incomingIsMeleeSwing,
+            bool puppetHoldsReadyMelee) =>
+            forceGuardDirectionTransition || incomingIsMeleeSwing || puppetHoldsReadyMelee;
         internal static bool IsMeleeSwingType(Agent.ActionCodeType actionType) =>
             actionType == Agent.ActionCodeType.ReadyMelee
             || actionType == Agent.ActionCodeType.ReleaseMelee;
@@ -627,6 +640,7 @@ namespace Missions.Agents.Packets
                             : ActionApplyTrace.Outcome.SuppressedGuardReaction,
                     agent, channel, actionIndex, actionProgress,
                     traceEnabled, tracePuppetIndex, tracePuppetProgress, tracePuppetType);
+                RecordDuelApply("suppressed", agent, channel, actionIndex, actionProgress, tracePuppetIndex, tracePuppetProgress, tracePuppetType);
 #endif
                 return;
             }
@@ -657,6 +671,7 @@ namespace Missions.Agents.Packets
                         : ActionApplyTrace.Outcome.NoTransitionPreserved,
                     agent, channel, actionIndex, actionProgress,
                     traceEnabled, tracePuppetIndex, tracePuppetProgress, tracePuppetType);
+                RecordDuelApply("noTransition", agent, channel, actionIndex, actionProgress, tracePuppetIndex, tracePuppetProgress, tracePuppetType);
                 // Nothing transitioned, so the state read before the decision is still the current state.
                 if (traceEnabled
                     && channel == 1
@@ -694,6 +709,7 @@ namespace Missions.Agents.Packets
                     ActionApplyTrace.Outcome.ResolveFailed,
                     agent, channel, actionIndex, actionProgress,
                     traceEnabled, tracePuppetIndex, tracePuppetProgress, tracePuppetType);
+                RecordDuelApply("resolveFailed", agent, channel, actionIndex, actionProgress, tracePuppetIndex, tracePuppetProgress, tracePuppetType);
 #endif
                 return;
             }
@@ -746,13 +762,34 @@ namespace Missions.Agents.Packets
             // The owner is authority for its own agent's animation, so local priority must not veto it.
             // Scoped to melee swings: everything else keeps normal arbitration, so death, fall and
             // dismount animations still win over a stale swing.
-            agent.SetActionChannel(
+            bool puppetHoldsReadyMelee =
+                agent.GetCurrentActionType(channel) == Agent.ActionCodeType.ReadyMelee;
+            bool ignorePriority = ShouldIgnorePriority(
+                forceGuardDirectionTransition,
+                incomingIsMeleeSwing,
+                puppetHoldsReadyMelee);
+            bool engineAccepted = agent.SetActionChannel(
                 channel,
                 action,
-                ignorePriority: ShouldIgnorePriority(forceGuardDirectionTransition, incomingIsMeleeSwing),
+                ignorePriority: ignorePriority,
                 additionalFlags: actionFlags,
                 actionSpeed: resolvedActionSpeed,
                 startProgress: actionProgress);
+#if DEBUG
+            if (channel == 1 && Missions.Diagnostics.DuelEvents.Enabled)
+            {
+                // What the engine did with the write, read back at once: a refused or immediately replaced action
+                // is the difference between "applied" in the trace and "never rendered" on the timeline.
+                Missions.Diagnostics.DuelEvents.Record("engine",
+                    "agent=" + Missions.Diagnostics.DuelEvents.Id8(agent) +
+                    " set=" + action.Index.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    " ok=" + (engineAccepted ? "1" : "0") +
+                    " ignPrio=" + (ignorePriority ? "1" : "0") +
+                    " after=" + agent.GetCurrentAction(channel).Index.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    "/" + ((int)agent.GetCurrentActionType(channel)).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    " flags=" + ((uint)agent.MovementFlags).ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+#endif
 
 #if DEBUG
             ActionWriteLog.SwingArrival(IsWindupForChannel(channel), 0);
@@ -760,6 +797,7 @@ namespace Missions.Agents.Packets
                 ActionApplyTrace.Outcome.Applied,
                 agent, channel, actionIndex, actionProgress,
                 traceEnabled, tracePuppetIndex, tracePuppetProgress, tracePuppetType);
+                RecordDuelApply("applied", agent, channel, actionIndex, actionProgress, tracePuppetIndex, tracePuppetProgress, tracePuppetType);
 
             // Speed and progress read AFTER the set, paired with the request from THIS call. Reading before
             // compared a new request against the previous value and reported ordinary churn as failure.
@@ -815,6 +853,32 @@ namespace Missions.Agents.Packets
 
         /// <summary>Whether THIS packet says the given channel carries a wind-up, read straight off the wire
         /// rather than from a type map learned only from actions that succeeded in being applied.</summary>
+#if DEBUG
+        /// <summary>
+        /// One <c>apply</c> line per upper-body apply decision while the duel recorder runs: which outcome, the
+        /// incoming action and progress, and what the puppet was playing. The aggregate trace said 91 of 91
+        /// wind-ups were applied while the timeline showed several never rendered; this is the per-event view.
+        /// </summary>
+        private void RecordDuelApply(string outcome, Agent agent, int channel, int actionIndex, float actionProgress,
+                                     int puppetIndex, float puppetProgress, int puppetType)
+        {
+            if (channel != 1 || !Missions.Diagnostics.DuelEvents.Enabled) return;
+            Missions.Diagnostics.DuelEvents.Record("apply",
+                "agent=" + Missions.Diagnostics.DuelEvents.Id8(agent) +
+                " out=" + outcome +
+                " in=" + actionIndex.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                (Action1IsMeleeSwing ? "(swing)" : "") +
+                "@" + actionProgress.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) +
+                " pup=" + puppetIndex.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                "/" + puppetType.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                "@" + puppetProgress.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) +
+                " guardCh=" + GuardActionChannel.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " guardDef=" + (GuardActionIsDefending ? "1" : "0") +
+                " flags=" + ((uint)DefendFlags).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " guard=" + ((int)GuardMode).ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
+#endif
+
         private bool IsWindupForChannel(int channel) =>
             channel == 0 ? Action0IsMeleeSwing : Action1IsMeleeSwing;
 

@@ -137,6 +137,63 @@ public class BattleInstanceCreationTests : MissionTestEnvironment
     }
 
     /// <summary>
+    /// A participant that asks to start the mission AGAIN (its client relaunched after a crash, or it retreated and
+    /// re-engages, BR-052) is not in the mission, whatever the server recorded from its first entry: it must be
+    /// sent the start again, while the other participant, still mid-battle, must not be torn out by a re-send.
+    /// Measured live on 5 Sep 2026 (`Scripts/Rig/runs/2026-09-05-1930-army-100-crash-host-rejoin`): the relaunched
+    /// host reconnected in 13 s, its entry request was answered "already in this mission; not re-sending its start",
+    /// no mission opened, and its army fought leaderless to the last man.
+    /// </summary>
+    [Fact]
+    [Trait("Requirement", "BR-052")]
+    public void RequesterRecordedAsStarted_IsSentTheStartAgain_OtherParticipantIsNot()
+    {
+        var (mapEventId, partyIds) = SetupCoopBattle("ctrl-A", "ctrl-B");
+        var troopId = CreateRegisteredObject<CharacterObject>();
+        var clients = Clients.ToArray();
+        Server.Resolve<IPlayerManager>().SetPeer("ctrl-A", clients[0].NetPeer);
+        Server.Resolve<IPlayerManager>().SetPeer("ctrl-B", clients[1].NetPeer);
+        Server.Call(() =>
+        {
+            Assert.True(Server.ObjectManager.TryGetObject<MobileParty>(partyIds[0], out var attacker));
+            Assert.True(Server.ObjectManager.TryGetObject<MobileParty>(partyIds[1], out var defender));
+            Assert.True(Server.ObjectManager.TryGetObject<CharacterObject>(troopId, out var troop));
+            using (new AllowedThread())
+            {
+                attacker.MemberRoster.AddToCounts(troop, 5);
+                defender.MemberRoster.AddToCounts(troop, 5);
+            }
+        }, MapEventDisabledMethods);
+        try
+        {
+            void RequestStart()
+            {
+                clients[0].Call(() => clients[0].Resolve<INetwork>().SendAll(new NetworkBattleStartRequest(
+                    Guid.NewGuid().ToString(),
+                    (int)BattleStartMode.Mission,
+                    mapEventId,
+                    partyIds[0])), MapEventDisabledMethods);
+                ReleaseTroopPreference(mapEventId);
+            }
+
+            Server.NetworkSentMessages.Clear();
+            RequestStart();
+            Assert.Equal(2, Server.NetworkSentMessages.GetMessages<NetworkStartAttackMission>().Count());
+
+            // ctrl-A's client is gone (crash) or back on the map (retreat) and asks again. Only it gets a start.
+            Server.NetworkSentMessages.Clear();
+            RequestStart();
+            var restarts = Server.NetworkSentMessages.GetMessages<NetworkStartAttackMission>().ToArray();
+            Assert.Single(restarts);
+            Assert.Equal(mapEventId, restarts[0].MapEventId);
+        }
+        finally
+        {
+            Server.Call(() => ServerBattleModeArbiter.Release(mapEventId));
+        }
+    }
+
+    /// <summary>
     /// Asserts the battle instance record on <paramref name="instance"/> is keyed by <paramref name="mapEventId"/>
     /// with the given host/successor line, and that the map event it names still resolves by — and round-trips
     /// back to — that same id (its association with the map event).

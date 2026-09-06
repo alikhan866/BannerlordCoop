@@ -296,6 +296,13 @@ internal class BattleMissionStartHandler : IHandler
                         payload.What.AttackerPartyId);
                 }
 
+                // The requester's client asked to START the mission, so it is not in one. A player relaunched
+                // after a crash, or one that retreated and re-engages (BR-052), was recorded as started by its
+                // first entry and was otherwise answered "already in this mission" and never sent the start:
+                // measured live on 5 Sep 2026, the relaunched host reconnected in 13 s, requested entry, got no
+                // mission, and watched its army die from the map. Only the requester is forgotten; the other
+                // participants keep their guard against being torn out of a running mission.
+                ForgetStartedController(payload.What.MapEventId, requester);
                 operation = "snapshot mission participants";
                 var participants = GetMissionParticipants(mapEvent);
 
@@ -713,6 +720,22 @@ internal class BattleMissionStartHandler : IHandler
                 : heroId);
         }
         return string.Join(", ", names);
+    }
+
+    private void ForgetStartedController(string mapEventId, NetPeer requester)
+    {
+        if (!playerManager.TryGetPlayer(requester, out var player) || string.IsNullOrEmpty(player.ControllerId))
+            return;
+        if (!missionStartedControllers.TryGetValue(mapEventId, out var deployed))
+            return;
+        bool forgotten;
+        lock (deployed) forgotten = deployed.Remove(player.ControllerId);
+        if (forgotten)
+        {
+            Logger.Information(
+                "[BattleMissionLifecycle] {MapEventId}: {ControllerId} asked to start the mission again (relaunch or re-engage); its start will be re-sent",
+                mapEventId, player.ControllerId);
+        }
     }
 
     private void SendMissionStart(IReadOnlyList<MissionParticipant> participants, IMessage message)

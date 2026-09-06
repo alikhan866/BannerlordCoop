@@ -131,7 +131,20 @@ internal static class AnimationTimeline
     private static bool enabled;
     private static long ticks;
 
+    /// <summary>
+    /// Duel mode: the two player agents are tracked from the moment recording starts, sampled EVERY tick, with a
+    /// buffer long enough for a two-minute exchange. The PvE arming rules (a 200-agent pool, 48 observed swingers,
+    /// 8 per side) can never be met in a 1v1, so they are bypassed instead of tuned.
+    /// </summary>
+    private static bool duelMode;
+    private static int samplesPerAgentLimit = SamplesPerAgent;
+    private static int sampleEveryNTicks = NarrativeEveryNTicks;
+
+    /// <summary>Two agents at 60 Hz for two minutes; ~40 bytes a sample keeps the dump near 600 KB, under the 1 MB cap.</summary>
+    private const int DuelSamplesPerAgent = 7200;
+
     public static bool Enabled => enabled;
+    public static bool DuelMode => duelMode;
 
     private struct Sample
     {
@@ -157,6 +170,42 @@ internal static class AnimationTimeline
         public int MountActionType;
         public short MountProgress;
         public short MountSpeedPercent;
+
+        // Duel fields. Health tells when a routed blow LANDED on each machine; the two directions tell what the
+        // owner was doing versus what the puppet shows (a swing to the left drawn as a swing to the right is a
+        // bug the action type alone cannot see); the usage index catches a spear drawn one-handed on one machine
+        // and two-handed on the other.
+        public short Health;
+        public sbyte AttackDirection;
+        // The upper-body action's direction (attack or defend), from GetCurrentActionDirection(1).
+        public sbyte DefendDirection;
+        public short UsageIndex;
+        // Channel 0 (legs/body): kicks, bashes and falls live there, invisible to the upper-body fields above.
+        public short Action0Index;
+        public sbyte Action0Type;
+        // Upper-body action STAGE (Agent.ActionStage): tells a live block from its lowering tail, which the type field cannot.
+        public sbyte Action1Stage;
+    }
+
+    /// <summary>
+    /// Records exactly <paramref name="agentIds"/> from now on, every tick, for <see cref="DuelSamplesPerAgent"/>
+    /// samples each. Used by the duel rig, where the two players are known up front.
+    /// </summary>
+    public static void StartDuel(IReadOnlyList<Guid> agentIds)
+    {
+        Start();
+        lock (Gate)
+        {
+            duelMode = true;
+            samplesPerAgentLimit = DuelSamplesPerAgent;
+            sampleEveryNTicks = 1;
+            foreach (Guid id in agentIds)
+            {
+                if (Tracked.Contains(id)) continue;
+                Tracked.Add(id);
+                Samples[id] = new List<Sample>(DuelSamplesPerAgent);
+            }
+        }
     }
 
     public static void Start()
@@ -166,6 +215,9 @@ internal static class AnimationTimeline
             Tracked.Clear();
             Samples.Clear();
             SwingObserved.Clear();
+            duelMode = false;
+            samplesPerAgentLimit = SamplesPerAgent;
+            sampleEveryNTicks = NarrativeEveryNTicks;
             ticks = 0;
             censusSamples = 0;
             localAgentTicks = 0;
@@ -193,7 +245,7 @@ internal static class AnimationTimeline
 
             if (Tracked.Count == 0 && !SelectAgents(registry)) return;
 
-            if (ticks % NarrativeEveryNTicks != 0) return;
+            if (ticks % sampleEveryNTicks != 0) return;
 
             bool anyRoom = false;
             long now = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
@@ -202,7 +254,7 @@ internal static class AnimationTimeline
             {
                 Guid id = Tracked[i];
                 if (!Samples.TryGetValue(id, out List<Sample> log)) continue;
-                if (log.Count >= SamplesPerAgent) continue;
+                if (log.Count >= samplesPerAgentLimit) continue;
 
                 anyRoom = true;
                 if (!registry.TryGetAgentInfo(id, out CoopAgentInfo info) || info.Agent == null) continue;
@@ -235,6 +287,13 @@ internal static class AnimationTimeline
                         MountActionType = MountActionTypeOf(agent),
                         MountProgress = MountProgressOf(agent),
                         MountSpeedPercent = MountSpeedOf(agent),
+                        Health = HealthOf(agent),
+                        AttackDirection = (sbyte)Math.Max(-1, Math.Min(127, (int)agent.AttackDirection)),
+                        DefendDirection = (sbyte)Math.Max(-1, Math.Min(127, (int)agent.GetCurrentActionDirection(1))),
+                        UsageIndex = UsageIndexOf(agent),
+                        Action0Index = (short)Math.Max(-1, Math.Min(short.MaxValue, agent.GetCurrentAction(0).Index)),
+                        Action0Type = (sbyte)Math.Max(-1, Math.Min(127, (int)agent.GetCurrentActionType(0))),
+                        Action1Stage = (sbyte)Math.Max(-1, Math.Min(127, (int)agent.GetCurrentActionStage(1))),
                     });
                 }
                 catch (Exception)
@@ -425,6 +484,29 @@ internal static class AnimationTimeline
         catch (Exception) { return -1; }
     }
 
+    private static short HealthOf(Agent agent)
+    {
+        try
+        {
+            float health = agent.Health;
+            if (float.IsNaN(health) || health < 0f) return -1;
+            return health > short.MaxValue ? short.MaxValue : (short)health;
+        }
+        catch (Exception) { return -1; }
+    }
+
+    /// <summary>The wielded main-hand weapon's usage index (spear one- versus two-handed), -1 when nothing is wielded.</summary>
+    private static short UsageIndexOf(Agent agent)
+    {
+        try
+        {
+            MissionWeapon weapon = agent.WieldedWeapon;
+            if (weapon.IsEmpty) return -1;
+            return (short)weapon.CurrentUsageIndex;
+        }
+        catch (Exception) { return -1; }
+    }
+
     private static int ToDecimetres(float value)
     {
         if (float.IsNaN(value) || float.IsInfinity(value)) return int.MinValue;
@@ -496,6 +578,19 @@ internal static class AnimationTimeline
                     text.Append('m').Append(sample.MountActionType.ToString(CultureInfo.InvariantCulture));
                     text.Append('/').Append(sample.MountProgress.ToString(CultureInfo.InvariantCulture));
                     text.Append('/').Append(sample.MountSpeedPercent.ToString(CultureInfo.InvariantCulture));
+                    // Duel fields, appended after the mount fields so the PvE analyser's regex still parses the
+                    // prefix it knows: h<health>a<attackDir>f<defendDir>u<usageIndex>.
+                    // Duel-only: with eight swingers a side these fields pushed the PvE dump past the 1 MiB
+                    // live-test message cap (the PvE analyser read zeros). analyze_timeline.py treats them as optional.
+                    if (duelMode)
+                    {
+                        text.Append('h').Append(sample.Health.ToString(CultureInfo.InvariantCulture));
+                        text.Append('a').Append(sample.AttackDirection.ToString(CultureInfo.InvariantCulture));
+                        text.Append('f').Append(sample.DefendDirection.ToString(CultureInfo.InvariantCulture));
+                        text.Append('u').Append(sample.UsageIndex.ToString(CultureInfo.InvariantCulture));
+                        text.Append('k').Append(sample.Action0Index.ToString(CultureInfo.InvariantCulture)).Append('/').Append(sample.Action0Type.ToString(CultureInfo.InvariantCulture));
+                        text.Append('g').Append(sample.Action1Stage.ToString(CultureInfo.InvariantCulture));
+                    }
                 }
                 text.Append(']');
             }

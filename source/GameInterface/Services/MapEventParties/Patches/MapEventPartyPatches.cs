@@ -3,7 +3,9 @@ using Common.Messaging;
 using GameInterface.Policies;
 using GameInterface.Services.MapEvents;
 using GameInterface.Services.MapEventParties.Messages;
+using Common.Logging;
 using HarmonyLib;
+using Serilog;
 using Helpers;
 using System;
 using System.Collections.Generic;
@@ -21,6 +23,8 @@ namespace GameInterface.Services.MapEventParties.Patches;
 [HarmonyPatch(typeof(MapEventParty))]
 internal class MapEventPartyPatches
 {
+    private static readonly ILogger Logger = LogManager.GetLogger<MapEventPartyPatches>();
+
     [HarmonyPatch(nameof(MapEventParty.OnTroopKilled))]
     [HarmonyPrefix]
     private static bool PrefixOnTroopKilled(MapEventParty __instance, ref UniqueTroopDescriptor troopSeed)
@@ -125,6 +129,24 @@ internal class MapEventPartyPatches
                     }
                 }
             }
+            // Diagnostic: XP is accrued per hit into FlattenedTroopRosterElement.XpGained and only turned
+            // into real troop XP here, at finalize. Nothing on this path logs, so 'my troops got no XP'
+            // gives no way to tell WHICH step lost it - never accrued, accrued then reset, or committed
+            // twice with the second pass finding an already-reset roster.
+            int pendingTroops = 0, pendingXp = 0;
+            foreach (var e in __instance._roster)
+            {
+                if (e.IsKilled || e.XpGained <= 0) continue;
+                pendingTroops++;
+                pendingXp += e.XpGained;
+            }
+            Logger.Information(
+                "[CommitXp] party={Party} troopsWithXp={Troops} xpPending={Xp} distinctTroops={Distinct}",
+                __instance.Party?.MobileParty?.StringId ?? __instance.Party?.Id.ToString(),
+                pendingTroops,
+                pendingXp,
+                dictionary.Count);
+
             __instance._roster.ResetTroopXP();
             foreach (KeyValuePair<CharacterObject, int> keyValuePair in dictionary)
             {

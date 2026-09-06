@@ -56,6 +56,8 @@ public static class DamageAttributionPatch
     private static void Measure(Agent attacker, Agent victim, Blow b, ref AttackCollisionData collisionData)
     {
         if (attacker == null) return;
+        // The duel rig's per-blow event, before the aggregate counters' gate: the two are armed separately.
+        DuelEvents.RecordBlow(attacker, victim, in b, in collisionData);
         if (!DamageAttributionDiagnostics.Enabled) return;
         if (Mission.Current?.GetMissionBehavior<CoopMissionController>() == null) return;
 

@@ -9,6 +9,7 @@ using Missions.Diagnostics;
 using Missions.Messages;
 using Missions.Services.Network;
 using System;
+using System.Diagnostics;
 using System.Collections.Generic;
 using System.Threading;
 using TaleWorlds.Core;
@@ -44,6 +45,32 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
     // These indexes keep the per-tick paths scoped to agents that currently need work.
     private readonly HashSet<Guid> _pendingActionAgentIds = new HashSet<Guid>();
     private readonly HashSet<Guid> _retainedGuardAgentIds = new HashSet<Guid>();
+    private readonly HashSet<Guid> _pendingReadyAgentIds = new HashSet<Guid>();
+    /// <summary>
+    /// Guard releases waiting for the puppet's OWN engine to lower the shield, the way the owner's engine does when
+    /// the block key comes up (about 250 ms at stage Defend, during which a swing still bounces). Forced to act_none
+    /// only if the puppet is still holding the guard action after the grace (PVP-SYNC-PLAN P4).
+    /// </summary>
+    private readonly Dictionary<Guid, PendingGuardRelease> _pendingGuardReleases = new Dictionary<Guid, PendingGuardRelease>();
+    private const float GuardReleaseGraceSeconds = 0.45f;
+
+    private readonly struct PendingGuardRelease
+    {
+        public PendingGuardRelease(Agent agent, int channel, ActionIndexCache guardAction, long startedTicks)
+        {
+            Agent = agent;
+            Channel = channel;
+            GuardAction = guardAction;
+            StartedTicks = startedTicks;
+        }
+
+        public Agent Agent { get; }
+        public int Channel { get; }
+        public ActionIndexCache GuardAction { get; }
+        public long StartedTicks { get; }
+    }
+    /// <summary>How often one applied wind-up is put back before the receiver gives up on it.</summary>
+    private const int MaximumReadyReasserts = 2;
     private readonly Dictionary<int, MigrationLineage> _migrationLineages =
         new Dictionary<int, MigrationLineage>();
     private readonly HashSet<string> _knownBattleHostControllers =
@@ -60,12 +87,16 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
         public RemoteActionSequence? LastSequence;
         public Dictionary<string, RemoteAction> PendingByController;
         public MigratedActionAuthority? MigratedAuthority;
+        /// <summary>The ReadyMelee the owner's last packet put on channel 1, or -1; see ReassertDroppedReadies.</summary>
+        public int PendingReadyIndex = -1;
+        public int PendingReadyReasserts;
 
         public bool IsEmpty =>
             RetainedGuard == null
             && !LastSequence.HasValue
             && (PendingByController == null || PendingByController.Count == 0)
-            && !MigratedAuthority.HasValue;
+            && !MigratedAuthority.HasValue
+            && PendingReadyIndex < 0;
     }
 
     private enum RemoteActionApplyResult
@@ -264,12 +295,15 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
         _agentStates.Remove(agentId);
         _pendingActionAgentIds.Remove(agentId);
         _retainedGuardAgentIds.Remove(agentId);
+        _pendingReadyAgentIds.Remove(agentId);
+        _pendingGuardReleases.Remove(agentId);
+        state.PendingReadyIndex = -1;
         if (state.RetainedGuard == null) return;
         if (agent == null || agent.Mission != Mission.Current || !agent.IsActive()) return;
 
         using (new AllowedThread())
         {
-            ClearRemoteDefendState(agent, state.RetainedGuard);
+            ClearRemoteDefendState(agent, state.RetainedGuard, immediate: true);
         }
     }
 
@@ -296,6 +330,213 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
 
         ApplyRetainedRemoteGuardStates(
             RemoteGuardTickPhase.AfterNativeTick);
+        ReassertDroppedReadies();
+        SettlePendingGuardReleases();
+    }
+
+    /// <summary>
+    /// Ends deferred guard releases: as soon as the puppet's engine has left the guard action nothing is needed;
+    /// a guard still standing after the grace is forced down the old way (act_none with the release blend).
+    /// </summary>
+    private void SettlePendingGuardReleases()
+    {
+        if (_pendingGuardReleases.Count == 0) return;
+
+        List<Guid> done = null;
+        long now = Stopwatch.GetTimestamp();
+        using (new AllowedThread())
+        {
+            foreach (KeyValuePair<Guid, PendingGuardRelease> pair in _pendingGuardReleases)
+            {
+                PendingGuardRelease pending = pair.Value;
+                Agent agent = pending.Agent;
+                if (agent == null || agent.Mission != Mission.Current || !agent.IsActive())
+                {
+                    (done ??= new List<Guid>()).Add(pair.Key);
+                    continue;
+                }
+
+                float elapsed = (float)(now - pending.StartedTicks) / Stopwatch.Frequency;
+                bool stillHolding;
+                try
+                {
+                    stillHolding = agent.GetCurrentAction(pending.Channel) == pending.GuardAction;
+                }
+                catch (Exception)
+                {
+                    (done ??= new List<Guid>()).Add(pair.Key);
+                    continue;
+                }
+
+                if (!stillHolding)
+                {
+#if DEBUG
+                    if (Missions.Diagnostics.DuelEvents.Enabled)
+                        Missions.Diagnostics.DuelEvents.Record("guardrelease",
+                            "agent=" + Missions.Diagnostics.DuelEvents.Id8(agent) + " how=natural ms=" +
+                            (elapsed * 1000f).ToString("0", System.Globalization.CultureInfo.InvariantCulture));
+#endif
+                    (done ??= new List<Guid>()).Add(pair.Key);
+                    continue;
+                }
+
+                if (elapsed < GuardReleaseGraceSeconds) continue;
+
+#if DEBUG
+                if (Missions.Diagnostics.DuelEvents.Enabled)
+                    Missions.Diagnostics.DuelEvents.Record("guardrelease",
+                        "agent=" + Missions.Diagnostics.DuelEvents.Id8(agent) + " how=forced ms=" +
+                        (elapsed * 1000f).ToString("0", System.Globalization.CultureInfo.InvariantCulture));
+                ActionWriteLog.Record(ActionWriteLog.Source.RetainedGuardRelease, 0f, restart: true);
+#endif
+                agent.SetActionChannel(
+                    pending.Channel,
+                    ActionIndexCache.act_none,
+                    ignorePriority: true,
+                    additionalFlags: AnimFlags.anf_restart,
+                    blendInPeriod: RetainedGuardReleaseBlendPeriod,
+                    forceFaceMorphRestart: false);
+                (done ??= new List<Guid>()).Add(pair.Key);
+            }
+        }
+
+        if (done == null) return;
+        foreach (Guid agentId in done)
+            _pendingGuardReleases.Remove(agentId);
+    }
+
+    /// <summary>
+    /// Remembers the wind-up the owner's packet just put on channel 1, so the native tick cannot quietly drop it.
+    /// Any packet that is not a held ReadyMelee (a release, a cancel, a block) ends the watch.
+    /// </summary>
+    private void TrackPendingReady(Guid agentId, Agent agent, AgentActionData data)
+    {
+        bool holdsReady;
+        try
+        {
+            holdsReady = data.Action1IsMeleeSwing
+                && agent.GetCurrentActionType(1) == Agent.ActionCodeType.ReadyMelee;
+        }
+        catch (Exception)
+        {
+            holdsReady = false;
+        }
+
+        RemoteAgentActionState state = GetOrCreateAgentState(agentId);
+        if (holdsReady)
+        {
+            int index = agent.GetCurrentAction(1).Index;
+            if (state.PendingReadyIndex != index)
+                state.PendingReadyReasserts = 0;
+            state.PendingReadyIndex = index;
+            _pendingReadyAgentIds.Add(agentId);
+        }
+        else
+        {
+            state.PendingReadyIndex = -1;
+            state.PendingReadyReasserts = 0;
+            _pendingReadyAgentIds.Remove(agentId);
+        }
+    }
+
+    /// <summary>
+    /// Puts back a wind-up the engine dropped. On the duel rig the owner's ReadyMelee was written to the puppet
+    /// (SetActionChannel returned true and read back as ReadyMelee) and the very next tick the puppet was idle
+    /// again, with no further packet - in about one attack out of five in the mixed script, always a swing that
+    /// started as another action (a bash, a block release, a stale swing) was ending. A ReadyMelee is a held state
+    /// the owner has not left, so an idle puppet is wrong by definition; a puppet that was struck, blocked or
+    /// parried is not (the reaction is real and the owner's next packet says what follows).
+    /// </summary>
+    private void ReassertDroppedReadies()
+    {
+        if (_pendingReadyAgentIds.Count == 0) return;
+
+        List<Guid> finished = null;
+        using (new AllowedThread())
+        {
+            foreach (Guid agentId in _pendingReadyAgentIds)
+            {
+                if (!_agentStates.TryGetValue(agentId, out RemoteAgentActionState state)
+                    || state.PendingReadyIndex < 0)
+                {
+                    (finished ??= new List<Guid>()).Add(agentId);
+                    continue;
+                }
+
+                if (agentRegistry.IsLocallyControlled(agentId)
+                    || !agentRegistry.TryGetAgentInfo(agentId, out CoopAgentInfo info)
+                    || info.Agent == null
+                    || info.Agent.Mission != Mission.Current
+                    || !info.Agent.IsActive())
+                {
+                    state.PendingReadyIndex = -1;
+                    (finished ??= new List<Guid>()).Add(agentId);
+                    continue;
+                }
+
+                Agent agent = info.Agent;
+                Agent.ActionCodeType current;
+                int currentIndex;
+                try
+                {
+                    current = agent.GetCurrentActionType(1);
+                    currentIndex = agent.GetCurrentAction(1).Index;
+                }
+                catch (Exception)
+                {
+                    continue;
+                }
+
+                // Still winding up (or released on its own timeline): nothing to do.
+                if (AgentActionData.IsMeleeSwingType(current)) continue;
+
+                // Anything but idle is a real event on the puppet (a hit, a fall, a weapon switch): leave it.
+                bool idle = currentIndex == ActionIndexCache.act_none.Index
+                    || current == Agent.ActionCodeType.Other
+                    || current == Agent.ActionCodeType.Idle
+                    || current == Agent.ActionCodeType.Guard;
+                if (!idle || state.PendingReadyReasserts >= MaximumReadyReasserts)
+                {
+                    state.PendingReadyIndex = -1;
+                    state.PendingReadyReasserts = 0;
+                    (finished ??= new List<Guid>()).Add(agentId);
+                    continue;
+                }
+
+                state.PendingReadyReasserts++;
+                var ready = new ActionIndexCache(state.PendingReadyIndex);
+                bool accepted = agent.SetActionChannel(
+                    1,
+                    ready,
+                    ignorePriority: true,
+                    startProgress: 0f);
+#if DEBUG
+                MissionActionDiagnostics.RecordActionCommand(
+                    agent,
+                    1,
+                    ready.Index,
+                    0f,
+                    (AnimFlags)0,
+                    "ready-reassert");
+                if (Missions.Diagnostics.DuelEvents.Enabled)
+                    Missions.Diagnostics.DuelEvents.Record("reassert",
+                        "agent=" + Missions.Diagnostics.DuelEvents.Id8(agent) +
+                        " ready=" + ready.Index.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                        " n=" + state.PendingReadyReasserts.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                        " was=" + currentIndex.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/" + ((int)current).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                        " ok=" + (accepted ? "1" : "0") +
+                        " after=" + agent.GetCurrentAction(1).Index.ToString(System.Globalization.CultureInfo.InvariantCulture));
+#endif
+            }
+        }
+
+        if (finished == null) return;
+        foreach (Guid agentId in finished)
+        {
+            _pendingReadyAgentIds.Remove(agentId);
+            if (_agentStates.TryGetValue(agentId, out RemoteAgentActionState state))
+                RemoveAgentStateIfEmpty(agentId, state);
+        }
     }
 
     private void ApplyRetainedRemoteGuardStates(
@@ -343,7 +584,7 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
                     guardState.Action.ControllerId,
                     guardState.Action.BattleHostEpoch))
                 {
-                    ClearRemoteDefendState(agent, guardState);
+                    ClearRemoteDefendState(agent, guardState, immediate: true);
                     (staleIds ??= new List<Guid>()).Add(agentId);
                     continue;
                 }
@@ -790,6 +1031,7 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
                     || mountedGuardRearm
                         == MountedGuardRearmPhase.NeutralInputObserved);
         }
+        TrackPendingReady(agentId, agent, action.Data);
         bool retainsGuard = action.Data.DefendFlags != Agent.MovementControlFlag.None
             || AgentActionData.IsGuardMode(action.Data.GuardMode)
             || (hasMountedGuardPresentation
@@ -1029,6 +1271,7 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
             RemoteAgentActionState retainedState = GetOrCreateAgentState(agentId);
             retainedState.RetainedGuard = guardState;
             _retainedGuardAgentIds.Add(agentId);
+            _pendingGuardReleases.Remove(agentId);
             return;
         }
 
@@ -1255,7 +1498,8 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
 
     private void ClearRetainedGuardAction(
         Agent agent,
-        RemoteGuardState retainedGuard)
+        RemoteGuardState retainedGuard,
+        bool immediate = false)
     {
         if (retainedGuard == null) return;
 
@@ -1266,6 +1510,20 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
         bool ownsAgentAction = currentAction == retainedGuard.GuardAction;
         if (!ownsAgentAction && currentAction != ActionIndexCache.act_none)
             return;
+
+        // The puppet is playing the guard action it was told to hold. Its engine has just been given the
+        // released flags and guard mode (ClearRemoteDefendState), so let it lower the shield on its own clock
+        // exactly as the owner's engine does; SettlePendingGuardReleases forces the old act_none only if the
+        // guard is still standing after the grace. Measured before this: the puppet read idle 20-25 ms after
+        // the owner's key came up while the owner's engine stayed at stage Defend for ~250 ms, and every melee
+        // hit "through a block" on the rig landed in that window.
+        if (ownsAgentAction && !immediate
+            && agentRegistry.TryGetAgentInfo(agent, out CoopAgentInfo releaseInfo))
+        {
+            _pendingGuardReleases[releaseInfo.AgentId] =
+                new PendingGuardRelease(agent, channel, retainedGuard.GuardAction, Stopwatch.GetTimestamp());
+            return;
+        }
 
         if (!ownsAgentAction
             && !agentVisualActionAccessor.IsActionVisible(
@@ -1310,9 +1568,10 @@ public class RemoteAgentActionProcessor : IRemoteAgentActionProcessor
 
     private void ClearRemoteDefendState(
         Agent agent,
-        RemoteGuardState retainedGuard = null)
+        RemoteGuardState retainedGuard = null,
+        bool immediate = false)
     {
-        ClearRetainedGuardAction(agent, retainedGuard);
+        ClearRetainedGuardAction(agent, retainedGuard, immediate);
         AgentActionData.ApplyDefendMovementFlags(
             agent,
             Agent.MovementControlFlag.None);

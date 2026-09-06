@@ -5,12 +5,15 @@ using Common.Network;
 using GameInterface.Services.MapEvents;
 using GameInterface.Services.MapEvents.Logging;
 using GameInterface.Services.MapEvents.Messages;
+using GameInterface.Services.MapEvents.TroopSupply;
+using GameInterface.Services.MapEvents.Messages.Leave;
 using GameInterface.Services.ObjectManager;
 using GameInterface.Services.Players;
 using LiteNetLib;
 using Serilog;
 using System;
 using TaleWorlds.CampaignSystem.MapEvents;
+using TaleWorlds.CampaignSystem.Party;
 using TaleWorlds.Core;
 
 namespace GameInterface.Services.MapEvents.Handlers;
@@ -26,11 +29,13 @@ internal class MapEventHandler : IHandler
     private readonly IBattleHostRegistry hostRegistry;
     private readonly IPlayerManager playerManager;
     private readonly IFinalizedBattleRetention finalizedBattles;
+    private readonly IBattleTroopReserveBuilder reserveBuilder;
 
     public MapEventHandler(IMessageBroker messageBroker, INetwork network, IObjectManager objectManager,
         IMapEventLogger mapEventLogger, IBattleHostRegistry hostRegistry, IPlayerManager playerManager,
-        IFinalizedBattleRetention finalizedBattles)
+        IFinalizedBattleRetention finalizedBattles, IBattleTroopReserveBuilder reserveBuilder)
     {
+        this.reserveBuilder = reserveBuilder;
         this.messageBroker = messageBroker;
         this.network = network;
         this.objectManager = objectManager;
@@ -97,6 +102,30 @@ internal class MapEventHandler : IHandler
             payload.What.HostEpoch,
             null,
             true);
+    }
+
+    /// <summary>
+    /// A player who RETREATED from the mission is still a member of the map event on the server, so when the
+    /// remaining side's mission ends in its favour the native conclusion counts the retreated party as
+    /// DEFEATED: every man taken prisoner and the hero captured. Measured live on 5 Sep 2026 in both roles: a
+    /// retreat at 47 s with 96 men standing ended as a party of 0 and a captive. Vanilla treats a party that
+    /// left the encounter as escaped, so each retreated party leaves the event through the authoritative leave
+    /// (the same path as the encounter-menu leave) before the state is committed. A retreater that re-engaged
+    /// had its mark cleared when its reserves were rebuilt (BR-052), so it is finalized like any other member.
+    /// </summary>
+    private void LeaveRetreatedParties(MapEvent mapEvent, string mapEventId, BattleState battleState)
+    {
+        foreach (var mobilePartyId in reserveBuilder.GetRetreatedMobilePartyIds(mapEvent))
+        {
+            if (!objectManager.TryGetObject<MobileParty>(mobilePartyId, out var mobileParty) || mobileParty?.Party == null)
+                continue;
+            if (mobileParty.Party.MapEvent != mapEvent)
+                continue;
+            Logger.Information(
+                "[MapEvent] {Party} retreated from battle {MapEventId} and leaves it before the {BattleState} conclusion: a retreat is not a defeat",
+                mobilePartyId, mapEventId, battleState);
+            messageBroker.Publish(this, new PlayerLeaveBattleAttempted(mobileParty.Party, finishLocalMenus: true));
+        }
     }
 
     private void ApplyBattleStateChange(
@@ -203,6 +232,19 @@ internal class MapEventHandler : IHandler
                     }
                 }
 
+                if (isAuthoritativeServerConclusion)
+                {
+                    LeaveRetreatedParties(mapEvent, mapEventId, battleState);
+                    if (mapEvent.BattleState != BattleState.None || mapEvent.IsFinalized)
+                    {
+                        // Letting the last party of a side go can end the event natively; then the state is
+                        // already set and committing it again would run the victory cascade twice.
+                        applied = mapEvent.BattleState == battleState;
+                        Logger.Information("Battle {MapEventId} concluded natively while its retreated parties left; not committing {BattleState} again (state {Current}, finalized {Finalized})",
+                            mapEventId, battleState, mapEvent.BattleState, mapEvent.IsFinalized);
+                        return;
+                    }
+                }
                 playerPartyIds = MapEventPlayerPartyCollector.CollectPartyIds(mapEvent, objectManager);
                 publishConclusion = battleState == BattleState.AttackerVictory ||
                     battleState == BattleState.DefenderVictory;

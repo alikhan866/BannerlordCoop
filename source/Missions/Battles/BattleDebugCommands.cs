@@ -829,6 +829,22 @@ internal static class BattleDebugCommands
             bool deploymentReady = mission.GetMissionBehavior<DeploymentMissionController>()?.TeamSetupOver == true;
             int activeAgents = mission.Agents.Count(agent => agent.IsActive());
             int enemyFleeing = enemies.Count(agent => agent.IsRunningAway);
+            // Humans only, per side: activeAgents counts horses too, which put a constant offset of two into the
+            // army rig's "my side as I count it versus as the other machine counts it" (run army-100).
+            int humans = 0, ownActive = 0, ownFleeing = 0;
+            if (playerTeam != null)
+            {
+                foreach (var agent in mission.Agents)
+                {
+                    if (!agent.IsActive() || !agent.IsHuman) continue;
+                    humans++;
+                    if (agent.Team?.Side == playerTeam.Side)
+                    {
+                        ownActive++;
+                        if (agent.IsRunningAway) ownFleeing++;
+                    }
+                }
+            }
             var result = mission.MissionResult;
             var suppliers = CoopTroopSupplierRegistry.GetSuppliers(controller.Session.InstanceId);
             var receiverReserves = suppliers
@@ -844,6 +860,7 @@ internal static class BattleDebugCommands
                 $"playerSide={playerTeam?.Side.ToString() ?? "None"} enemyParties={enemyParties} enemyActive={enemies.Count} " +
                 $"enemyAi={enemies.Count(agent => agent.IsAIControlled)} enemyFleeing={enemyFleeing} " +
                 $"enemyMovedSinceLast={moved} damageReceivedEvents={ownDamageEvents} " +
+                $"humans={humans} ownActive={ownActive} ownFleeing={ownFleeing} " +
                 $"resultState={result?.BattleState.ToString() ?? "None"} " +
                 $"battleResolved={result?.BattleResolved ?? false} playerVictory={result?.PlayerVictory ?? false}");
         }

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using Common.Logging;
 using HarmonyLib;
 using Serilog;
@@ -26,20 +26,45 @@ namespace GameInterface.Services.MapEvents.Patches;
 /// the mission tick during a teardown path, and a diagnostic must never be the reason a battle behaves
 /// differently.
 /// </remarks>
+/// <summary>
+/// Test-rig switch: while set, the boundary handler does not punish anybody on this machine (no "leaving the
+/// battlefield" retreat). Set only by the DEBUG duel command <c>coop.debug.duel.boundary off</c>; a horse that
+/// overshoots the field ended the whole mission for both players twice (runs p6-ride, m-lance-before).
+/// </summary>
+public static class BattleBoundaryOverride
+{
+    public static volatile bool SuppressPunishment;
+}
+
 [HarmonyPatch(typeof(MissionBoundaryCrossingHandler), nameof(MissionBoundaryCrossingHandler.DecideOrHandleAgentPunishment))]
 internal class BattleBoundaryDiagnosticPatch
 {
     private static readonly ILogger Logger = LogManager.GetLogger<BattleBoundaryDiagnosticPatch>();
+    private static long lastSuppressedLogTicks;
 
     [HarmonyPrefix]
-    private static void Prefix(Agent agent)
+    private static bool Prefix(Agent agent)
     {
-        if (!BattleSpawnConfig.Enabled || !BattleSpawnGate.IsCoopBattleActive) return;
+        if (!BattleSpawnConfig.Enabled || !BattleSpawnGate.IsCoopBattleActive) return true;
+
+        // The rig's immunity: log that it fired (once per few seconds - the expired leave timer re-fires every
+        // tick), skip the punishment.
+        if (BattleBoundaryOverride.SuppressPunishment)
+        {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (now - lastSuppressedLogTicks > 5L * System.Diagnostics.Stopwatch.Frequency)
+            {
+                lastSuppressedLogTicks = now;
+                Logger.Warning("[Boundary] Punishment of {Who} SUPPRESSED (test rig boundary override)",
+                    agent == Mission.Current?.MainAgent ? "THE LOCAL PLAYER" : "an agent");
+            }
+            return false;
+        }
 
         try
         {
             var mission = Mission.Current;
-            if (mission == null || agent == null) return;
+            if (mission == null || agent == null) return true;
 
             var position = agent.Position.AsVec2;
 
@@ -59,6 +84,7 @@ internal class BattleBoundaryDiagnosticPatch
         {
             Logger.Warning(e, "[Boundary] Could not record why the boundary handler is punishing an agent");
         }
+        return true;
     }
 
     private static bool? Inside(Mission mission, Vec2 position, bool hard)

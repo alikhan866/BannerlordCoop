@@ -156,6 +156,16 @@ public sealed class MovementRateController : IMovementRateController
     private const int ReceiverCapHeartbeatMilliseconds = 1000;
     private const int HealthyWindowsBeforeIncrease = 4;
     private const int MaximumAdaptiveHz = 60;
+    /// <summary>
+    /// The player lane (PVP-SYNC-PLAN section 3): the local player's own agent (and its mount) is polled and sent
+    /// at least at this rate in battles, no matter where the adaptive ladder, a forced rate or a slow peer's cap
+    /// put the crowd's bulk rate. Measured at 60 on the duel rig with the bulk rate forced to 20 (P1, 2026-09-05):
+    /// no change in onset latency (20-28 ms either way), wind-up rendering or position error (p90 0.00 m, max
+    /// 0.1-0.2 m at both rates), for +1.2 ms of sender time per second and +2-6 mesh messages per second. The
+    /// plan's cost rule (0.5 ms/s) decides: 40, which is also what the sender did before the lane was named.
+    /// Raise it only with a before/after on the mounted duel (P6), where speeds are five times higher.
+    /// </summary>
+    public const int PlayerLaneHz = 40;
     private const double RejectedRateRetryCostRatio = 0.9d;
 
     internal enum MovementReceiveHealth
@@ -839,7 +849,7 @@ public sealed class MovementRateController : IMovementRateController
             reason = localReason;
         }
 
-        priorityHz = Math.Max(40, bulkHz);
+        priorityHz = Math.Max(PlayerLaneHz, bulkHz);
     }
 
     private void PruneExpiredReceiverCaps()

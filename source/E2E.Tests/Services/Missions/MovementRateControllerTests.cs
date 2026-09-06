@@ -71,7 +71,7 @@ public sealed class MovementRateControllerTests
 
         Assert.Equal(60, state.PerformanceCeilingHz);
         Assert.Equal(40, state.BulkHz);
-        Assert.Equal(40, state.PriorityHz);
+        Assert.Equal(MovementRateController.PlayerLaneHz, state.PriorityHz);
         Assert.Equal("battle-start", state.Reason);
     }
 
@@ -87,7 +87,7 @@ public sealed class MovementRateControllerTests
 
         MovementRateSnapshot capped = fixture.Controller.Snapshot;
         Assert.Equal(40, capped.BulkHz);
-        Assert.Equal(40, capped.PriorityHz);
+        Assert.Equal(MovementRateController.PlayerLaneHz, capped.PriorityHz);
         Assert.Equal("slow-peer", capped.PeerReceiverCapSource);
         Assert.Equal(15, fixture.Controller.GetReceiverCapHz("slow-peer"));
         Assert.Equal(60, fixture.Controller.GetReceiverCapHz("healthy-peer"));
@@ -640,6 +640,24 @@ public sealed class MovementRateControllerTests
         Assert.Equal(125, fixture.Controller.Snapshot.WireBytesPerSecond);
     }
 
+    [Theory]
+    [InlineData(10)]
+    [InlineData(20)]
+    public void BattleProfile_PlayerLaneHoldsSixtyWhenBulkRateIsForcedDown(int forcedBulkHz)
+    {
+        using var fixture = new RateControllerFixture();
+        fixture.Controller.Configure(MovementCadenceProfile.Battle);
+        fixture.Controller.ReportPopulation(1800, 900);
+
+        Assert.True(fixture.Controller.TrySetForcedBulkHz(forcedBulkHz, out string error));
+        Assert.Null(error);
+
+        MovementRateSnapshot state = fixture.Controller.Snapshot;
+        Assert.Equal(forcedBulkHz, state.BulkHz);
+        Assert.Equal(MovementRateController.PlayerLaneHz, state.PriorityHz);
+        Assert.Equal(40, MovementRateController.PlayerLaneHz);
+    }
+
     [Fact]
     public void BattleProfile_ForcedRateSupportsBenchmarkSweep()
     {
@@ -656,7 +674,7 @@ public sealed class MovementRateControllerTests
         Assert.True(fixture.Controller.TrySetForcedBulkHz(null, out error));
         Assert.Null(error);
         Assert.Equal(40, fixture.Controller.Snapshot.BulkHz);
-        Assert.Equal(40, fixture.Controller.Snapshot.PriorityHz);
+        Assert.Equal(MovementRateController.PlayerLaneHz, fixture.Controller.Snapshot.PriorityHz);
     }
 
     [Fact]

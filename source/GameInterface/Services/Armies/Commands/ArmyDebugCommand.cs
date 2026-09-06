@@ -11,6 +11,7 @@ using TaleWorlds.CampaignSystem.Actions;
 using TaleWorlds.CampaignSystem.Party;
 using TaleWorlds.CampaignSystem.Settlements;
 using static TaleWorlds.CampaignSystem.Army;
+using Common.Util;
 
 namespace GameInterface.Services.Armies.Commands;
 
@@ -397,6 +398,209 @@ public class ArmyDebugCommand
             sb.AppendLine($"leaderparty owner {army?.LeaderParty.Owner.Name}");
             sb.AppendLine($"armycohesion: {army?.Cohesion}");
             return Succeeded(sb.ToString());
+        }
+    }
+
+    // coop.debug.army.prisoners <ArmyId>
+    /// <summary>Prisoner count of every party in an army, so a sell can be seen happening.</summary>
+    public sealed class ArmyPrisonersCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.army";
+
+        public string Name => "prisoners";
+
+        public string Description => "Prisoner count of every party in an army, so a sell can be seen happening.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("army_id", "The registered army id."),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (!ContainerProvider.TryResolve<IObjectManager>(out var objectManager))
+                return Failed($"Unable to get {nameof(IObjectManager)}");
+            if (!objectManager.TryGetObject<Army>(args[0], out var army))
+                return Failed($"Unable to get Army with {args[0]}");
+
+            var sb = new StringBuilder();
+            int total = 0;
+            foreach (var party in army.Parties)
+            {
+                int count = party?.PrisonRoster?.TotalManCount ?? 0;
+                total += count;
+                objectManager.TryGetId(party, out var partyId);
+                sb.AppendLine($"{party?.Name} ({partyId}) prisoners={count} inSettlement={party?.CurrentSettlement?.StringId}");
+            }
+            sb.AppendLine($"ARMY_PRISONER_TOTAL={total}");
+            return Succeeded(sb.ToString());
+        }
+    }
+
+    // coop.debug.army.give_prisoners <MobilePartyId> <CharacterObjectId> <count>
+    /// <summary>Puts prisoners into a party so the sell-on-entry path has something to sell.</summary>
+    public sealed class ArmyGivePrisonersCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.army";
+
+        public string Name => "give_prisoners";
+
+        public string Description => "Puts prisoners into a party so the sell-on-entry path has something to sell.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("party_id", "The registered mobile party id."),
+            new ExpectedArgs("character_id", "The prisoner troop's character id."),
+            new ExpectedArgs("count", "How many prisoners to add."),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (!ContainerProvider.TryResolve<IObjectManager>(out var objectManager))
+                return Failed($"Unable to get {nameof(IObjectManager)}");
+            if (!objectManager.TryGetObject<MobileParty>(args[0], out var party))
+                return Failed($"Unable to get MobileParty with {args[0]}");
+            if (!objectManager.TryGetObject<CharacterObject>(args[1], out var character))
+                return Failed($"Unable to get CharacterObject with {args[1]}");
+            if (!int.TryParse(args[2], out var count) || count <= 0)
+                return Failed($"{args[2]} is not a positive count");
+
+            party.PrisonRoster.AddToCounts(character, count);
+            return Succeeded($"{party.Name} now holds {party.PrisonRoster.TotalManCount} prisoners");
+        }
+    }
+
+    // coop.debug.army.leave_settlement <ArmyId>
+    /// <summary>Takes every party of an army back out of its settlement, so an entry can be re-run.</summary>
+    /// <remarks>
+    /// Entry is idempotent - EnterSettlementActionPatches refuses a party already inside - so a second
+    /// enter_settlement raises no event and measures nothing.
+    /// </remarks>
+    public sealed class ArmyLeaveSettlementCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.army";
+
+        public string Name => "leave_settlement";
+
+        public string Description => "Takes every party of an army back out of its settlement, so an entry can be re-run.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("army_id", "The registered army id."),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (ModInformation.IsClient) return Failed("Command is only available to run on the server");
+            if (!ContainerProvider.TryResolve<IObjectManager>(out var objectManager))
+                return Failed($"Unable to get {nameof(IObjectManager)}");
+            if (!objectManager.TryGetObject<Army>(args[0], out var army))
+                return Failed($"Unable to get Army with {args[0]}");
+
+            int left = 0;
+            using (new AllowedThread())
+            {
+                foreach (var party in army.Parties.ToList())
+                {
+                    if (party?.CurrentSettlement == null) continue;
+                    LeaveSettlementAction.ApplyForParty(party);
+                    left++;
+                }
+            }
+            return Succeeded($"{left} party(ies) left their settlement");
+        }
+    }
+
+    // coop.debug.army.attach_all <ArmyId>
+    /// <summary>
+    /// Attaches every member party to the army leader, as if they had caught up with it.
+    /// </summary>
+    /// <remarks>
+    /// Adding a party to an army makes it a MEMBER; it only becomes ATTACHED once it physically reaches
+    /// the leader, which needs campaign time the headless server does not run. Vanilla only brings
+    /// ATTACHED parties into a settlement with their leader - correctly, since a lord three days away
+    /// should not teleport inside - so a test that skips this step measures nothing.
+    /// </remarks>
+    public sealed class ArmyAttachAllCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.army";
+
+        public string Name => "attach_all";
+
+        public string Description => "Attaches every member party to the army leader, as if they had caught up with it.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("army_id", "The registered army id."),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (ModInformation.IsClient) return Failed("Command is only available to run on the server");
+            if (!ContainerProvider.TryResolve<IObjectManager>(out var objectManager))
+                return Failed($"Unable to get {nameof(IObjectManager)}");
+            if (!objectManager.TryGetObject<Army>(args[0], out var army))
+                return Failed($"Unable to get Army with {args[0]}");
+
+            var leader = army.LeaderParty;
+            if (leader == null) return Failed("Army has no leader party");
+
+            int attached = 0;
+            using (new AllowedThread())
+            {
+                foreach (var party in army.Parties.ToList())
+                {
+                    if (party == null || party == leader) continue;
+                    if (party.AttachedTo != null) continue;
+                    army.AddPartyToMergedParties(party);
+                    attached++;
+                }
+            }
+            return Succeeded($"attached {attached} party(ies); AttachedParties={leader.AttachedParties.Count}");
+        }
+    }
+
+    // coop.debug.army.enter_settlement <ArmyId> <SettlementId>
+    /// <summary>
+    /// Marches an army into a settlement by entering its LEADER, exactly as the map would.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately enters only the leader. Vanilla brings the attached parties in behind it, but only
+    /// for MobileParty.MainParty, which on a coop server is a dummy hero with no party - so this command
+    /// is what demonstrates whether the attached lords follow their leader inside.
+    /// </remarks>
+    public sealed class ArmyEnterSettlementCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.army";
+
+        public string Name => "enter_settlement";
+
+        public string Description => "Marches an army into a settlement by entering its leader, exactly as the map would.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("army_id", "The registered army id."),
+            new ExpectedArgs("settlement_id", "The registered settlement id."),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (ModInformation.IsClient) return Failed("Command is only available to run on the server");
+            if (!ContainerProvider.TryResolve<IObjectManager>(out var objectManager))
+                return Failed($"Unable to get {nameof(IObjectManager)}");
+            if (!objectManager.TryGetObject<Army>(args[0], out var army))
+                return Failed($"Unable to get Army with {args[0]}");
+            if (!objectManager.TryGetObject<Settlement>(args[1], out var settlement))
+                return Failed($"Unable to get Settlement with {args[1]}");
+
+            var leader = army.LeaderParty;
+            if (leader == null) return Failed("Army has no leader party");
+
+            using (new AllowedThread())
+            {
+                EnterSettlementAction.ApplyForParty(leader, settlement);
+            }
+            return Succeeded($"{leader.Name} entered {settlement.Name}; leader inSettlement={leader.CurrentSettlement?.StringId ?? "none"}");
         }
     }
     }

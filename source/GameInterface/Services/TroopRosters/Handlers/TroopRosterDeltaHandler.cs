@@ -392,6 +392,7 @@ internal class TroopRosterDeltaHandler : IHandler
 
         Apply(m.RosterId, m.CharacterId, nameof(NetworkTroopRosterElementBatch), (roster, character) =>
         {
+            bool xpChanged = false;
             foreach (var operation in m.Operations)
             {
                 switch (operation.Kind)
@@ -404,6 +405,7 @@ internal class TroopRosterDeltaHandler : IHandler
                         ApplyToExisting(roster, character, m.RosterId, m.CharacterId,
                             nameof(NetworkTroopRosterElementBatch),
                             (existingRoster, index) => existingRoster.SetElementXp(index, operation.Xp));
+                        xpChanged = true;
                         break;
                     default:
                         Logger.Error("Unknown troop-roster batch operation {OperationKind} for {Character} in roster {Roster}",
@@ -411,6 +413,12 @@ internal class TroopRosterDeltaHandler : IHandler
                         break;
                 }
             }
+
+            // A roster hands out its rows from a list it rebuilds only when its version changes, and writing XP
+            // does not change it: without this the party screen keeps showing the XP the troops had before
+            // (6 Sep 2026 - donated loot put 40,170 XP into a party that went on reading 0 in every row view).
+            // Once for the batch, not once per element: the rebuild is the expensive half.
+            if (xpChanged) roster.UpdateVersion();
         });
     }
 

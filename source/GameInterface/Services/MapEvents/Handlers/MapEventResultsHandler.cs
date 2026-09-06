@@ -155,8 +155,12 @@ internal class MapEventResultsHandler : IHandler
                 IsHeroId);
 
             // An offer from an earlier wave of the same siege must not still be answerable once this one
-            // exists, or a late reply to the old one would be honoured against the new battle.
-            BattleLootOfferRegistry.Shared.ForgetMapEvent(mapEventId);
+            // exists, or a late reply to the old one would be honoured against the new battle. Only THIS
+            // party's earlier offers, though: this runs once per player, and forgetting the whole event here
+            // erased the first player's offer the moment the second player's was built, so in every
+            // two-player battle the winner's answer came back "UnknownOffer" and its troop and prisoner
+            // claims were never applied (measured live 5 Sep 2026, `2134-army-100-lootwalk2`).
+            BattleLootOfferRegistry.Shared.ForgetPartyOffers(mapEventId, partyId);
             BattleLootOfferRegistry.Shared.Register(offer, BattleLootTransactionHandler.NowSeconds());
 
             network.Send(peer, new NetworkBattleLootOffer(offer));

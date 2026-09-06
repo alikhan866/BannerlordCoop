@@ -14,7 +14,7 @@ public interface IAgentPositionInterpolator
     void SetRiderTarget(Agent agent, AgentData data);
 
     /// <summary>Record the latest continuous frame the owner reported for a mounted rider puppet.</summary>
-    void SetMountedRiderTarget(Agent agent, AgentData data);
+    void SetMountedRiderTarget(Agent agent, AgentData data, float oneWayLatencySeconds = 0f);
 
     /// <summary>Record the latest continuous frame the owner reported for a mount puppet.</summary>
     void SetMountTarget(Agent mountAgent, AgentMountData data);
@@ -189,7 +189,7 @@ public class AgentPositionInterpolator : IAgentPositionInterpolator
             updateSequence: GetNextUpdateSequence()));
     }
 
-    public void SetMountedRiderTarget(Agent agent, AgentData data)
+    public void SetMountedRiderTarget(Agent agent, AgentData data, float oneWayLatencySeconds = 0f)
     {
         if (agent == null || data.MountData == null) return;
         if (!TryResolveTargetPosition(agent, data.HasPosition, data.Position, out Vec3 mountedPosition))
@@ -212,7 +212,9 @@ public class AgentPositionInterpolator : IAgentPositionInterpolator
                 data.GetMovementInput(agent),
                 data.MovementFlag),
             elapsed,
-            GetNextUpdateSequence()));
+            GetNextUpdateSequence(),
+            oneWayLatencySeconds,
+            data.MountData.MountMovementDirection * data.MountData.MountSpeed));
     }
 
     public void SetMountTarget(Agent mountAgent, AgentMountData data)
@@ -564,6 +566,67 @@ public class AgentPositionInterpolator : IAgentPositionInterpolator
         return target.Position + lead;
     }
 
+    /// <summary>Fastest believable horse; a courser gallops at 12-14 m/s, so anything above this is a bad frame.</summary>
+    private const float MaximumMountLeadSpeed = 22f;
+
+    /// <summary>Furthest a puppet horse may be aimed beyond its reported position.</summary>
+    private const float MaximumMountLeadDistance = 3f;
+
+    /// <summary>A frame older than this is a stalled stream; it is not extrapolated further.</summary>
+    private const float MaximumMountLeadAgeSeconds = 0.1f;
+
+    /// <summary>A ping estimate above this is a spike, not a delay to lead by.</summary>
+    private const float MaximumLeadLatencySeconds = 0.3f;
+
+    /// <summary>
+    /// What the puppet horse trails by on a zero-delay rig with the lead off: about one frame. Measured 0.2 m at
+    /// 10 m/s (run v2-lance-before), so the horse's own locomotion, not the ease, carries it between frames; the
+    /// earlier 1 / 12 s "ease lag" term over-led and is gone.
+    /// </summary>
+    private const float MountedPresentationLagSeconds = 0.02f;
+
+    private long mountLeadMoves;
+    private double mountLeadDistanceSum;
+#if DEBUG
+    private float lastMountLeadReport;
+#endif
+
+    /// <summary>How often the mounted lead was applied, and how far it reached. Read by the battle census.</summary>
+    public long MountLeadMoves => mountLeadMoves;
+    public double MeanMountLeadDistance => mountLeadMoves == 0 ? 0 : mountLeadDistanceSum / mountLeadMoves;
+
+    /// <summary>
+    /// How far ahead of its reported position a puppet HORSE should be aimed: the owner's horse velocity (sent in
+    /// the frame, so no two-frame differencing that fails at a 60 Hz lane where frames are 16.7 ms apart) times the
+    /// time the frame has been in flight and on this machine.
+    /// </summary>
+    /// <remarks>
+    /// Pure so the guards can be tested. Age is capped at 0.1 s (a stalled stream must not run away), the network
+    /// delay at 0.3 s, speed must be a horse's, and the lead is capped well inside the 12 m mount snap distance.
+    /// The delay term is the one that matters between two real machines: at a 12 m/s gallop, 50 ms one way is
+    /// 0.6 m of horse the other player never sees where it is.
+    /// </remarks>
+    internal static bool TryComputeMountLead(Vec2 velocity, float age, float oneWayLatency, out Vec3 lead)
+    {
+        lead = Vec3.Zero;
+
+        float speed = velocity.Length;
+        if (float.IsNaN(speed) || float.IsInfinity(speed)) return false;
+        if (speed < MinimumLeadSpeed || speed > MaximumMountLeadSpeed) return false;
+        if (float.IsNaN(age) || age < 0f) return false;
+
+        float latency = float.IsNaN(oneWayLatency) ? 0f : Math.Max(0f, Math.Min(oneWayLatency, MaximumLeadLatencySeconds));
+        float seconds = Math.Min(age, MaximumMountLeadAgeSeconds) + latency + MountedPresentationLagSeconds;
+        Vec3 candidate = new Vec3(velocity.X * seconds, velocity.Y * seconds, 0f);
+        float leadDistance = candidate.Length;
+        if (float.IsNaN(leadDistance) || float.IsInfinity(leadDistance)) return false;
+        if (leadDistance > MaximumMountLeadDistance)
+            candidate *= MaximumMountLeadDistance / leadDistance;
+
+        lead = candidate;
+        return true;
+    }
+
     /// <summary>
     /// How far ahead of its reported position a puppet should be aimed, given the owner's last step.
     /// </summary>
@@ -624,6 +687,33 @@ public class AgentPositionInterpolator : IAgentPositionInterpolator
         if (mount == null || !mount.IsActive()) return;
 
         Vec3 mountTarget = target.HasMountSnapPosition ? target.MountSnapPosition : target.Position;
+        // A moving horse is eased toward a position its owner has already left: the frame is up to one update
+        // old and the exponential ease itself trails a moving target by v / MountedFollowRate (83 ms). At a
+        // canter that is about a metre - the puppet horse a lance length behind where its rider really is. Lead
+        // the target by the owner's last velocity over both, with the same guards the on-foot lead has.
+        if (MountedSyncSwitches.LeadEnabled
+            && TryComputeMountLead(
+                target.MountVelocity,
+                elapsed - target.UpdatedAt,
+                target.OneWayLatencySeconds,
+                out Vec3 mountLead))
+        {
+            mountTarget += mountLead;
+            mountLeadMoves++;
+            mountLeadDistanceSum += mountLead.Length;
+        }
+#if DEBUG
+        if (Missions.Diagnostics.DuelEvents.Enabled && elapsed - lastMountLeadReport >= 1f)
+        {
+            lastMountLeadReport = elapsed;
+            Missions.Diagnostics.DuelEvents.Record("mountlead",
+                "moves=" + mountLeadMoves.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " meanM=" + MeanMountLeadDistance.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) +
+                " speed=" + target.MountVelocity.Length.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) +
+                " latencyMs=" + (target.OneWayLatencySeconds * 1000f).ToString("0", System.Globalization.CultureInfo.InvariantCulture) +
+                " lead=" + (MountedSyncSwitches.LeadEnabled ? "on" : "off"));
+        }
+#endif
         Vec3 cur = mount.Position;
         float distance = cur.Distance(mountTarget);
         bool hasGuardPresentation = HasGuardPresentation(rider);
@@ -733,7 +823,9 @@ public class AgentPositionInterpolator : IAgentPositionInterpolator
             Vec3 mountSnapPosition,
             ContinuousState mountedRiderState,
             float updatedAt,
-            long updateSequence)
+            long updateSequence,
+            float oneWayLatencySeconds = 0f,
+            Vec2 mountVelocity = default)
         {
             Position = position;
             AgentState = agentState;
@@ -742,7 +834,15 @@ public class AgentPositionInterpolator : IAgentPositionInterpolator
             MountedRiderState = mountedRiderState;
             UpdatedAt = updatedAt;
             UpdateSequence = updateSequence;
+            OneWayLatencySeconds = oneWayLatencySeconds;
+            MountVelocity = mountVelocity;
         }
+
+        /// <summary>The sender's estimated one-way delay when this frame arrived (mesh ping / 2, plus any simulated hold).</summary>
+        public float OneWayLatencySeconds { get; }
+
+        /// <summary>The owner's horse velocity as sent (direction x speed), the basis of the mounted lead.</summary>
+        public Vec2 MountVelocity { get; }
 
         public Vec3 Position { get; }
         public ContinuousState AgentState { get; }

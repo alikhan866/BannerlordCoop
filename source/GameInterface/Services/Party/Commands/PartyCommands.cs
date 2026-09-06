@@ -19,10 +19,12 @@ using System.Text;
 using TaleWorlds.CampaignSystem;
 using TaleWorlds.CampaignSystem.Actions;
 using TaleWorlds.CampaignSystem.GameState;
+using TaleWorlds.CampaignSystem.Map;
 using TaleWorlds.CampaignSystem.Party;
 using TaleWorlds.CampaignSystem.Roster;
 using TaleWorlds.CampaignSystem.Settlements;
 using TaleWorlds.Core;
+using TaleWorlds.Library;
 using TaleWorlds.ObjectSystem;
 using TaleWorlds.ScreenSystem;
 
@@ -228,6 +230,149 @@ internal class PartyCommands
                 resetMovementToHold: true));
 
         return Succeeded($"Restored {party.StringId} to {party.Position.X:R},{party.Position.Y:R} in Hold mode.");
+    }
+
+    /// <summary>
+    /// Finds the nearest point around a party where no other mobile party stands within a radius, on passable
+    /// land. Battle fixtures use it: vanilla pulls every nearby co-belligerent into a fresh map event, so a duel
+    /// started where a lord camps becomes a 20-party field battle (PVP-SYNC-PLAN P0, runs 4-6).
+    /// </summary>
+    public sealed class FindClearSpotCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.mobile_party";
+
+        public string Name => "find_clear_spot";
+
+        public string Description => "Finds the nearest land position near a party with no other mobile party within a radius.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("party_id", "The registered mobile-party id to search around."),
+            new ExpectedArgs("clear_radius", "No other party may stand within this many map units."),
+            new ExpectedArgs("max_offset", "How far from the party to search."),
+            new ExpectedArgs("ignore_party_id", "A second party that may stand inside the radius (it is being moved too).", false),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (ModInformation.IsClient) return Failed("Command can only be run on the server.");
+            if (!float.TryParse(args[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var clearRadius) ||
+                !float.TryParse(args[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var maxOffset))
+                return Failed("Invalid command argument value.");
+            if (!TryGetObjectManager(out var objectManager)) return Failed("Unable to resolve ObjectManager.");
+            if (!objectManager.TryGetObject(args[0], out MobileParty party))
+                return Failed($"Party with id {args[0]} not found");
+            MobileParty ignored = null;
+            string ignoreId = args.ElementAtOrDefault(3);
+            if (!string.IsNullOrEmpty(ignoreId)) objectManager.TryGetObject(ignoreId, out ignored);
+
+            var mapScene = Campaign.Current.MapSceneWrapper;
+            Vec2 origin = party.Position.ToVec2();
+            // Rings of 1.5 map units, 16 bearings per ring; the origin itself is ring 0.
+            for (float offset = 0f; offset <= maxOffset; offset += 1.5f)
+            {
+                int bearings = offset <= 0f ? 1 : 16;
+                for (int i = 0; i < bearings; i++)
+                {
+                    float angle = (float)(2 * Math.PI * i / bearings);
+                    Vec2 candidate = origin + new Vec2((float)Math.Cos(angle), (float)Math.Sin(angle)) * offset;
+                    var position = new CampaignVec2(candidate, true);
+                    PathFaceRecord face = mapScene.GetFaceIndex(position);
+                    if (!face.IsValid()) continue;
+                    TerrainType terrain = mapScene.GetFaceTerrainType(face);
+                    switch (terrain)
+                    {
+                        case TerrainType.Water:
+                        case TerrainType.River:
+                        case TerrainType.Lake:
+                        case TerrainType.Mountain:
+                        case TerrainType.Canyon:
+                        case TerrainType.Bridge:
+                        case TerrainType.Fording:
+
+                            continue;
+                    }
+
+                    int crowd = 0;
+                    var search = MobileParty.StartFindingLocatablesAroundPosition(candidate, clearRadius);
+                    for (MobileParty other = MobileParty.FindNextLocatable(ref search); other != null; other = MobileParty.FindNextLocatable(ref search))
+                    {
+                        if (other == party || other == ignored || !other.IsActive) continue;
+                        crowd++;
+                    }
+                    if (crowd > 0) continue;
+
+                    return Succeeded(
+                        $"x={candidate.x.ToString("R", CultureInfo.InvariantCulture)}|" +
+                        $"y={candidate.y.ToString("R", CultureInfo.InvariantCulture)}|" +
+                        $"offset={offset.ToString("0.0", CultureInfo.InvariantCulture)}|terrain={terrain}|partiesWithin=0");
+                }
+            }
+            return Failed($"No clear land spot within {maxOffset} of {party.StringId} (radius {clearRadius}).");
+        }
+    }
+
+    /// <summary>
+    /// The member and prisoner rosters of a party as sorted characterId:healthy/wounded/xp lines plus a hash, so
+    /// three machines can be diffed in one line and the lines say where they differ (PVP-ARMY-SYNC-PLAN 3.3).
+    /// Runs on the server and on clients (each reports its own copy of the world).
+    /// </summary>
+    public sealed class RosterHashCoopCommand : ICoopCommand
+    {
+        public string Prefix => "coop.debug.mobile_party";
+
+        public string Name => "roster_hash";
+
+        public string Description => "Prints a party's member and prisoner rosters as sorted characterId:healthy/wounded/xp lines and a hash of them.";
+
+        public IExpectedArgs[] ExpectedArgs { get; } = new IExpectedArgs[]
+        {
+            new ExpectedArgs("party_id", "The registered mobile-party id."),
+            new ExpectedArgs("lines", "'lines' to include every roster line (default: hash and counts only).", false),
+        };
+
+        public CoopCommandResult ProcessCommand(ICoopCommandArgs args)
+        {
+            if (!TryGetObjectManager(out var objectManager)) return Failed("Unable to resolve ObjectManager.");
+            if (!objectManager.TryGetObject(args[0], out MobileParty party))
+                return Failed($"Party with id {args[0]} not found");
+
+            var lines = new List<string>();
+            int members = 0, wounded = 0, prisoners = 0, heroes = 0;
+            foreach (TroopRosterElement element in party.MemberRoster.GetTroopRoster())
+            {
+                if (element.Character == null) continue;
+                lines.Add("m:" + element.Character.StringId + ":" + element.Number + "/" + element.WoundedNumber + "/" + element.Xp);
+                members += element.Number;
+                wounded += element.WoundedNumber;
+                if (element.Character.IsHero) heroes++;
+            }
+            foreach (TroopRosterElement element in party.PrisonRoster.GetTroopRoster())
+            {
+                if (element.Character == null) continue;
+                lines.Add("p:" + element.Character.StringId + ":" + element.Number + "/" + element.WoundedNumber + "/" + element.Xp);
+                prisoners += element.Number;
+            }
+            lines.Sort(StringComparer.Ordinal);
+            string joined = string.Join("\n", lines);
+            string hash;
+            using (var sha = System.Security.Cryptography.SHA1.Create())
+            {
+                byte[] digest = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(joined));
+                hash = BitConverter.ToString(digest, 0, 8).Replace("-", string.Empty).ToLowerInvariant();
+            }
+            var text = new StringBuilder();
+            text.Append("ROSTER_HASH party=").Append(party.StringId)
+                .Append(" hash=").Append(hash)
+                .Append(" members=").Append(members)
+                .Append(" wounded=").Append(wounded)
+                .Append(" heroes=").Append(heroes)
+                .Append(" prisoners=").Append(prisoners)
+                .Append(" lines=").Append(lines.Count);
+            if (string.Equals(args.ElementAtOrDefault(1), "lines", StringComparison.OrdinalIgnoreCase))
+                text.Append('\n').Append(joined);
+            return Succeeded(text.ToString());
+        }
     }
 
     public sealed class MoveToSettlementCoopCommand : ICoopCommand
