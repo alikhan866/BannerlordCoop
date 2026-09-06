@@ -554,3 +554,6 @@ source/.idea
 
 .pi-subagents/**
 .pi/**
+# Live-rig run artifacts: logs, position dumps and traces, hundreds of MB per session
+Scripts/Rig/runs/
+Scripts/Rig/__pycache__/
